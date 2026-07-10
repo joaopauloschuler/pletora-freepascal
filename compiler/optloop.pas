@@ -8321,7 +8321,14 @@ unit optloop;
           exit;
         env.facts:=facts;
         env.changed:=changed;
-        foreachnodestatic(pm_preprocess,n,@jt_walk_cb,@env);
+        { pm_postprocess runs the callback BEFORE descending, so the
+          fen_norecurse_false returned for ifn genuinely stops the generic walk
+          and jt_do_if alone recurses into the branches. pm_preprocess would
+          process the children first, so every nested if would be visited once
+          by the generic sweep and again by each ancestor's manual jt_walk --
+          exponential in if-nesting depth (hangs on large lowered string-case
+          dispatch chains). }
+        foreachnodestatic(pm_postprocess,n,@jt_walk_cb,@env);
       end;
 
 
