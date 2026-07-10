@@ -113,7 +113,7 @@ implementation
       globals,cutils,constexp,verbose,fmodule,
       symconst,symbase,symtype,symsym,symtable,
       defutil,paramgr,pparautl,pass_1,
-      nbas,nld,nmem,ncal,ncon,nutils,
+      nbas,nld,nmem,ncal,ncon,nflw,nutils,
       optutils,
       symcreat;
 
@@ -124,6 +124,78 @@ implementation
       ipacp_clones_per_routine = 4;
       { at most this many clones per module (bounds total code growth) }
       ipacp_clones_per_module = 64;
+
+    { ---- constant descriptors ---------------------------------------------- }
+
+    type
+      { one compile-time constant actual bound for a specializable parameter }
+      tipacpconst = record
+        def    : tdef;             { the parameter's declared type }
+        isreal : boolean;          { true => realval (single/double), else ordval }
+        ordval : tconstexprint;
+        realval : bestreal;
+      end;
+
+      { one (visible-parameter, constant) specialization pair }
+      tipacpspec = record
+        visidx : longint;
+        c      : tipacpconst;
+      end;
+      tipacpspecs = array of tipacpspec;
+
+    { build the literal node for a constant descriptor (typechecked) }
+    function make_const_node(const c : tipacpconst) : tnode;
+      begin
+        if c.isreal then
+          result:=crealconstnode.create(c.realval,c.def)
+        else
+          result:=cordconstnode.create(c.ordval,c.def,false);
+        typecheckpass(result);
+      end;
+
+    { a name/key token identifying one spec; only [A-Za-z0-9] characters so it
+      is a valid mangled-name fragment.  Floats key on their BIT PATTERN (NOT
+      the textual value): two literals that print alike but differ in bits must
+      get distinct clones, and vice-versa.  Only single/double actuals are
+      eligible, so the value is narrowed to a 64-bit double first: this both
+      keeps the key stable (bestreal is `extended`, whose sizeof carries
+      nondeterministic padding bytes that would defeat identical-value sharing)
+      and makes bit-identical values map to one clone. }
+    function real_bits_hex(v : bestreal) : string;
+      var
+        d : double;
+        q : qword;
+      begin
+        d:=double(v);
+        q:=pqword(@d)^;
+        result:=hexstr(q,16);
+      end;
+
+    function spec_token(const s : tipacpspec) : string;
+      begin
+        result:='p'+tostr(s.visidx);
+        if s.c.isreal then
+          result:=result+'f'+real_bits_hex(s.c.realval)
+        else if s.c.ordval.svalue<0 then
+          result:=result+'vn'+tostr(-s.c.ordval.svalue)
+        else
+          result:=result+'v'+tostr(s.c.ordval.svalue);
+      end;
+
+    { human-readable value for -OoREPORT remarks }
+    function spec_valstr(const c : tipacpconst) : string;
+      begin
+        if c.isreal then
+          begin
+            str(c.realval,result);
+            { str() left-pads a non-negative real with a blank; drop it so the
+              remark reads `k=2.0...` not `k= 2.0...` }
+            if (length(result)>0) and (result[1]=' ') then
+              delete(result,1,1);
+          end
+        else
+          result:=tostr(c.ordval.svalue);
+      end;
 
     { ---- per-module state --------------------------------------------------- }
 
@@ -194,6 +266,23 @@ implementation
               pboolean(arg)^:=false;
               result:=fen_norecurse_true;
             end;
+          addrn:
+            { taking the address of a frame variable (local or parameter) forces
+              that variable into memory (non-register).  The clone rebuilds the
+              localst/parast fresh and re-typechecks a copy that is already
+              typecheck-marked, so this "must stay in memory" property is not
+              re-derived on the clone's new symbol -- the register allocator then
+              keeps it in a register and taking its address internalerrors in
+              the code generator.  Reject such routines (rare among clonable
+              kernels); addresses of unit-level/global data are unaffected but
+              are conservatively rejected here too. }
+            if assigned(taddrnode(n).left) and
+               (taddrnode(n).left.nodetype=loadn) and
+               (tloadnode(taddrnode(n).left).symtableentry.typ in [localvarsym,paravarsym]) then
+              begin
+                pboolean(arg)^:=false;
+                result:=fen_norecurse_true;
+              end;
           else
             ;
         end;
@@ -236,10 +325,30 @@ implementation
       end;
 
     function proc_eligible(pd : tprocdef) : boolean;
+      var
+        i : longint;
+        pv : tparavarsym;
       begin
         result:=false;
         if not(pd.proctypeoption in [potype_procedure,potype_function]) then
           exit;
+        { reject routines whose signature carries a hidden high-length parameter
+          (open array / array of const): the clone is a same-signature alias, but
+          rebuilding a call to it copies only the visible argument nodes, so the
+          hidden high para is left unbound and the re-typecheck reports a
+          parameter-count mismatch.  This is the reliable structural equivalent
+          of the pi_has_open_array_parameter procinfo flag, which is set during
+          firstpass and is therefore NOT yet available at pre-firstpass stash
+          time (a routine whose only callers are in the main program body would
+          otherwise slip past that flag and be cloned incorrectly). }
+        for i:=0 to pd.paras.count-1 do
+          begin
+            pv:=tparavarsym(pd.paras[i]);
+            if vo_is_high_para in pv.varoptions then
+              exit;
+            if assigned(pv.vardef) and is_special_array(pv.vardef) then
+              exit;
+          end;
         { only a register-returned (or void) result: a result returned via a
           hidden pointer parameter (managed/large types) needs funcret handling
           we do not replicate -- skip it }
@@ -371,8 +480,18 @@ implementation
         result:=ctx.safe;
       end;
 
-    { a specializable parameter: by-value/const scalar ordinal/enum/bool (a
-      compile-time constant argument is always an ordconstn), never written }
+    { a specializable parameter: a by-value/const, never-written parameter whose
+      compile-time constant argument the clone can drop into the body as a
+      literal.  Eligible types:
+        - scalar ordinal/enum/bool  (constant argument is an ordconstn), and
+        - single/double float       (constant argument is a realconstn).
+      Managed types (ansistring/widestring/interfaces/variants/dynarrays) and
+      shortstrings are deliberately NOT eligible: their constant argument is not
+      a plain literal node the remap could substitute, substituting them would
+      change lifetime/refcount bookkeeping, and the clone's parast/localst copy
+      would need init/final adjustments we do not replicate.  Currency is a
+      floatdef but is fixed-point (value_currency, not value_real) so it is
+      excluded here as well. }
     function para_specializable(pv : tparavarsym; code : tnode) : boolean;
       begin
         result:=false;
@@ -382,7 +501,8 @@ implementation
           exit;
         if not assigned(pv.vardef) then
           exit;
-        if not(pv.vardef.typ in [orddef,enumdef]) then
+        if not((pv.vardef.typ in [orddef,enumdef]) or
+               (is_single(pv.vardef) or is_double(pv.vardef))) then
           exit;
         if not param_readonly(pv,code) then
           exit;
@@ -411,6 +531,157 @@ implementation
       begin
         result:=false;
         foreachnodestatic(pm_postprocess,code,@has_control_flow,@result);
+      end;
+
+    { -------- for-loop counter escape gate ---------------------------------- }
+
+    { count load nodes of symbol SYM within (sub)tree N }
+    type
+      pcountctx = ^tcountctx;
+      tcountctx = record
+        sym : tsym;
+        n   : longint;
+      end;
+
+    function count_sym_loads_cb(var n : tnode; arg : pointer) : foreachnoderesult;
+      begin
+        result:=fen_true;
+        if (n.nodetype=loadn) and
+           (tloadnode(n).symtableentry=pcountctx(arg)^.sym) then
+          inc(pcountctx(arg)^.n);
+      end;
+
+    function count_sym_loads(root : tnode; sym : tsym) : longint;
+      var
+        ctx : tcountctx;
+      begin
+        ctx.sym:=sym;
+        ctx.n:=0;
+        foreachnodestatic(pm_postprocess,root,@count_sym_loads_cb,@ctx);
+        result:=ctx.n;
+      end;
+
+    function collect_forns_cb(var n : tnode; arg : pointer) : foreachnoderesult;
+      begin
+        result:=fen_true;
+        if n.nodetype=forn then
+          TFPList(arg).add(n);
+      end;
+
+    function for_loopvar(f : tnode) : tsym;
+      begin
+        result:=nil;
+        if assigned(tfornode(f).left) and
+           (tfornode(f).left.nodetype=loadn) then
+          result:=tloadnode(tfornode(f).left).symtableentry;
+      end;
+
+    { true if FORN lies within OTHER's subtree (OTHER is an enclosing loop) }
+    type
+      pfindnodectx = ^tfindnodectx;
+      tfindnodectx = record
+        target : tnode;
+        found  : boolean;
+      end;
+
+    function find_node_cb(var n : tnode; arg : pointer) : foreachnoderesult;
+      begin
+        result:=fen_true;
+        if n=pfindnodectx(arg)^.target then
+          pfindnodectx(arg)^.found:=true;
+      end;
+
+    function forn_within(forn, other : tnode) : boolean;
+      var
+        ctx : tfindnodectx;
+      begin
+        result:=false;
+        if forn=other then
+          exit;
+        ctx.target:=forn;
+        ctx.found:=false;
+        foreachnodestatic(pm_postprocess,other,@find_node_cb,@ctx);
+        result:=ctx.found;
+      end;
+
+    { true if the body contains two or more counted for-loops that are NOT nested
+      one within another (i.e. sibling / cousin loops).  We refuse to specialize
+      such a routine: turning its loop bounds into compile-time constants feeds
+      constant-trip sibling loops to the aggressive -O4 loop-nest passes
+      (LICM / LOOPFUSE / LOOPDISTPAT / LOOPPEEL / LOOPSPLIT / UNROLLJAM ...),
+      which are not yet robust against constant-bounds sibling loops and can
+      miscompile or crash on them (a hazard that predates this pass -- the same
+      clone built from an ordinary caller trips it too).  Single-loop kernels and
+      nested loop-nests (the primary loop-bound-as-parameter IPACP target) stay
+      eligible.  This gate is purely conservative: it only ever declines to
+      clone, never changes emitted code. }
+    function has_sibling_forloops(code : tnode) : boolean;
+      var
+        forns : TFPList;
+        i,j,toplevel : longint;
+        nested : boolean;
+      begin
+        result:=false;
+        forns:=TFPList.create;
+        try
+          foreachnodestatic(pm_postprocess,code,@collect_forns_cb,forns);
+          { count for-loops that are not enclosed by any other for-loop }
+          toplevel:=0;
+          for i:=0 to forns.count-1 do
+            begin
+              nested:=false;
+              for j:=0 to forns.count-1 do
+                if (i<>j) and forn_within(tnode(forns[i]),tnode(forns[j])) then
+                  begin
+                    nested:=true;
+                    break;
+                  end;
+              if not nested then
+                begin
+                  inc(toplevel);
+                  if toplevel>=2 then
+                    exit(true);
+                end;
+            end;
+        finally
+          forns.free;
+        end;
+      end;
+
+    { true if some for-loop counter is read OUTSIDE every for-loop that uses it,
+      i.e. the loop's exit value is observed.  We refuse to specialize such a
+      routine: turning the loop bound into a compile-time constant lets the loop
+      passes rewrite the (now single-trip / empty) loop, and the exact exit value
+      of a constant-bounds for counter is not something we should let a clone
+      depend on.  (Counters that are only ever used AS a loop counter -- the
+      common case -- do not gate.) }
+    function loop_counter_escapes(code : tnode) : boolean;
+      var
+        forns : TFPList;
+        i,j : longint;
+        v : tsym;
+        total,insum : longint;
+      begin
+        result:=false;
+        forns:=TFPList.create;
+        try
+          foreachnodestatic(pm_postprocess,code,@collect_forns_cb,forns);
+          for i:=0 to forns.count-1 do
+            begin
+              v:=for_loopvar(tnode(forns[i]));
+              if not assigned(v) then
+                continue;
+              total:=count_sym_loads(code,v);
+              insum:=0;
+              for j:=0 to forns.count-1 do
+                if for_loopvar(tnode(forns[j]))=v then
+                  insum:=insum+count_sym_loads(tnode(forns[j]),v);
+              if total>insum then
+                exit(true);
+            end;
+        finally
+          forns.free;
+        end;
       end;
 
     { -------- stash ---------------------------------------------------------- }
@@ -442,6 +713,10 @@ implementation
         if node_count(code,ipacp_body_budget)>=ipacp_body_budget then
           exit;
         if not body_has_control_flow(code) then
+          exit;
+        if loop_counter_escapes(code) then
+          exit;
+        if has_sibling_forloops(code) then
           exit;
 
         { collect the visible indices of specializable parameters }
@@ -497,15 +772,29 @@ implementation
     { -------- clone body construction --------------------------------------- }
 
     type
+      { one resolved substitution: the callee paravarsym and the literal value }
+      tremaptarget = record
+        para : tsym;
+        c    : tipacpconst;
+      end;
+
       premap = ^tremap;
       tremap = record
         oldpd,newpd   : tprocdef;
         oldfuncret,newfuncret : tsym;
-        targetpara    : tsym;         { callee paravarsym being specialized }
-        constdef      : tdef;         { its type }
-        constval      : tconstexprint;
+        targets       : array of tremaptarget;   { params being specialized }
         oldlocals     : TFPList;      { parallel old/new local maps }
         newlocals     : TFPList;
+      end;
+
+    function remap_target_index(ctx : premap; sym : tsym) : longint;
+      var
+        i : longint;
+      begin
+        result:=-1;
+        for i:=0 to high(ctx^.targets) do
+          if ctx^.targets[i].para=sym then
+            exit(i);
       end;
 
     function remap_local(ctx : premap; sym : tsym) : tsym;
@@ -531,10 +820,10 @@ implementation
           exit;
         ld:=tloadnode(n);
         { specialized parameter -> literal constant }
-        if ld.symtableentry=ctx^.targetpara then
+        idx:=remap_target_index(ctx,ld.symtableentry);
+        if idx>=0 then
           begin
-            n:=cordconstnode.create(ctx^.constval,ctx^.constdef,false);
-            typecheckpass(n);
+            n:=make_const_node(ctx^.targets[idx].c);
             ld.free;
             exit;
           end;
@@ -658,18 +947,18 @@ implementation
           end;
       end;
 
-    function build_clone(stash : tipacpstash; visidx : longint;
-      const val : tconstexprint; const clonerealname,clonemangled : string;
+    function build_clone(stash : tipacpstash; const specs : tipacpspecs;
+      const clonerealname,clonemangled : string;
       out clonecode : tnode) : tprocdef;
       var
         clonepd : tprocdef;
         targetpv : tparavarsym;
         ctx : tremap;
+        i : longint;
       begin
         result:=nil;
         clonecode:=nil;
-        targetpv:=nth_visible_para(stash.calleepd,visidx);
-        if not assigned(targetpv) then
+        if length(specs)=0 then
           exit;
 
         clonepd:=create_procdef_alias(stash.calleepd,clonerealname,clonemangled,
@@ -687,9 +976,21 @@ implementation
         ctx.newpd:=clonepd;
         ctx.oldfuncret:=stash.calleepd.funcretsym;
         ctx.newfuncret:=clonepd.funcretsym;
-        ctx.targetpara:=targetpv;
-        ctx.constdef:=targetpv.vardef;
-        ctx.constval:=val;
+        setlength(ctx.targets,length(specs));
+        for i:=0 to high(specs) do
+          begin
+            targetpv:=nth_visible_para(stash.calleepd,specs[i].visidx);
+            if not assigned(targetpv) then
+              begin
+                clonecode.free;
+                clonecode:=nil;
+                exit;
+              end;
+            ctx.targets[i].para:=targetpv;
+            ctx.targets[i].c:=specs[i].c;
+            { the literal takes the parameter's declared type }
+            ctx.targets[i].c.def:=targetpv.vardef;
+          end;
         ctx.oldlocals:=TFPList.create;
         ctx.newlocals:=TFPList.create;
         try
@@ -705,9 +1006,20 @@ implementation
 
     { -------- call retargeting ---------------------------------------------- }
 
-    function clone_key(pd : tprocdef; visidx : longint; const val : tconstexprint) : string;
+    { the mangled/name/cache-key suffix for a whole (possibly multi-param) tuple:
+      the concatenation of the per-spec tokens in visible-index order }
+    function specs_suffix(const specs : tipacpspecs) : string;
+      var
+        i : longint;
       begin
-        result:=hexstr(ptrint(pd),sizeof(ptrint)*2)+'_'+tostr(visidx)+'_'+tostr(val.svalue);
+        result:='';
+        for i:=0 to high(specs) do
+          result:=result+spec_token(specs[i]);
+      end;
+
+    function clone_key(pd : tprocdef; const specs : tipacpspecs) : string;
+      begin
+        result:=hexstr(ptrint(pd),sizeof(ptrint)*2)+'_'+specs_suffix(specs);
       end;
 
     function clones_of_routine(pd : tprocdef) : longint;
@@ -722,19 +1034,20 @@ implementation
             inc(result);
       end;
 
-    { get-or-create the clone for (callee,visidx,val); returns its procsym or
-      nil (budget/cap exceeded).  A newly-created clone is appended to PENDING. }
-    function get_clone(stash : tipacpstash; visidx : longint;
-      const val : tconstexprint; pending : TFPObjectList;
-      const pos : tfileposinfo) : tprocsym;
+    { get-or-create the clone specialized on the whole SPECS tuple; returns its
+      procsym or nil (budget/cap exceeded).  A newly-created clone is appended to
+      PENDING and counts as ONE clone against both caps. }
+    function get_clone(stash : tipacpstash; const specs : tipacpspecs;
+      pending : TFPObjectList; const pos : tfileposinfo) : tprocsym;
       var
         key,rn,mn : string;
         clonepd : tprocdef;
         clonecode : tnode;
-        vstr : string;
       begin
         result:=nil;
-        key:=clone_key(stash.calleepd,visidx,val);
+        if length(specs)=0 then
+          exit;
+        key:=clone_key(stash.calleepd,specs);
         clonepd:=tprocdef(clonecache.Find(key));
         if assigned(clonepd) then
           exit(tprocsym(clonepd.procsym));
@@ -750,12 +1063,9 @@ implementation
               ' (per-routine clone cap)');
             exit;
           end;
-        vstr:=tostr(val.svalue);
-        if val.svalue<0 then
-          vstr:='n'+tostr(-val.svalue);
-        rn:='$ipacp$'+stash.calleepd.procsym.realname+'$p'+tostr(visidx)+'v'+vstr;
-        mn:=stash.calleepd.mangledname+'$ipacp$p'+tostr(visidx)+'v'+vstr;
-        clonepd:=build_clone(stash,visidx,val,rn,mn,clonecode);
+        rn:='$ipacp$'+stash.calleepd.procsym.realname+'$'+specs_suffix(specs);
+        mn:=stash.calleepd.mangledname+'$ipacp$'+specs_suffix(specs);
+        clonepd:=build_clone(stash,specs,rn,mn,clonecode);
         if not assigned(clonepd) then
           exit;
         clonecache.add(key,clonepd);
@@ -772,27 +1082,60 @@ implementation
         pending  : TFPObjectList;
       end;
 
-    { find, in call node N, the first argument that is a constant for an
-      eligible parameter of STASH; returns its visible index or -1 }
-    function first_const_para(stash : tipacpstash; call : tcallnode;
-      out val : tconstexprint) : longint;
+    { insert SPEC into SPECS keeping the array sorted by ascending visidx (so a
+      given constant tuple always produces the same key/name regardless of the
+      textual argument order) }
+    procedure insert_spec_sorted(var specs : tipacpspecs; const spec : tipacpspec);
+      var
+        i,j : longint;
+      begin
+        i:=length(specs);
+        setlength(specs,i+1);
+        j:=i;
+        while (j>0) and (specs[j-1].visidx>spec.visidx) do
+          begin
+            specs[j]:=specs[j-1];
+            dec(j);
+          end;
+        specs[j]:=spec;
+      end;
+
+    { collect EVERY argument of call node CALL that is a compile-time constant
+      (ordinal or single/double float) bound to an eligible parameter of STASH.
+      A call site that passes constants for several eligible params yields a
+      multi-element tuple here, so it is specialized by ONE tuple clone rather
+      than several single-param clones. }
+    function collect_const_paras(stash : tipacpstash; call : tcallnode) : tipacpspecs;
       var
         pn : tcallparanode;
         visidx : longint;
+        spec : tipacpspec;
       begin
-        result:=-1;
-        val:=0;
+        result:=nil;
         pn:=tcallparanode(call.left);
         while assigned(pn) do
           begin
-            if assigned(pn.left) and (pn.left.nodetype=ordconstn) and
-               assigned(pn.parasym) then
+            if assigned(pn.left) and assigned(pn.parasym) and
+               (pn.left.nodetype in [ordconstn,realconstn]) then
               begin
                 visidx:=visible_index_of(stash.calleepd,pn.parasym);
                 if (visidx>=0) and para_is_eligible(stash,visidx) then
                   begin
-                    val:=tordconstnode(pn.left).value;
-                    exit(visidx);
+                    spec.visidx:=visidx;
+                    spec.c.def:=tparavarsym(pn.parasym).vardef;
+                    if pn.left.nodetype=ordconstn then
+                      begin
+                        spec.c.isreal:=false;
+                        spec.c.ordval:=tordconstnode(pn.left).value;
+                        spec.c.realval:=0;
+                      end
+                    else
+                      begin
+                        spec.c.isreal:=true;
+                        spec.c.ordval:=0;
+                        spec.c.realval:=trealconstnode(pn.left).value_real;
+                      end;
+                    insert_spec_sorted(result,spec);
                   end;
               end;
             pn:=tcallparanode(pn.right);
@@ -808,14 +1151,28 @@ implementation
           result:=nil;
       end;
 
+    { build the '<p1>=<v1>, <p2>=<v2>' fragment for the -OoREPORT remark }
+    function specs_remark(calleepd : tprocdef; const specs : tipacpspecs) : string;
+      var
+        i : longint;
+      begin
+        result:='';
+        for i:=0 to high(specs) do
+          begin
+            if i>0 then
+              result:=result+', ';
+            result:=result+nth_visible_para(calleepd,specs[i].visidx).realname+
+              '='+spec_valstr(specs[i].c);
+          end;
+      end;
+
     function scan_calls(var n : tnode; arg : pointer) : foreachnoderesult;
       var
         ctx : pscanctx;
         call : tcallnode;
         stash : tipacpstash;
         calleepd : tprocdef;
-        visidx : longint;
-        val : tconstexprint;
+        specs : tipacpspecs;
         clonesym : tprocsym;
         newcall : tnode;
       begin
@@ -836,10 +1193,10 @@ implementation
         stash:=find_stash(calleepd);
         if not assigned(stash) then
           exit;
-        visidx:=first_const_para(stash,call,val);
-        if visidx<0 then
+        specs:=collect_const_paras(stash,call);
+        if length(specs)=0 then
           exit;
-        clonesym:=get_clone(stash,visidx,val,ctx^.pending,call.fileinfo);
+        clonesym:=get_clone(stash,specs,ctx^.pending,call.fileinfo);
         if not assigned(clonesym) then
           exit;
         { retarget by rebuilding a fresh call to the clone's procsym with a
@@ -850,8 +1207,7 @@ implementation
           clonesym,clonesym.owner,nil,[],nil);
         typecheckpass(newcall);
         OptRemark(call.fileinfo,'ipacp','call to '+calleepd.procsym.realname+
-          ' specialized for '+nth_visible_para(calleepd,visidx).realname+'='+
-          tostr(val.svalue));
+          ' specialized for '+specs_remark(calleepd,specs));
         n.free;
         n:=newcall;
       end;

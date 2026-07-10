@@ -132,6 +132,13 @@ interface
     { parses only the body of a non nested routine; needs a correctly setup pd }
     procedure read_proc_body(pd:tprocdef);
 
+    { -OoIPACP: scan the already-parsed main program body (MAINPI, potype_proginit)
+      for call sites that pass compile-time constants to eligible parameters of
+      stashed routines, retarget them to specialized clones, and compile those
+      clones.  Must be called after MAINPI.parse_body and before its
+      generate_code_tree, with the module static symtable on the symtablestack. }
+    procedure ipacp_process_main_body(mainpi:tcgprocinfo);
+
     procedure import_external_proc(pd:tprocdef);
 
 
@@ -3533,6 +3540,45 @@ implementation
         current_procinfo:=oldpi;
         for i:=0 to high(ipacp_suppressed_msgs) do
           SetMessageVerbosity(ipacp_suppressed_msgs[i],savedmsgstate[i]);
+      end;
+
+
+    procedure ipacp_process_main_body(mainpi:tcgprocinfo);
+      var
+        ipacp_pending : TFPObjectList;
+        ipacp_code    : tnode;
+        i             : longint;
+      begin
+        if not (cs_opt_ipacp in current_settings.optimizerswitches) then
+          exit;
+        if not assigned(mainpi) or not assigned(mainpi.procdef) or
+           not assigned(mainpi.code) then
+          exit;
+        { only the real program/library init body carries user code worth
+          scanning; the synthetic stubs (mainstub/libmainstub/pkgstub) do not }
+        if mainpi.procdef.proctypeoption<>potype_proginit then
+          exit;
+        ipacp_pending:=TFPObjectList.create(true);
+        try
+          ipacp_code:=mainpi.code;
+          { mirror read_proc_body: the caller's symtables must be reachable while
+            the retargeted call nodes are re-typechecked.  For the main proc the
+            localst IS the module static symtable (already on the stack) and the
+            (empty) parast sits below normal_function_level, so add/remove are
+            effectively no-ops here -- but keep them for symmetry/safety. }
+          mainpi.add_to_symtablestack;
+          ipacp_process_calls(mainpi.procdef,ipacp_code,ipacp_pending);
+          mainpi.remove_from_symtablestack;
+          mainpi.code:=ipacp_code;
+          { compile the synthesised clone bodies now (before the main body's own
+            generate_code_tree): each is an independent out-of-line routine and
+            only its symbol needs to exist for the retargeted call sites }
+          for i:=0 to ipacp_pending.count-1 do
+            compile_ipacp_clone(tipacpclone(ipacp_pending[i]).clonepd,
+              tipacpclone(ipacp_pending[i]).clonecode);
+        finally
+          ipacp_pending.free;
+        end;
       end;
 
 
