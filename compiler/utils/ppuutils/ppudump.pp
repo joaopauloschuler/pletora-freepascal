@@ -2607,7 +2607,9 @@ const
          'cs_opt_icf',
          'cs_opt_ipara',
          'cs_opt_finalvalue',
-         'cs_opt_sibcall'
+         'cs_opt_sibcall',
+         'cs_opt_report',
+         'cs_opt_devirt'
        );
     var
          globalswitch  : tglobalswitch;

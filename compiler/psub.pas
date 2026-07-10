@@ -173,6 +173,7 @@ implementation
        optcse,
        optloop,
        optfinalvalue,
+       optdevirt,
        optpure,
        optpartialinline,
        optipara,
@@ -1284,6 +1285,19 @@ implementation
        if (cs_opt_finalvalue in current_settings.optimizerswitches) and
          ((flags*[pi_has_assembler_block,pi_is_assembler,pi_uses_exceptions,pi_has_label])=[]) then
          OptimizeFinalValue(code);
+
+       { provable-receiver devirtualization (-OoDEVIRT): rewrite virtual calls
+         whose receiver a conservative constructor-provenance analysis proves
+         monomorphic into direct calls to the concrete override (see optdevirt).
+         Skipped for routines with inline assembler (the receiver's storage may
+         be referenced opaquely) or with labels (goto could enter regions the
+         provenance scan assumed unreachable). Independent of DFA -- it is a
+         structural whole-tree scan. NOTE: this runs AFTER do_optinline above,
+         so a call devirtualized here does not itself feed the inliner in this
+         routine; wiring the direct target into the inliner is a follow-up. }
+       if (cs_opt_devirt in current_settings.optimizerswitches) and
+         ((flags*[pi_has_assembler_block,pi_is_assembler,pi_has_label])=[]) then
+         OptimizeDevirt(code);
 
        if (cs_opt_nodedfa in current_settings.optimizerswitches) and
          { creating dfa is not always possible }

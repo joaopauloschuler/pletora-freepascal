@@ -219,6 +219,16 @@ interface
           { checks if there are any parameters which end up at the stack, i.e.
             which have LOC_REFERENCE and set pi_has_stackparameter if this applies }
           procedure check_stack_parameters;
+          { -OoDEVIRT: turn a proven-monomorphic virtual dispatch into a direct
+            call to the concrete override PD (the runtime dispatch would have
+            selected). Mirrors the WPO devirtualization mechanism: procdefinition
+            (the virtual base def, whose signature the override shares) is kept
+            for the call convention/parameter layout, and the emitted symbol name
+            is forced to PD's, so ncgcal skips the VMT indirect load. }
+          procedure devirtualize_target(pd: tprocdef);
+          { true if a forced call name is already set (e.g. Objective-C message
+            send, or a prior devirtualization) -> -OoDEVIRT must not touch it }
+          function has_forced_call_name: boolean;
           { force the name of the to-be-called routine to a particular string,
             used for Objective-C message sending.  }
           property parameters : tnode read left write left;
@@ -2293,6 +2303,18 @@ implementation
     function tcallnode.getoverrideprocnamedef: tprocdef; inline;
       begin
         result:=foverrideprocnamedef;
+      end;
+
+
+    procedure tcallnode.devirtualize_target(pd: tprocdef);
+      begin
+        foverrideprocnamedef:=pd;
+      end;
+
+
+    function tcallnode.has_forced_call_name: boolean;
+      begin
+        result:=assigned(foverrideprocnamedef);
       end;
 
 

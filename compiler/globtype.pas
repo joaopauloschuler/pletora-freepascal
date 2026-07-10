@@ -789,7 +789,25 @@ interface
            (unlike the per-pass -vn notes) and machine-greppable. Measure-only:
            enabling it never changes generated code. NOT part of the -O4
            defaults }
-         cs_opt_report
+         cs_opt_report,
+         { provable-receiver devirtualization (-OoDEVIRT): the intra-procedural
+           counterpart of the WPO -Owdevirtcalls pass. At a virtual call site
+           x.VirtMethod(...) where a conservative local dataflow proves the
+           receiver x's dynamic type EXACTLY -- x is a local (or by-value
+           parameter) reference variable, never address-taken, never captured
+           by a nested scope, never passed by var/out, and EVERY assignment to
+           x in the routine is a concrete constructor call TFoo.Create (the
+           same class TFoo, via a loadvmtaddr of a typen, never a class-ref
+           variable) -- the indirect VMT dispatch is replaced by a direct call
+           to TFoo's resolution of that vmt slot (the override the runtime
+           dispatch would have selected). No runtime guard is needed because
+           the only non-nil value x can hold is a TFoo instance; a call on nil
+           is already undefined in the virtual form. Interfaces, class-ref
+           constructor calls, virtual class methods/constructors via an
+           instance and dynamic casts prove nothing and are skipped. Measure
+           and report via -Ooreport. Opt-in; NOT part of the -O4 defaults --
+           a wrong target is a miscompile }
+         cs_opt_devirt
        );
        toptimizerswitches = set of toptimizerswitch;
 
@@ -870,7 +888,7 @@ interface
          'SINK','STOREMOTION','VRP','REFELIDE','SWITCHTABLE','REE',
          'SHRINKWRAP','GVNPRE','PURE','PARTIALINLINE','STACKALLOC','SLP',
          'UNROLLDYN','PREFETCH','ICF','IPARA','FINALVALUE','SIBCALL',
-         'REPORT'
+         'REPORT','DEVIRT'
        );
        WPOptimizerSwitchStr : array [twpoptimizerswitch] of string[14] = (
          'DEVIRTCALLS','OPTVMTS','SYMBOLLIVENESS'
