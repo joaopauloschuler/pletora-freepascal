@@ -3844,8 +3844,14 @@ unit optloop;
         if n.nodetype=forn then
           begin
             tvectorizecontext(arg^).processloop(n);
-            { n may now be a block; do not recurse into the freed for-node }
-            result:=fen_norecurse_false;
+            { If processloop vectorized this loop, n is now a block: stop, so we
+              do not recurse into the freed for-node.  If it DECLINED (n is still
+              a forn -- e.g. this is an outer counted loop whose body holds a
+              nested reduction loop, the dense-layer `for row do (dot over cols)`
+              shape), fall through with fen_false so the walk descends into the
+              body and the inner reduction loop still gets its own processloop. }
+            if n.nodetype<>forn then
+              result:=fen_norecurse_false;
           end;
       end;
 
@@ -6635,8 +6641,13 @@ unit optloop;
         if n.nodetype=forn then
           begin
             treassoccontext(arg^).processloop(n);
-            { n may now be a block; do not recurse into the freed for-node }
-            result:=fen_norecurse_false;
+            { If processloop split this loop, n is now a block: stop, so we do not
+              recurse into the freed for-node.  If it DECLINED (n is still a forn,
+              e.g. an outer counted loop enclosing a nested reduction loop), fall
+              through with fen_false so the walk descends into the body and the
+              inner reduction loop still gets its own processloop. }
+            if n.nodetype<>forn then
+              result:=fen_norecurse_false;
           end;
       end;
 

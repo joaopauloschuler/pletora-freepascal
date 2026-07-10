@@ -47,6 +47,32 @@ var a,b: TS;
 begin SetLength(a,64); SetLength(b,64); Writeln(dot(a,b,64):0:3, sum(a,64):0:3); end.
 EOF
 
+# nested dot kernel: the reduction is the INNER loop of an enclosing counted
+# for-loop (the dense-layer `for row do (dot over cols)` shape).  The loop-pass
+# driver must descend into the outer loop and vectorize the inner reduction --
+# before the fix the driver stopped at the outer for-node and this stayed scalar.
+cat > "$tmp/kn.pp" <<'EOF'
+program kn;
+{$mode objfpc}{$H+}
+type TS = array of single;
+procedure matvec(const m: array of TS; const v: TS; var r: TS; rows,cols: longint);
+var row,col: longint; s: single; rowarr,vv: TS;
+begin
+  vv:=v;
+  for row:=0 to rows-1 do
+    begin
+      s:=0; rowarr:=m[row];
+      for col:=0 to cols-1 do s:=s+rowarr[col]*vv[col];
+      r[row]:=s;
+    end;
+end;
+var m: array of TS; v,r: TS; i: longint;
+begin
+  SetLength(m,4); for i:=0 to 3 do SetLength(m[i],64);
+  SetLength(v,64); SetLength(r,4); matvec(m,v,r,4,64); Writeln(r[0]:0:3);
+end.
+EOF
+
 # double-precision dot kernel (for vfmadd231pd)
 cat > "$tmp/kd.pp" <<'EOF'
 program kd;
@@ -77,6 +103,15 @@ sse_spill=$(grep -cE "$spill_re" "$s" || true)
 echo "SSE64  sum+dot : addps=$sse_addps  acc-spill-to-stack=$sse_spill (must be 0)"
 [ "$sse_addps" -ge 1 ] || { echo "FAIL: expected a packed addps (reduction not vectorized?)"; rc=1; }
 [ "$sse_spill" -eq 0 ] || { echo "FAIL: packed accumulator spilled/reloaded to a stack slot (not register-resident)"; rc=1; }
+
+# ---- 1b. nested inner reduction (single, SSE): must still pack ----
+compile kn.pp -Cfsse64
+sn="$tmp/kn.s"
+nest_mulps=$(grep -cE '(^|[^v])mulps' "$sn" || true)
+nest_addps=$(grep -cE '(^|[^v])addps' "$sn" || true)
+echo "SSE64  nested  : mulps=$nest_mulps addps=$nest_addps (inner dot nested in outer for-loop must pack)"
+[ "$nest_mulps" -ge 1 ] || { echo "FAIL: nested inner dot did not pack (mulps absent) -- driver did not descend into the outer loop"; rc=1; }
+[ "$nest_addps" -ge 1 ] || { echo "FAIL: nested inner dot did not pack (addps absent) -- driver did not descend into the outer loop"; rc=1; }
 
 # ---- 2a. SSE dot: mul+add, no FMA ----
 sse_mulps=$(grep -cE '(^|[^v])mulps' "$s" || true)
