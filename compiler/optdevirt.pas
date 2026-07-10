@@ -253,6 +253,8 @@ implementation
                   cp:=tcallparanode(cp.right);
                 end;
             end;
+          else
+            ;
         end;
       end;
 

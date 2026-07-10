@@ -2610,7 +2610,8 @@ const
          'cs_opt_sibcall',
          'cs_opt_report',
          'cs_opt_devirt',
-         'cs_opt_ipacp'
+         'cs_opt_ipacp',
+         'cs_opt_vect256'
        );
     var
          globalswitch  : tglobalswitch;
