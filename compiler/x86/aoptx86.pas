@@ -4462,11 +4462,25 @@ unit aoptx86;
                                           movdqu x(mem1), %xmmreg
                                           movdqu %xmmreg, y(mem2)
 
-                                        ...but only as long as the memory blocks don't overlap
+                                        ...but only as long as the memory blocks don't overlap.
+
+                                        Only merge when optimizing for size: this shrinks the
+                                        code (4 scalar moves -> 2 wide moves) but does not make
+                                        it faster, and at speed it is an active pessimization --
+                                        when mem1 was just written by two narrower scalar stores
+                                        (e.g. a 2xdouble record produced field-by-field, or a
+                                        record function result spilled from xmm0:xmm1), the
+                                        merged 16-byte load cannot be satisfied by store-to-load
+                                        forwarding and stalls. That pattern is a complex-
+                                        arithmetic hot loop (core/fft regressed to ~0.6x vs stock
+                                        FPC at -O2 before this gate). Consistent with the XMM/AVX
+                                        block-copy modes in cgx86.getcopymode, which are likewise
+                                        restricted to -Os.
                                       }
                                       SourceRef := taicpu(p).oper[0]^.ref^;
                                       TargetRef := taicpu(hp1).oper[1]^.ref^;
-                                      if (taicpu(p).opsize = S_Q) and
+                                      if (cs_opt_size in current_settings.optimizerswitches) and
+                                        (taicpu(p).opsize = S_Q) and
                                         not RegUsedAfterInstruction(p_TargetReg, hp1, TmpUsedRegs) and
                                         GetNextInstruction(hp1, hp2) and
                                         MatchInstruction(hp2, A_MOV, [taicpu(p).opsize]) and
