@@ -112,7 +112,7 @@ implementation
     uses
       globals,cutils,constexp,verbose,fmodule,
       symconst,symbase,symtype,symsym,symtable,
-      defutil,paramgr,pparautl,pass_1,
+      defutil,paramgr,pparautl,pass_1,htypechk,
       nbas,nld,nmem,ncal,ncon,nflw,nutils,
       optutils,
       symcreat;
@@ -266,23 +266,15 @@ implementation
               pboolean(arg)^:=false;
               result:=fen_norecurse_true;
             end;
-          addrn:
-            { taking the address of a frame variable (local or parameter) forces
-              that variable into memory (non-register).  The clone rebuilds the
-              localst/parast fresh and re-typechecks a copy that is already
-              typecheck-marked, so this "must stay in memory" property is not
-              re-derived on the clone's new symbol -- the register allocator then
-              keeps it in a register and taking its address internalerrors in
-              the code generator.  Reject such routines (rare among clonable
-              kernels); addresses of unit-level/global data are unaffected but
-              are conservatively rejected here too. }
-            if assigned(taddrnode(n).left) and
-               (taddrnode(n).left.nodetype=loadn) and
-               (tloadnode(taddrnode(n).left).symtableentry.typ in [localvarsym,paravarsym]) then
-              begin
-                pboolean(arg)^:=false;
-                result:=fen_norecurse_true;
-              end;
+          { addrn (taking the address of a frame variable) used to be rejected
+            here: the clone rebuilds its localst/parast fresh and re-uses an
+            already-typecheck-marked body copy, so the "@var forces the var into
+            memory" property (addr_taken on the SYMBOL) was not re-derived on the
+            clone's new symbol, and the code generator internalerrored (2006111510)
+            taking the address of a register-resident var.  That is now fixed
+            structurally in build_clone (mark_addrtaken_cb re-sets addr_taken on
+            the clone's own symbols after the remap), so address-of-frame-variable
+            routines are eligible again. }
           else
             ;
         end;
@@ -533,157 +525,6 @@ implementation
         foreachnodestatic(pm_postprocess,code,@has_control_flow,@result);
       end;
 
-    { -------- for-loop counter escape gate ---------------------------------- }
-
-    { count load nodes of symbol SYM within (sub)tree N }
-    type
-      pcountctx = ^tcountctx;
-      tcountctx = record
-        sym : tsym;
-        n   : longint;
-      end;
-
-    function count_sym_loads_cb(var n : tnode; arg : pointer) : foreachnoderesult;
-      begin
-        result:=fen_true;
-        if (n.nodetype=loadn) and
-           (tloadnode(n).symtableentry=pcountctx(arg)^.sym) then
-          inc(pcountctx(arg)^.n);
-      end;
-
-    function count_sym_loads(root : tnode; sym : tsym) : longint;
-      var
-        ctx : tcountctx;
-      begin
-        ctx.sym:=sym;
-        ctx.n:=0;
-        foreachnodestatic(pm_postprocess,root,@count_sym_loads_cb,@ctx);
-        result:=ctx.n;
-      end;
-
-    function collect_forns_cb(var n : tnode; arg : pointer) : foreachnoderesult;
-      begin
-        result:=fen_true;
-        if n.nodetype=forn then
-          TFPList(arg).add(n);
-      end;
-
-    function for_loopvar(f : tnode) : tsym;
-      begin
-        result:=nil;
-        if assigned(tfornode(f).left) and
-           (tfornode(f).left.nodetype=loadn) then
-          result:=tloadnode(tfornode(f).left).symtableentry;
-      end;
-
-    { true if FORN lies within OTHER's subtree (OTHER is an enclosing loop) }
-    type
-      pfindnodectx = ^tfindnodectx;
-      tfindnodectx = record
-        target : tnode;
-        found  : boolean;
-      end;
-
-    function find_node_cb(var n : tnode; arg : pointer) : foreachnoderesult;
-      begin
-        result:=fen_true;
-        if n=pfindnodectx(arg)^.target then
-          pfindnodectx(arg)^.found:=true;
-      end;
-
-    function forn_within(forn, other : tnode) : boolean;
-      var
-        ctx : tfindnodectx;
-      begin
-        result:=false;
-        if forn=other then
-          exit;
-        ctx.target:=forn;
-        ctx.found:=false;
-        foreachnodestatic(pm_postprocess,other,@find_node_cb,@ctx);
-        result:=ctx.found;
-      end;
-
-    { true if the body contains two or more counted for-loops that are NOT nested
-      one within another (i.e. sibling / cousin loops).  We refuse to specialize
-      such a routine: turning its loop bounds into compile-time constants feeds
-      constant-trip sibling loops to the aggressive -O4 loop-nest passes
-      (LICM / LOOPFUSE / LOOPDISTPAT / LOOPPEEL / LOOPSPLIT / UNROLLJAM ...),
-      which are not yet robust against constant-bounds sibling loops and can
-      miscompile or crash on them (a hazard that predates this pass -- the same
-      clone built from an ordinary caller trips it too).  Single-loop kernels and
-      nested loop-nests (the primary loop-bound-as-parameter IPACP target) stay
-      eligible.  This gate is purely conservative: it only ever declines to
-      clone, never changes emitted code. }
-    function has_sibling_forloops(code : tnode) : boolean;
-      var
-        forns : TFPList;
-        i,j,toplevel : longint;
-        nested : boolean;
-      begin
-        result:=false;
-        forns:=TFPList.create;
-        try
-          foreachnodestatic(pm_postprocess,code,@collect_forns_cb,forns);
-          { count for-loops that are not enclosed by any other for-loop }
-          toplevel:=0;
-          for i:=0 to forns.count-1 do
-            begin
-              nested:=false;
-              for j:=0 to forns.count-1 do
-                if (i<>j) and forn_within(tnode(forns[i]),tnode(forns[j])) then
-                  begin
-                    nested:=true;
-                    break;
-                  end;
-              if not nested then
-                begin
-                  inc(toplevel);
-                  if toplevel>=2 then
-                    exit(true);
-                end;
-            end;
-        finally
-          forns.free;
-        end;
-      end;
-
-    { true if some for-loop counter is read OUTSIDE every for-loop that uses it,
-      i.e. the loop's exit value is observed.  We refuse to specialize such a
-      routine: turning the loop bound into a compile-time constant lets the loop
-      passes rewrite the (now single-trip / empty) loop, and the exact exit value
-      of a constant-bounds for counter is not something we should let a clone
-      depend on.  (Counters that are only ever used AS a loop counter -- the
-      common case -- do not gate.) }
-    function loop_counter_escapes(code : tnode) : boolean;
-      var
-        forns : TFPList;
-        i,j : longint;
-        v : tsym;
-        total,insum : longint;
-      begin
-        result:=false;
-        forns:=TFPList.create;
-        try
-          foreachnodestatic(pm_postprocess,code,@collect_forns_cb,forns);
-          for i:=0 to forns.count-1 do
-            begin
-              v:=for_loopvar(tnode(forns[i]));
-              if not assigned(v) then
-                continue;
-              total:=count_sym_loads(code,v);
-              insum:=0;
-              for j:=0 to forns.count-1 do
-                if for_loopvar(tnode(forns[j]))=v then
-                  insum:=insum+count_sym_loads(tnode(forns[j]),v);
-              if total>insum then
-                exit(true);
-            end;
-        finally
-          forns.free;
-        end;
-      end;
-
     { -------- stash ---------------------------------------------------------- }
 
     procedure ipacp_stash_candidate(pd : tprocdef; code : tnode;
@@ -713,10 +554,6 @@ implementation
         if node_count(code,ipacp_body_budget)>=ipacp_body_budget then
           exit;
         if not body_has_control_flow(code) then
-          exit;
-        if loop_counter_escapes(code) then
-          exit;
-        if has_sibling_forloops(code) then
           exit;
 
         { collect the visible indices of specializable parameters }
@@ -866,6 +703,33 @@ implementation
         { anything else (unit-level var/const, another routine) stays as-is }
       end;
 
+    { Re-establish the "address taken" property on the clone's own symbols.
+      Taking @var forces that variable into memory; the frontend records this by
+      setting addr_taken on the var's SYMBOL during typecheck of the addrn.  The
+      clone body is a copy of an already-typecheck-marked template whose loads we
+      just repointed onto the clone's freshly-built local/param symbols -- symbols
+      on which typecheck never ran, so their addr_taken bit is clear even though
+      the body still takes their address.  The register allocator would then keep
+      such a var in a register and the code generator would internalerror
+      (2006111510) taking its address.  Walk the remapped body and set addr_taken
+      on every local/param whose address it takes, exactly as typecheck would. }
+    function mark_addrtaken_cb(var n : tnode; arg : pointer) : foreachnoderesult;
+      var
+        inner : tnode;
+      begin
+        result:=fen_true;
+        if n.nodetype<>addrn then
+          exit;
+        inner:=taddrnode(n).left;
+        if assigned(inner) and (inner.nodetype=loadn) and
+           (tloadnode(inner).symtableentry is tabstractvarsym) and
+           (tloadnode(inner).symtableentry.typ in [localvarsym,paravarsym]) then
+          { same call taddrnode.pass_typecheck makes: mark the symbol
+            address-taken AND force it out of a register (varregable:=vr_none),
+            so the code generator gives it a memory location }
+          make_not_regable(inner,[ra_addr_regable,ra_addr_taken]);
+      end;
+
     { classify a funcret-role sym: 0 = the $result local, 1 = the function-name
       alias, 2 = the RESULT alias; -1 if not a funcret sym }
     function funcret_role(sym : tsym) : longint;
@@ -997,6 +861,9 @@ implementation
           clone_locals(stash.calleepd,clonepd,@ctx);
           map_funcret(stash.calleepd,clonepd,@ctx);
           foreachnodestatic(pm_postprocess,clonecode,@remap_body,@ctx);
+          { after the loads point at the clone's own symbols, re-derive the
+            address-taken property those symbols must carry (see above) }
+          foreachnodestatic(pm_postprocess,clonecode,@mark_addrtaken_cb,nil);
         finally
           ctx.oldlocals.free;
           ctx.newlocals.free;

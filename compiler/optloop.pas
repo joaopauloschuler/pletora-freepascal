@@ -315,6 +315,24 @@ unit optloop;
                     { create block statement }
                     result:=internalstatements(newforstatement);
                     addstatement(newforstatement,unrollblock);
+                    { The fully-unrolled body dropped the loop counter: its reads
+                      were rewritten to constants and the for-node is gone, so the
+                      counter variable is now never assigned.  A stand-alone
+                      for-loop leaves the counter at its last iterated value (the
+                      `to' bound t1) when it ran.  Unless that exit value is known
+                      dead (lnf_dont_mind_loopvar_on_exit -- set by objfpc/delphi's
+                      undefined-on-exit rule at parse time, or by DFA once it has
+                      proved the counter unused after the loop), restore it so a
+                      post-loop read of an escaping counter (mode unleashed keeps
+                      the counter live across the exit) still sees the right value.
+                      counts>=1 means the loop actually ran; a zero-trip loop
+                      leaves the counter untouched, exactly as a real for-loop
+                      would, so no fixup is emitted for it. }
+                    if (counts>=1) and
+                       not(lnf_dont_mind_loopvar_on_exit in tfornode(node).loopflags) then
+                      addstatement(newforstatement,
+                        cassignmentnode.create_internal(tfornode(node).left.getcopy,
+                          tfornode(node).t1.getcopy));
                     doinlinesimplify(result);
                   end;
               end
@@ -6209,6 +6227,17 @@ unit optloop;
           changed:=true;
           fusedany:=true;
           firstpair:=false;
+          { do_firstpass is a var-param that may REPLACE the fused loop: for a
+            constant-trip fused loop, tfornode.pass_typecheck runs the stock loop
+            unroller, which can fully unroll it (getridoffor) into a plain block
+            with no for-node left.  The greedy fold below reinterprets s1.left as a
+            tfornode on the next iteration, so if the survivor is no longer a
+            counted for-loop we must stop folding onto it (it would walk a block as
+            if it were a for-node -- an internalerror/stack overflow).  Any
+            still-unfused following loops remain visited by the outer
+            foreachnodestatic walk and can still fuse among themselves. }
+          if fusedfor.nodetype<>forn then
+            break;
         until false;
       end;
 
@@ -6481,6 +6510,18 @@ unit optloop;
             exit('descending (downto) loop');
           if assigned(forn.loopstep) then
             exit('non-unit loop step');
+          { The reassociated form drives the counter with an explicit main+tail
+            while loop, which leaves it at hi+1 (or, for an empty range, at lo) --
+            not at the for-loop's exit value (hi when it ran, unchanged when it did
+            not).  That difference is only observable if the counter's exit value
+            is live after the loop, so reassociate only when it is known dead
+            (lnf_dont_mind_loopvar_on_exit -- objfpc/delphi's undefined-on-exit
+            rule at parse time, or DFA having proved the counter unused after the
+            loop).  Reduction-loop counters are almost always dead here, so this
+            keeps the transform firing on the intended kernels while staying sound
+            for an escaping counter (mode unleashed keeps the counter live). }
+          if not(lnf_dont_mind_loopvar_on_exit in forn.loopflags) then
+            exit('loop counter''s exit value is observed after the loop');
 
           { counter: simple non-aliased signed 32/64-bit local/value-param }
           counter:=rangeelim_simple_var(forn.left);
