@@ -147,13 +147,29 @@ implementation
         (scalarleft=true), matching the source's non-commutative order. }
       var
         regb, regc, regs, resreg, regacc, regt : tregister;
+        regacc_x, regs_x, reghi : tregister;
         opps, movop, addop, mulop, xorop, movsop, fmaop : tasmop;
         refb, refc, refa, refsplat, refacc : treference;
-        avx, dbl, use_packed_fma : boolean;
-        scalarsize : tcgsize;
+        avx, dbl, use_packed_fma, use256 : boolean;
+        scalarsize, mmsize : tcgsize;
       begin
         avx:=UseAVX;
         dbl:=isdouble;
+        { window byte width = vecwidth lanes * element size (4 single / 8 double).
+          32 bytes selects a 256-bit ymm register (OS_M256), 16 bytes the legacy
+          128-bit xmm path.  A ymm window is only ever built by the recognizer on
+          an AVX fputype (vect_want_ymm gates on FPUX86_HAS_AVXUNIT), so use256
+          implies avx; assert it so a mis-sized node fails loudly rather than
+          emitting a bad encoding. }
+        use256:=(vecwidth*(4+4*ord(dbl)))=32;   { vecwidth*(4 or 8) bytes = 32 -> ymm }
+        if use256 then
+          begin
+            if not avx then
+              internalerror(2026071010);
+            mmsize:=OS_M256;
+          end
+        else
+          mmsize:=OS_M128;
         { packed-FMA gate for the dot-product reduction: mirror the scalar a*b+c ->
           fma() contraction gate (tx86addnode.use_fma + try_fma), i.e. fast-math is
           enabled AND the fputype has an FMA/FMA4 unit.  The reduction recognizer
@@ -204,12 +220,16 @@ implementation
             { accreg := [0,..,0], then merge s into lane 0 with a scalar move so
               the upper lanes stay exactly zero (the register-source path of
               a_loadmm_*_reg would movaps a full 128 bits and clobber them, so the
-              merge must be an explicit MOVSS|MOVSD / v-form reg,reg here) }
-            regacc:=cg.getmmregister(current_asmdata.CurrAsmList,OS_M128);
+              merge must be an explicit MOVSS|MOVSD / v-form reg,reg here).  For a
+              ymm accumulator the vxorps zeroes all 256 bits; the VEX.128 vmovss
+              merge then zero-extends its xmm dst over the whole ymm, so lanes
+              1..7/1..3 stay exactly zero -- the seed is counted once. }
+            regacc:=cg.getmmregister(current_asmdata.CurrAsmList,mmsize);
             if avx then
               begin
                 current_asmdata.CurrAsmList.concat(taicpu.op_reg_reg_reg(xorop,S_NO,regacc,regacc,regacc));
-                current_asmdata.CurrAsmList.concat(taicpu.op_reg_reg_reg(movsop,S_NO,regs,regacc,regacc));
+                regacc_x:=cg.makeregsize(current_asmdata.CurrAsmList,regacc,OS_M128);
+                current_asmdata.CurrAsmList.concat(taicpu.op_reg_reg_reg(movsop,S_NO,regs,regacc_x,regacc_x));
               end
             else
               begin
@@ -237,7 +257,7 @@ implementation
               internalerror(2026070812);
             refb:=left.location.reference;
             tcgx86(cg).make_simple_ref(current_asmdata.CurrAsmList,refb);
-            regb:=cg.getmmregister(current_asmdata.CurrAsmList,OS_M128);
+            regb:=cg.getmmregister(current_asmdata.CurrAsmList,mmsize);
             current_asmdata.CurrAsmList.concat(taicpu.op_ref_reg(movop,S_NO,refb,regb));
             if kind=vok_reduce_dot then
               begin
@@ -247,7 +267,7 @@ implementation
                   internalerror(2026070813);
                 refc:=right.location.reference;
                 tcgx86(cg).make_simple_ref(current_asmdata.CurrAsmList,refc);
-                regc:=cg.getmmregister(current_asmdata.CurrAsmList,OS_M128);
+                regc:=cg.getmmregister(current_asmdata.CurrAsmList,mmsize);
                 current_asmdata.CurrAsmList.concat(taicpu.op_ref_reg(movop,S_NO,refc,regc));
                 if use_packed_fma then
                   begin
@@ -283,6 +303,21 @@ implementation
             if not (assigned(redctx) and redctx^.seeded) then
               internalerror(2026070814);
             regacc:=redctx^.accreg;
+            { ymm epilogue: fold the two 128-bit halves of the ymm accumulator
+              together first (vextractf128 $1 -> reghi, then vaddps/pd low+high),
+              leaving a 128-bit partial sum in the xmm view of regacc that the
+              existing SSE/AVX 128-bit horizontal reduce below finishes. }
+            if use256 then
+              begin
+                reghi:=cg.getmmregister(current_asmdata.CurrAsmList,OS_M128);
+                current_asmdata.CurrAsmList.concat(taicpu.op_const_reg_reg(A_VEXTRACTF128,S_NO,1,regacc,reghi));
+                regacc_x:=cg.makeregsize(current_asmdata.CurrAsmList,regacc,OS_M128);
+                if dbl then
+                  current_asmdata.CurrAsmList.concat(taicpu.op_reg_reg_reg(A_VADDPD,S_NO,reghi,regacc_x,regacc_x))
+                else
+                  current_asmdata.CurrAsmList.concat(taicpu.op_reg_reg_reg(A_VADDPS,S_NO,reghi,regacc_x,regacc_x));
+                regacc:=regacc_x;
+              end;
             regt:=cg.getmmregister(current_asmdata.CurrAsmList,OS_M128);
             if dbl then
               begin
@@ -329,26 +364,35 @@ implementation
             exit;
           end;
 
-        { --- broadcast: fill the 16-byte splat slot with [s,s,s,s] once --- }
+        { --- broadcast: fill the 16/32-byte splat slot with [s,s,..] once --- }
         if kind=vok_broadcast then
           begin
             secondpass(right);   { the loop-invariant scalar single/double s }
-            regs:=cg.getmmregister(current_asmdata.CurrAsmList,OS_M128);
+            regs:=cg.getmmregister(current_asmdata.CurrAsmList,mmsize);
+            { the low-128 splat is always built in the xmm view; for a ymm slot
+              the two halves are then made identical with vinsertf128 below }
+            regs_x:=regs;
+            if use256 then
+              regs_x:=cg.makeregsize(current_asmdata.CurrAsmList,regs,OS_M128);
             { load s into the low lane (movss / movsd) }
-            cg.a_loadmm_loc_reg(current_asmdata.CurrAsmList,scalarsize,right.location,regs,mms_movescalar);
+            cg.a_loadmm_loc_reg(current_asmdata.CurrAsmList,scalarsize,right.location,regs_x,mms_movescalar);
             { splat lane 0 across all lanes: single -> shufps imm $00 (4 lanes);
               double -> unpcklpd regs,regs (2 lanes) }
             if dbl then
               begin
                 if avx then
-                  current_asmdata.CurrAsmList.concat(taicpu.op_reg_reg_reg(A_VUNPCKLPD,S_NO,regs,regs,regs))
+                  current_asmdata.CurrAsmList.concat(taicpu.op_reg_reg_reg(A_VUNPCKLPD,S_NO,regs_x,regs_x,regs_x))
                 else
-                  current_asmdata.CurrAsmList.concat(taicpu.op_reg_reg(A_UNPCKLPD,S_NO,regs,regs));
+                  current_asmdata.CurrAsmList.concat(taicpu.op_reg_reg(A_UNPCKLPD,S_NO,regs_x,regs_x));
               end
             else if avx then
-              current_asmdata.CurrAsmList.concat(taicpu.op_const_reg_reg_reg(A_VSHUFPS,S_NO,$00,regs,regs,regs))
+              current_asmdata.CurrAsmList.concat(taicpu.op_const_reg_reg_reg(A_VSHUFPS,S_NO,$00,regs_x,regs_x,regs_x))
             else
-              current_asmdata.CurrAsmList.concat(taicpu.op_const_reg_reg(A_SHUFPS,S_NO,$00,regs,regs));
+              current_asmdata.CurrAsmList.concat(taicpu.op_const_reg_reg(A_SHUFPS,S_NO,$00,regs_x,regs_x));
+            { ymm: duplicate the built low 128-bit splat into the high 128 lane so
+              all 8/4 lanes hold s }
+            if use256 then
+              current_asmdata.CurrAsmList.concat(taicpu.op_const_reg_reg_reg(A_VINSERTF128,S_NO,1,regs_x,regs,regs));
             { store the packed splat to the slot (left = tempref to it) }
             secondpass(left);
             if not (left.location.loc in [LOC_REFERENCE,LOC_CREFERENCE]) then
@@ -366,7 +410,7 @@ implementation
           internalerror(2026070702);
         refb:=right.location.reference;
         tcgx86(cg).make_simple_ref(current_asmdata.CurrAsmList,refb);
-        regb:=cg.getmmregister(current_asmdata.CurrAsmList,OS_M128);
+        regb:=cg.getmmregister(current_asmdata.CurrAsmList,mmsize);
         current_asmdata.CurrAsmList.concat(taicpu.op_ref_reg(movop,S_NO,refb,regb));
 
         if kind=vok_copy then
@@ -405,7 +449,7 @@ implementation
               internalerror(2026070703);
             refc:=third.location.reference;
             tcgx86(cg).make_simple_ref(current_asmdata.CurrAsmList,refc);
-            regc:=cg.getmmregister(current_asmdata.CurrAsmList,OS_M128);
+            regc:=cg.getmmregister(current_asmdata.CurrAsmList,mmsize);
             current_asmdata.CurrAsmList.concat(taicpu.op_ref_reg(movop,S_NO,refc,regc));
 
             if (kind=vok_arr_scalar) and scalarleft then

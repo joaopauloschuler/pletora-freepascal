@@ -453,7 +453,7 @@ interface
           constructor create(a,b,c : tnode; _op : TOpCG; _vecwidth : longint; _isdouble : boolean);virtual;
           constructor create_scalar(a,b,splat : tnode; _op : TOpCG; _scalarleft : boolean; _vecwidth : longint; _isdouble : boolean);
           constructor create_copy(a,b : tnode; _vecwidth : longint; _isdouble : boolean);
-          constructor create_broadcast(splat,scalar : tnode; _isdouble : boolean);
+          constructor create_broadcast(splat,scalar : tnode; _vecwidth : longint; _isdouble : boolean);
           { vok_minmax: a[i..i+VL-1] := max/min(u, v) where u (opA, loaded into the
             destination register) and v (opB, the second/NaN-preferred operand) are
             each a 16-byte window -- an array-element access or a pre-broadcast
@@ -465,7 +465,7 @@ interface
             accumulator slot is initialised with the incoming scalar in lane 0,
             accumulated VL-wide across the loop, then horizontally summed back into
             the scalar. }
-          constructor create_reduce_init(seed : tnode; _isdouble : boolean);
+          constructor create_reduce_init(seed : tnode; _vecwidth : longint; _isdouble : boolean);
           constructor create_reduce(b,c : tnode; _isdot : boolean; _vecwidth : longint; _isdouble : boolean);
           constructor create_reduce_finish(target : tnode; _vecwidth : longint; _isdouble : boolean);
           { allocate a fresh shared reduction context and attach it to self }
@@ -664,11 +664,11 @@ implementation
       end;
 
 
-    constructor tvectoropnode.create_broadcast(splat,scalar : tnode; _isdouble : boolean);
+    constructor tvectoropnode.create_broadcast(splat,scalar : tnode; _vecwidth : longint; _isdouble : boolean);
       begin
         inherited create(vectoropn,splat,scalar,nil);
         op:=OP_NONE;
-        vecwidth:=0;
+        vecwidth:=_vecwidth;
         kind:=vok_broadcast;
         scalarleft:=false;
         isdouble:=_isdouble;
@@ -693,11 +693,11 @@ implementation
         sum:    left = b[i] window
         dot:    left = b[i] window   right = c[i] window
         finish: left = target scalar temp the horizontal sum is written to }
-    constructor tvectoropnode.create_reduce_init(seed : tnode; _isdouble : boolean);
+    constructor tvectoropnode.create_reduce_init(seed : tnode; _vecwidth : longint; _isdouble : boolean);
       begin
         inherited create(vectoropn,seed,nil,nil);
         op:=OP_NONE;
-        vecwidth:=0;
+        vecwidth:=_vecwidth;
         kind:=vok_reduce_init;
         scalarleft:=false;
         isdouble:=_isdouble;

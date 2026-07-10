@@ -826,7 +826,16 @@ interface
            call is retargeted by rebuilding a fresh call node to the clone.
            Opt-in; NOT part of the -O4 defaults -- a wrong clone is a
            miscompile }
-         cs_opt_ipacp
+         cs_opt_ipacp,
+         { AVX-256 (ymm) autovectorization width: widen the -OoVECTORIZE 128-bit
+           SSE/AVX packed windows to 256-bit ymm on an AVX-capable fputype
+           (single: 8 lanes/iteration, double: 4), with a vextractf128-based
+           horizontal-reduction epilogue (reduce ymm -> xmm -> scalar). Opt-in
+           and only takes effect when the fputype actually has an AVX unit
+           (-Cfavx / -Cfavx2 / ...); otherwise the existing 128-bit path is
+           kept. The scalar remainder tail (now up to 7/3 iterations) is
+           unchanged in shape. NOT part of the -O4 defaults }
+         cs_opt_vect256
        );
        toptimizerswitches = set of toptimizerswitch;
 
@@ -907,7 +916,7 @@ interface
          'SINK','STOREMOTION','VRP','REFELIDE','SWITCHTABLE','REE',
          'SHRINKWRAP','GVNPRE','PURE','PARTIALINLINE','STACKALLOC','SLP',
          'UNROLLDYN','PREFETCH','ICF','IPARA','FINALVALUE','SIBCALL',
-         'REPORT','DEVIRT','IPACP'
+         'REPORT','DEVIRT','IPACP','VECT256'
        );
        WPOptimizerSwitchStr : array [twpoptimizerswitch] of string[14] = (
          'DEVIRTCALLS','OPTVMTS','SYMBOLLIVENESS'

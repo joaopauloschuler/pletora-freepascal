@@ -64,9 +64,9 @@ unit optloop;
       cclasses,cutils,compinnr,cdynset,
       cgbase,aasmbase,aasmtai,aasmdata,aasmcnst,
       globtype,globals,constexp,
-{$ifdef i386}
+{$if defined(i386) or defined(x86_64)}
       cpuinfo,
-{$endif i386}
+{$endif}
       verbose,
       symbase,symconst,symdef,symsym,symtype,symtable,fmodule,
       defutil,defcmp,
@@ -3016,6 +3016,32 @@ unit optloop;
     const
       vect_vecwidth = 4;   { single lanes per 128-bit SSE packed op }
 
+    function vect_want_ymm : boolean;
+      { true when the AVX-256 (ymm) autovectorization width is requested
+        (-OoVECT256) AND the target fputype actually has an AVX unit, so the
+        128-bit windows can be safely widened to 256-bit. Only x86 has the
+        ymm-capable backend node; every other target keeps 128-bit. }
+      begin
+{$if defined(i386) or defined(x86_64)}
+        vect_want_ymm:=(cs_opt_vect256 in current_settings.optimizerswitches) and
+          (FPUX86_HAS_AVXUNIT in fpu_capabilities[current_settings.fputype]);
+{$else}
+        vect_want_ymm:=false;
+{$endif}
+      end;
+
+    function vect_widthtag : string;
+      { -OoREPORT width suffix: appended to the vectorize remark ONLY when the
+        256-bit ymm width was chosen (-OoVECT256 on an AVX fputype). The default
+        128-bit path appends nothing, so its remark stays byte-identical to the
+        pre-AVX-256 wording other tooling greps. }
+      begin
+        if vect_want_ymm then
+          vect_widthtag:=' width=ymm256'
+        else
+          vect_widthtag:='';
+      end;
+
     function vect_elem_reason(n : tnode; counter : tabstractvarsym; out vec : tvecnode) : string;
       { returns '' and sets vec to the vecn if n (after peeling typeconv wrappers)
         is  A[i]  where A is a simple non-aliased dynamic array of single and the
@@ -3616,6 +3642,15 @@ unit optloop;
             eletype:=s32floattype;
             elewidth:=4;
           end;
+        { -OoVECT256: on an AVX-capable fputype double the lane count so each
+          packed window is a 256-bit ymm op (single: 8 lanes, double: 4). The
+          window advance (i:=i+VL), the vector-loop guard (i<=hi-(VL-1)) and the
+          splat/temp slot sizes below are all expressed in terms of elewidth, so
+          the wider window and its scalar remainder (now up to VL-1 = 7/3
+          iterations) follow automatically; the backend node derives the ymm
+          register width from vecwidth*element-size. }
+        if vect_want_ymm then
+          elewidth:=elewidth*2;
 
         { ---- build the replacement statement block ---- }
         block:=internalstatements(stat);
@@ -3662,7 +3697,7 @@ unit optloop;
               ctemprefnode.create(seedtemp),
               cloadnode.create(tsym(accsym),accsym.owner)));
             redinit:=cvectoropnode.create_reduce_init(
-              ctemprefnode.create(seedtemp),vecdouble);
+              ctemprefnode.create(seedtemp),elewidth,vecdouble);
             redctx:=redinit.new_redctx;
             addstatement(stat,redinit);
 
@@ -3723,7 +3758,7 @@ unit optloop;
 
             do_firstpass(block);
             MessagePos1(forn.fileinfo,cg_n_loop_reduction_vectorized,tostr(elewidth));
-            OptRemark(forn.fileinfo,'vectorize','reduction loop vectorized, VF='+tostr(elewidth)+', tail=scalar');
+            OptRemark(forn.fileinfo,'vectorize','reduction loop vectorized, VF='+tostr(elewidth)+', tail=scalar'+vect_widthtag);
             forn.free;
             n:=block;
             changed:=true;
@@ -3743,7 +3778,7 @@ unit optloop;
               elewidth*eletype.size,tt_persistent,false);
             addstatement(stat,splattemp);
             addstatement(stat,cvectoropnode.create_broadcast(
-              ctemprefnode.create(splattemp),scalarnode.getcopy,vecdouble));
+              ctemprefnode.create(splattemp),scalarnode.getcopy,elewidth,vecdouble));
           end;
 
         { if-conversion (vok_minmax): each min/max operand is either an array
@@ -3761,7 +3796,7 @@ unit optloop;
                   elewidth*eletype.size,tt_persistent,false);
                 addstatement(stat,splata);
                 addstatement(stat,cvectoropnode.create_broadcast(
-                  ctemprefnode.create(splata),mmA_scalar.getcopy,vecdouble));
+                  ctemprefnode.create(splata),mmA_scalar.getcopy,elewidth,vecdouble));
                 windowa:=ctemprefnode.create(splata);
               end;
             if assigned(mmB_vec) then
@@ -3773,7 +3808,7 @@ unit optloop;
                   elewidth*eletype.size,tt_persistent,false);
                 addstatement(stat,splatb);
                 addstatement(stat,cvectoropnode.create_broadcast(
-                  ctemprefnode.create(splatb),mmB_scalar.getcopy,vecdouble));
+                  ctemprefnode.create(splatb),mmB_scalar.getcopy,elewidth,vecdouble));
                 windowb:=ctemprefnode.create(splatb);
               end;
           end;
@@ -3829,12 +3864,12 @@ unit optloop;
         if vshape=vok_minmax then
           begin
             MessagePos1(forn.fileinfo,cg_n_loop_ifconverted,tostr(elewidth));
-            OptRemark(forn.fileinfo,'ifconvert','min/max loop if-converted to packed max/min, VF='+tostr(elewidth));
+            OptRemark(forn.fileinfo,'ifconvert','min/max loop if-converted to packed max/min, VF='+tostr(elewidth)+vect_widthtag);
           end
         else
           begin
             MessagePos1(forn.fileinfo,cg_n_loop_vectorized,tostr(elewidth));
-            OptRemark(forn.fileinfo,'vectorize','loop vectorized, VF='+tostr(elewidth)+', tail=scalar');
+            OptRemark(forn.fileinfo,'vectorize','loop vectorized, VF='+tostr(elewidth)+', tail=scalar'+vect_widthtag);
           end;
         forn.free;
         n:=block;
@@ -4687,7 +4722,7 @@ unit optloop;
                       firstpass(tmpn);
                       addstatement(wrapstat,tmpn);
                       bcast:=cvectoropnode.create_broadcast(
-                        ctemprefnode.create(splattemp),parses[i].scalarnode.getcopy,false);
+                        ctemprefnode.create(splattemp),parses[i].scalarnode.getcopy,slp_vecwidth,false);
                       firstpass(bcast);
                       addstatement(wrapstat,bcast);
                       opnode:=cvectoropnode.create_scalar(parses[i].avec.getcopy,
