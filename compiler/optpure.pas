@@ -75,6 +75,7 @@ implementation
       symbase,symtype,symconst,symsym,symtable,
       defutil,
       nutils,ncal,nld,nmem,ninl,ncnv,
+      optutils,
       compinnr;
 
     type
@@ -83,6 +84,9 @@ implementation
         pd : tprocdef;
         impure : boolean;
         readsglobal : boolean;
+        { -OoREPORT: the first (dominant) intrinsic-impurity cause found, so the
+          remark can name a concrete why-not. Purely diagnostic. }
+        reason : ansistring;
       end;
 
     { inline intrinsics that are genuinely side-effect-free, non-trapping value
@@ -168,6 +172,33 @@ implementation
           (po_assembler in pd.procoptions) or
           assigned(pd.struct) or
           (pd.owner.symtabletype=localsymtable);
+      end;
+
+
+    { -OoREPORT: a short human phrase for the impurity a node introduced, used
+      only to build the diagnostic remark's why-not text (never a decision) }
+    function purity_reason_for(n : tnode) : ansistring;
+      begin
+        case n.nodetype of
+          asmn:
+            result:='contains inline assembler';
+          raisen,tryexceptn,tryfinallyn,onn:
+            result:='uses exceptions';
+          goton,labeln:
+            result:='contains a goto/label';
+          addrn:
+            result:='takes the address of something';
+          divn,modn:
+            result:='may trap on division';
+          assignn,loadn,derefn,subscriptn,vecn,addn,subn,muln,unaryminusn,typeconvn:
+            result:='writes global/static state or has a checked-arithmetic side effect';
+          inlinen:
+            result:='calls a non-pure intrinsic (I/O, allocation, length/setlength, ...)';
+          calln:
+            result:='calls an indirect / virtual / external routine';
+          else
+            result:='has a side effect';
+        end;
       end;
 
 
@@ -272,7 +303,11 @@ implementation
             ;
         end;
         if ctx^.impure then
-          result:=fen_norecurse_true;
+          begin
+            if ctx^.reason='' then
+              ctx^.reason:=purity_reason_for(n);
+            result:=fen_norecurse_true;
+          end;
       end;
 
 
@@ -380,11 +415,17 @@ implementation
           begin
             pd.pure_intrinsic_impure:=true;
             pd.pure_analyzed:=true;
+            { -OoREPORT: a routine tuning users might expect kept out of a loop
+              (LICM) but that the analysis cannot even consider }
+            OptRemark(pd.fileinfo,'pure',pd.fullprocname(false)+
+              ' not analyzed: ineligible signature (non-simple result, or a'+
+              ' writable/managed/hidden parameter, or method/virtual dispatch)');
             exit;
           end;
         ctx.pd:=pd;
         ctx.impure:=false;
         ctx.readsglobal:=false;
+        ctx.reason:='';
         foreachnodestatic(pm_postprocess,code,@purescan_node,@ctx);
         pd.pure_intrinsic_impure:=ctx.impure;
         pd.pure_reads_global:=ctx.readsglobal;
@@ -396,6 +437,22 @@ implementation
           MessagePos1(pd.fileinfo,cg_h_proc_const,pd.fullprocname(false))
         else if proc_is_pure(pd) then
           MessagePos1(pd.fileinfo,cg_h_proc_pure,pd.fullprocname(false));
+        { -OoREPORT: the same verdict, plus the concrete why-not when neither
+          verdict holds, routed through the optimization-remarks facility. The
+          fixpoint (proc_is_pure/const) is the final answer -- when the body is
+          intrinsically clean but a callee spoils it, name that instead. }
+        if proc_is_const(pd) then
+          OptRemark(pd.fileinfo,'pure',pd.fullprocname(false)+
+            ' proven const (result depends only on its by-value parameters)')
+        else if proc_is_pure(pd) then
+          OptRemark(pd.fileinfo,'pure',pd.fullprocname(false)+
+            ' proven pure (reads but never writes global state)')
+        else if ctx.impure then
+          OptRemark(pd.fileinfo,'pure',pd.fullprocname(false)+
+            ' not pure/const: '+ctx.reason)
+        else
+          OptRemark(pd.fileinfo,'pure',pd.fullprocname(false)+
+            ' not pure/const: calls a routine not provably pure/const');
       end;
 
 

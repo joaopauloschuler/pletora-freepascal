@@ -18571,6 +18571,10 @@ unit aoptx86;
         taicpu(p).opcode:=A_JMP;
         taicpu(p).is_jmp:=true;
         DebugMsg(SPeepholeOptimization + 'sibling-call optimization (OptSibCall)',p);
+        { -OoREPORT: measure-only optimization remark }
+        if cs_opt_report in current_settings.optimizerswitches then
+          MessagePos2(taicpu(p).fileinfo,cg_o_opt_remark,'sibcall',
+            'tail call turned into a jump reusing the caller frame (no new stack frame)');
 
         if not crossed_label then
           begin
@@ -19034,6 +19038,11 @@ unit aoptx86;
             taicpu(p).changeopsize(opsz);
             DebugMsg(SPeepholeOptimization + 'StoreMerge: coalesced '+tostr(inwin)+
               ' constant stores into one '+tostr(tw*8)+'-bit store', p);
+            { -OoREPORT: measure-only optimization remark }
+            if cs_opt_report in current_settings.optimizerswitches then
+              MessagePos2(taicpu(p).fileinfo,cg_o_opt_remark,'storemerge',
+                'coalesced '+tostr(inwin)+' adjacent constant stores into one '+
+                tostr(tw*8)+'-bit store');
             Result:=true;
             exit;
           end;

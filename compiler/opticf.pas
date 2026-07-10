@@ -113,7 +113,7 @@ interface
 implementation
 
     uses
-      cutils,
+      cutils,globals,verbose,
       cpubase,aasmbase,aasmtai,aasmcpu,cgbase,cgutils,
       symconst,symbase,symtype,symdef;
 
@@ -532,6 +532,30 @@ implementation
           extern_survivor:=e.name;
       end;
 
+    { -OoREPORT: one measure-only remark per fold, at the folded routine's own
+      source position when its procdef is known }
+    procedure icf_report_fold(dup : ticfroutine; const targetname : TSymStr);
+      var
+        pos : tfileposinfo;
+        dupname : TSymStr;
+      begin
+        if not(cs_opt_report in current_settings.optimizerswitches) then
+          exit;
+        if assigned(dup.pd) then
+          begin
+            pos:=dup.pd.fileinfo;
+            dupname:=dup.pd.procsym.realname;
+          end
+        else
+          begin
+            pos:=current_filepos;
+            dupname:=dup.startsym.sym.name;
+          end;
+        MessagePos2(pos,cg_o_opt_remark,'icf',
+          'byte-identical routine '+dupname+' folded onto '+targetname);
+      end;
+
+
     function OptimizeICF(alist : TAsmList) : longint;
       var
         routines : TFPObjectList;
@@ -628,6 +652,10 @@ implementation
                     fold_to_thunk(alist,rt,rep.startsym.sym.name);
                   rt.folded:=true;
                   rep.has_local_dup:=true;
+                  if assigned(rep.pd) then
+                    icf_report_fold(rt,rep.pd.procsym.realname)
+                  else
+                    icf_report_fold(rt,rep.startsym.sym.name);
                   inc(OptimizeICF);
                 end;
             end;
@@ -649,6 +677,7 @@ implementation
                   begin
                     fold_to_thunk(alist,rt,extname);
                     rt.folded:=true;
+                    icf_report_fold(rt,extname);
                     inc(OptimizeICF);
                   end;
               end;

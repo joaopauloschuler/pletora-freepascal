@@ -41,7 +41,7 @@ unit optdeadstore;
       nutils,
       nbas,nld,nmem,ncal,
       defutil,
-      optbase,optpure,
+      optbase,optpure,optutils,
       symtype,symdef,symsym,symconst;
 
 
@@ -549,7 +549,15 @@ unit optdeadstore;
             { extended pass: record-field and static-array-element stores }
             if rootnode.nodetype=blockn then
               el_fieldstore_block(tblocknode(rootnode).left,changed);
-          end;
+            { -OoREPORT: report only when a store was actually removed }
+            if changed then
+              OptRemark(current_procinfo.procdef.fileinfo,'deadstore',
+                'removed one or more stores whose value is overwritten before any use');
+          end
+        else
+          { -OoREPORT: the dominant whole-routine bail-out }
+          OptRemark(current_procinfo.procdef.fileinfo,'deadstore',
+            'dead-store elimination skipped: routine has nested procedures');
 {$ifdef DEBUG_DEADSTORE}
         if changed then
           begin

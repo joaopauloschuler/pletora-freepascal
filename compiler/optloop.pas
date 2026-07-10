@@ -2580,22 +2580,26 @@ unit optloop;
           whilerepeatn:
             if bitidiom_try(n) then
               begin
+                OptRemark(n.fileinfo,'bitidiom','clear-lowest-set-bit loop rewritten to the PopCnt intrinsic');
                 pboolean(arg)^:=true;
                 result:=fen_norecurse_false;
               end
             else if bitidiom_bsr_try(n) then
               begin
+                OptRemark(n.fileinfo,'bitidiom','highest-set-bit loop rewritten to the Bsr intrinsic');
                 pboolean(arg)^:=true;
                 result:=fen_norecurse_false;
               end;
           ifn:
             if bitidiom_tzcnt_try(n) then
               begin
+                OptRemark(n.fileinfo,'bitidiom','lowest-set-bit index rewritten to the Bsf/tzcnt intrinsic');
                 pboolean(arg)^:=true;
                 result:=fen_norecurse_false;
               end
             else if bitidiom_bsr_try(n) then
               begin
+                OptRemark(n.fileinfo,'bitidiom','highest-set-bit loop rewritten to the Bsr intrinsic');
                 pboolean(arg)^:=true;
                 result:=fen_norecurse_false;
               end;
@@ -4653,6 +4657,10 @@ unit optloop;
                 end;
             if packok then
               begin
+                if assigned(parses[i].avec) then
+                  OptRemark(parses[i].avec.fileinfo,'slp',
+                    'straight-line group of '+tostr(slp_vecwidth)+
+                    ' scalar single-precision statements packed into one 128-bit SSE op');
                 case parses[i].shape of
                   vok_arr_arr:
                     begin
@@ -7822,6 +7830,7 @@ unit optloop;
         if reason<>'' then
           begin
             MessagePos1(forn.fileinfo,cg_n_loop_not_predcommoned,reason);
+            OptRemark(forn.fileinfo,'predcom','not predictively commoned: '+reason);
             exit;
           end;
 
@@ -7895,6 +7904,9 @@ unit optloop;
 
         do_firstpass(block);
         MessagePos2(forn.fileinfo,cg_n_loop_predcommoned,tostr(w),basesym.realname);
+        OptRemark(forn.fileinfo,'predcom','sliding window of '+tostr(w)+
+          ' offset(s) of '+basesym.realname+
+          ' carried in rotating temporaries (only the leading edge is reloaded)');
         forn.free;
         n:=block;
         changed:=true;
@@ -10044,6 +10056,10 @@ unit optloop;
             current_procinfo.procdef.localst.insertsym(cands[i].recsym);
             cands[i].accept:=true;
             result:=true;
+            if assigned(cands[i].inl) then
+              OptRemark(cands[i].inl.fileinfo,'stackalloc',
+                'dynamic array '+cands[i].dsym.realname+' of '+tostr(cands[i].n)+
+                ' element(s) promoted from the heap to a stack frame slot');
           end;
         if result then
           foreachnodestatic(node,@stackalloc_apply,@cands);
@@ -10376,14 +10392,21 @@ unit optloop;
       end;
 
     function switchtable_walk(var n: tnode; arg: pointer): foreachnoderesult;
+      var
+        casepos : tfileposinfo;
       begin
         result:=fen_false;
         if n.nodetype=casen then
-          if switchtable_try(n) then
-            begin
-              pboolean(arg)^:=true;
-              result:=fen_norecurse_false;
-            end;
+          begin
+            casepos:=n.fileinfo;
+            if switchtable_try(n) then
+              begin
+                OptRemark(casepos,'switchtable',
+                  'fully-covered constant-assignment case converted to per-variable lookup tables (branchless)');
+                pboolean(arg)^:=true;
+                result:=fen_norecurse_false;
+              end;
+          end;
       end;
 
     function OptimizeSwitchTable(node : tnode) : boolean;
@@ -11295,6 +11318,10 @@ unit optloop;
           begin
             MessagePos2(current_procinfo.entrypos,cg_n_gvnpre_eliminated,
               tostr(ctx.eliminated),ctx.firstexpr);
+            OptRemark(current_procinfo.entrypos,'gvnpre',
+              'eliminated '+tostr(ctx.eliminated)+
+              ' fully-redundant expression(s) (first: '+ctx.firstexpr+
+              '), reused from a dominating computation');
             if assigned(ctx.preambleblk) then
               begin
                 do_firstpass(ctx.preambleblk);
