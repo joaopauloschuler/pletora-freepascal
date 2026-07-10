@@ -100,6 +100,7 @@ units
 !/tests/test/units
 /tests/tstunits/tmp/
 /tests/tstunits/*-*/
+/unleashed/tests/.tmp/
 /tests/utils/concat
 /tests/utils/digest
 /tests/utils/dotest

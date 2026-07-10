@@ -804,6 +804,14 @@ unit optcse;
                        constentries[i].valuenode.resultdef.size,tt_persistent,true);
                      addstatement(creates,constentries[i].temp);
                      addstatement(creates,cassignmentnode.create_internal(ctemprefnode.create(constentries[i].temp),constentries[i].valuenode));
+                     { the tempdeletenode after the body is not (only) cleanup:
+                       for register temps its code generator emits the
+                       a_reg_sync that extends the temp's live range past every
+                       backward jump in the body (goto loops, tail-recursion
+                       loops); without it the register allocator considers the
+                       register free after the last linear use and reuses it
+                       inside loops }
+                     addstatement(deletes,ctempdeletenode.create(constentries[i].temp));
                      current_filepos:=old_current_filepos;
                      foreachnodestatic(pm_postprocess,rootnode,@replaceconsts,@constentries[i]);
                      inc(fpu_regs_assigned);
@@ -829,6 +837,9 @@ unit optcse;
                      addstatement(creates,constentries[i].temp);
                      addstatement(creates,cassignmentnode.create_internal(ctemprefnode.create(constentries[i].temp),
                        caddrnode.create_internal(constentries[i].valuenode)));
+                     { see the comment at the realconst branch above: required
+                       for correctness, not just cleanup }
+                     addstatement(deletes,ctempdeletenode.create(constentries[i].temp));
                      current_filepos:=old_current_filepos;
                      foreachnodestatic(pm_postprocess,rootnode,@replaceconsts,@constentries[i]);
                      inc(int_regs_assigned);
