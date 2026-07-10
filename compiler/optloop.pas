@@ -6471,6 +6471,18 @@ unit optloop;
         enclosing block's do_firstpass rebuild it consistently. }
       begin
         result:=fen_false;
+        { a copied load of a variable from an enclosing frame still carries the
+          original's parentfp node in left; with resultdef cleared the load is
+          re-typechecked, and pass_typecheck insists on wiring the parentfp
+          itself - IE 200309289 if one is already there.  Drop the stale copy
+          and let the re-typecheck rebuild it (set_needs_parentfp and
+          add_captured_sym are idempotent). }
+        if (n.nodetype=loadn) and assigned(tloadnode(n).left) and
+           (tloadnode(n).left.nodetype=loadparentfpn) then
+          begin
+            tloadnode(n).left.free;
+            tloadnode(n).left:=nil;
+          end;
         n.resultdef:=nil;
         exclude(n.transientflags,tnf_pass1_done);
         exclude(n.transientflags,tnf_error);
