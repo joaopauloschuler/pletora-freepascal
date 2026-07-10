@@ -59,6 +59,10 @@ unit opttree;
       blockns can be processed with the proper arg (their own statement chain) }
     var
       normalize_success : pboolean;
+      { @searchblock, so searchblock can recurse into a subtree without naming
+        itself (its own name inside the body denotes the Result variable). Set
+        in normalize(). }
+      searchblockproc : staticforeachnodefunction;
 
     function hasblock(var n : tnode;arg : pointer) : foreachnoderesult;
       begin
@@ -122,6 +126,33 @@ unit opttree;
                 if would be wrong. Stop the scan at this boundary; the nested
                 statement list is normalized separately (see the second phase in
                 searchstatements) with its own insertion point. }
+              result:=fen_norecurse_true;
+              exit;
+            end;
+          assignn:
+            begin
+              { The LHS of an assignment is a WRITE TARGET (an lvalue), not an
+                rvalue expression, and must NOT have its block-expressions
+                value-extracted. When range/overflow checking (-Cr / -Co) or any
+                other lowering wraps (part of) the target in a block-expression
+                whose result IS an lvalue reference -- e.g.  a[i]  under -Cr
+                becomes "begin <rangecheck i>; a[i] end" (expectloc
+                LOC_REFERENCE), and  a[i].x  wraps that block under a subscriptn
+                -- the generic blockn handling below would mis-treat it as an
+                rvalue: it rewrites the block's last expression into
+                "temp := <lvalue>" (a READ of the target) and replaces the block
+                with a tempref, so the store degenerates into "temp := <rhs>" and
+                the actual memory write to the target is silently dropped ->
+                miscompile. Such a block can sit anywhere along the LHS address
+                spine (directly, or nested under subscriptn / vecn), so the whole
+                LHS is left exactly as codegen expects it: normalizing the LHS is
+                only an enabler for the following dead-store pass, never a
+                correctness requirement (the normal pipeline runs no normalize at
+                all -- it is gated on -Oodeadstore -- and codegen consumes the
+                lvalue blocks directly). Only the RHS is a genuine rvalue, so
+                only it is normalized. (searchblockproc = @searchblock, set in
+                normalize.) }
+              foreachnodestatic(tassignmentnode(n).right,searchblockproc,arg);
               result:=fen_norecurse_true;
               exit;
             end;
@@ -327,6 +358,7 @@ unit opttree;
         printnode(output,n);
 {$endif DEBUG_NORMALIZE}
         searchstatementsproc:=@searchstatements;
+        searchblockproc:=@searchblock;
         normalize_success:=@success;
         foreachnodestatic(n,@searchstatements,@success);
 {$ifdef DEBUG_NORMALIZE}
