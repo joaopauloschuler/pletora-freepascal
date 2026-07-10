@@ -808,14 +808,19 @@ implementation
         end;
       addstatement(stmt,cassignmentnode.create(impl_field(fEvent),rtl('RTLEVENTCREATE',nil)));
       addstatement(stmt,cassignmentnode.create(impl_field(fKeep),cloadnode.create(implsym,implsym.owner)));
+      { take the caller's interface reference BEFORE starting the worker: the
+        worker drops __keepalive as its last act, and if that were the only
+        counted reference a fast worker would destroy the impl while __Spawn
+        is still writing __tid / converting the result (use-after-free that
+        surfaces as a flaky AV here or at the caller's final _Release) }
+      addstatement(stmt,cassignmentnode.create(
+        cloadnode.create(spawnpd.funcretsym,spawnpd.funcretsym.owner),cloadnode.create(implsym,implsym.owner)));
       addstatement(stmt,cassignmentnode.create(impl_field(fTid),rtl('BEGINTHREAD',
         ccallparanode.create(
           ctypeconvnode.create_internal(cloadnode.create(implsym,implsym.owner),voidpointertype),
           ccallparanode.create(
             ctypeconvnode.create_proc_to_procvar(cloadnode.create_procvar(thunkpd.procsym,thunkpd,thunkpd.procsym.owner)),
             nil)))));
-      addstatement(stmt,cassignmentnode.create(
-        cloadnode.create(spawnpd.funcretsym,spawnpd.funcretsym.owner),cloadnode.create(implsym,implsym.owner)));
       async_defer_method(spawnpd,body);
 
       async_add_destructor(clsdef,fEvent,fExc,fTid);
@@ -1038,14 +1043,19 @@ implementation
         cloadnode.create(procparam,procparam.owner)));
       addstatement(stmt,cassignmentnode.create(impl_field(fEvent),rtl('RTLEVENTCREATE',nil)));
       addstatement(stmt,cassignmentnode.create(impl_field(fKeep),cloadnode.create(implsym,implsym.owner)));
+      { take the caller's interface reference BEFORE starting the worker: the
+        worker drops __keepalive as its last act, and if that were the only
+        counted reference a fast worker would destroy the impl while __Spawn
+        is still writing __tid / converting the result (use-after-free that
+        surfaces as a flaky AV here or at the caller's final _Release) }
+      addstatement(stmt,cassignmentnode.create(
+        cloadnode.create(spawnpd.funcretsym,spawnpd.funcretsym.owner),cloadnode.create(implsym,implsym.owner)));
       addstatement(stmt,cassignmentnode.create(impl_field(fTid),rtl('BEGINTHREAD',
         ccallparanode.create(
           ctypeconvnode.create_internal(cloadnode.create(implsym,implsym.owner),voidpointertype),
           ccallparanode.create(
             ctypeconvnode.create_proc_to_procvar(cloadnode.create_procvar(thunkpd.procsym,thunkpd,thunkpd.procsym.owner)),
             nil)))));
-      addstatement(stmt,cassignmentnode.create(
-        cloadnode.create(spawnpd.funcretsym,spawnpd.funcretsym.owner),cloadnode.create(implsym,implsym.owner)));
       async_defer_method(spawnpd,body);
 
       async_add_destructor(clsdef,fEvent,fExc,fTid);
