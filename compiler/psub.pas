@@ -176,6 +176,7 @@ implementation
        optdevirt,
        optpure,
        optpartialinline,
+       optipacp,
        optipara,
        opticf,
        optsra,
@@ -3418,6 +3419,93 @@ implementation
       end;
 
 
+    { uninitialized-variable/result diagnostics silenced while a specialized
+      IPACP clone (a copy of already-validated code) is code-generated }
+    const
+      ipacp_suppressed_msgs : array[0..8] of longint = (
+        sym_w_uninitialized_local_variable,
+        sym_w_uninitialized_variable,
+        sym_h_uninitialized_local_variable,
+        sym_h_uninitialized_variable,
+        sym_w_function_result_uninitialized,
+        sym_h_uninitialized_managed_local_variable,
+        sym_h_uninitialized_managed_variable,
+        sym_w_managed_function_result_uninitialized,
+        { the constant fold that specializes the clone can make a case/if arm
+          unreachable -- a true statement about the clone, noise on user lines }
+        cg_w_unreachable_code);
+
+    { -OoIPACP: compile a synthesised specialized clone procdef (built by
+      optipacp.ipacp_process_calls) whose body is CLONECODE.  Like
+      compile_partial_inline_header, but the clone is a normal out-of-line
+      routine (no inline info is created), reentrantly code-generated at
+      module-level symtablestack state after the caller's own
+      generate_code_tree. }
+    procedure compile_ipacp_clone(clonepd:tprocdef;clonecode:tnode);
+      var
+        oldpi : tprocinfo;
+        oldmoduleprocinfo : tprocinfo;
+        oldstructdef : tabstractrecorddef;
+        oldblock : tblock_type;
+        i : longint;
+        savedmsgstate : array[0..high(ipacp_suppressed_msgs)] of tmsgstate;
+        pi : tcgprocinfo;
+      begin
+        if not assigned(clonepd) or not assigned(clonecode) then
+          exit;
+        { The clone body is a copy of code already fully checked when the
+          original routine compiled; the DFA run over the specialized copy can
+          raise spurious uninitialized-variable/result warnings on the user's
+          own source lines (constant folding can leave e.g. `Result:=a;
+          Result:=Result+k` in a shape the partial life analysis flags even
+          though the write dominates). Turn those specific messages off for the
+          clone's compilation only; everything else (real errors) still fires. }
+        for i:=0 to high(ipacp_suppressed_msgs) do
+          begin
+            savedmsgstate[i]:=GetMessageState(ipacp_suppressed_msgs[i]);
+            SetMessageVerbosity(ipacp_suppressed_msgs[i],ms_off_global);
+          end;
+        oldpi:=current_procinfo;
+        oldmoduleprocinfo:=tprocinfo(current_module.procinfo);
+        oldstructdef:=current_structdef;
+        oldblock:=block_type;
+
+        pi:=tcgprocinfo(cprocinfo.create(nil));
+        current_module.procinfo:=pi;
+        pi.procdef:=clonepd;
+        current_procinfo:=pi;
+        current_structdef:=nil;
+        block_type:=bt_body;
+
+        clonepd.aliasnames.insert(clonepd.mangledname);
+        alloc_proc_symbol(clonepd);
+
+        pi.add_to_symtablestack;
+
+        pi.entrypos:=clonecode.fileinfo;
+        pi.entryswitches:=current_settings.localswitches;
+        pi.exitpos:=clonecode.fileinfo;
+        pi.exitswitches:=current_settings.localswitches;
+
+        pi.code:=clonecode;
+        do_typecheckpass(pi.code);
+
+        pi.remove_from_symtablestack;
+
+        current_structdef:=oldstructdef;
+        block_type:=oldblock;
+
+        if Errorcount=0 then
+          pi.generate_code_tree;
+
+        freeandnil(pi);
+        current_module.procinfo:=oldmoduleprocinfo;
+        current_procinfo:=oldpi;
+        for i:=0 to high(ipacp_suppressed_msgs) do
+          SetMessageVerbosity(ipacp_suppressed_msgs[i],savedmsgstate[i]);
+      end;
+
+
     procedure read_proc_body(old_current_procinfo:tprocinfo;pd:tprocdef);
       {
         Parses the procedure directives, then parses the procedure body, then
@@ -3430,12 +3518,16 @@ implementation
         pi_dosplit       : boolean;
         pi_headerpd      : tprocdef;
         pi_headercode    : tnode;
+        ipacp_pending    : TFPObjectList;
+        ipacp_code       : tnode;
+        ipacp_i          : longint;
       begin
         Message1(parser_d_procedure_start,pd.fullprocname(false));
         oldfailtokenmode:=[];
         pi_dosplit:=false;
         pi_headerpd:=nil;
         pi_headercode:=nil;
+        ipacp_pending:=nil;
 
         { create a new procedure }
         current_procinfo:=cprocinfo.create(old_current_procinfo);
@@ -3493,6 +3585,27 @@ implementation
             current_procinfo.flags,
             assigned(current_procinfo.get_first_nestedproc));
 
+        { -OoIPACP: stash this routine's pre-codegen body as a clone template
+          for later callers, then scan its own body for calls that pass a
+          compile-time constant to an eligible parameter of an already-stashed
+          routine and retarget them to specialized clones (compiled below,
+          after this routine's generate_code_tree). }
+        if (cs_opt_ipacp in current_settings.optimizerswitches) and
+           (not isnestedproc) and
+           (not(df_generic in pd.defoptions)) then
+          begin
+            ipacp_pending:=TFPObjectList.create(true);
+            ipacp_stash_candidate(pd,
+              tcgprocinfo(current_procinfo).code,
+              current_procinfo.flags,
+              assigned(current_procinfo.get_first_nestedproc));
+            ipacp_code:=tcgprocinfo(current_procinfo).code;
+            tcgprocinfo(current_procinfo).add_to_symtablestack;
+            ipacp_process_calls(pd,ipacp_code,ipacp_pending);
+            tcgprocinfo(current_procinfo).remove_from_symtablestack;
+            tcgprocinfo(current_procinfo).code:=ipacp_code;
+          end;
+
         { When it's a nested procedure then defer the code generation,
           when back at normal function level then generate the code
           for all deferred nested procedures and the current procedure }
@@ -3517,6 +3630,17 @@ implementation
             pi_headerpd:=partialinline_make_header(pd,pi_headercode);
             if assigned(pi_headerpd) then
               compile_partial_inline_header(pi_headerpd,pi_headercode);
+          end;
+
+        { -OoIPACP: now that the caller has been code-generated (its call sites
+          already retargeted to the clone symbols), compile the specialized
+          clone bodies that were synthesised for it. }
+        if assigned(ipacp_pending) then
+          begin
+            for ipacp_i:=0 to ipacp_pending.count-1 do
+              compile_ipacp_clone(tipacpclone(ipacp_pending[ipacp_i]).clonepd,
+                tipacpclone(ipacp_pending[ipacp_i]).clonecode);
+            freeandnil(ipacp_pending);
           end;
 
         { release procinfo }

@@ -807,7 +807,26 @@ interface
            instance and dynamic casts prove nothing and are skipped. Measure
            and report via -Ooreport. Opt-in; NOT part of the -O4 defaults --
            a wrong target is a miscompile }
-         cs_opt_devirt
+         cs_opt_devirt,
+         { interprocedural constant propagation via call-site-driven function
+           cloning (the gcc -fipa-cp / -fipa-cp-clone idea, ported to FPC's
+           single-pass, immediate-codegen model as an intra-unit CLONE pass --
+           see compiler/optipacp.pas). When a routine's body is stashed before
+           codegen and a LATER caller passes a compile-time ordinal/bool/enum
+           constant for an eligible by-value, never-written parameter, a
+           specialized out-of-line clone is synthesised: the parameter's reads
+           are substituted with the literal and the enclosing arithmetic /
+           comparisons / if-branches re-folded, so the clone's own optimizer
+           pipeline (dead-branch elimination, unrolling, vectorization) fires
+           on now-constant loop bounds and flags. Clones are cached per
+           (routine,param,value) and shared across call sites; growth is bound
+           by a node-count budget and a per-routine clone cap. The clone keeps
+           the original signature (the constant argument is still passed but
+           ignored internally) so the calling convention is untouched, and the
+           call is retargeted by rebuilding a fresh call node to the clone.
+           Opt-in; NOT part of the -O4 defaults -- a wrong clone is a
+           miscompile }
+         cs_opt_ipacp
        );
        toptimizerswitches = set of toptimizerswitch;
 
@@ -888,7 +907,7 @@ interface
          'SINK','STOREMOTION','VRP','REFELIDE','SWITCHTABLE','REE',
          'SHRINKWRAP','GVNPRE','PURE','PARTIALINLINE','STACKALLOC','SLP',
          'UNROLLDYN','PREFETCH','ICF','IPARA','FINALVALUE','SIBCALL',
-         'REPORT','DEVIRT'
+         'REPORT','DEVIRT','IPACP'
        );
        WPOptimizerSwitchStr : array [twpoptimizerswitch] of string[14] = (
          'DEVIRTCALLS','OPTVMTS','SYMBOLLIVENESS'
