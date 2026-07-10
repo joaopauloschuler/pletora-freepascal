@@ -147,13 +147,22 @@ implementation
         (scalarleft=true), matching the source's non-commutative order. }
       var
         regb, regc, regs, resreg, regacc, regt : tregister;
-        opps, movop, addop, mulop, xorop, movsop : tasmop;
+        opps, movop, addop, mulop, xorop, movsop, fmaop : tasmop;
         refb, refc, refa, refsplat, refacc : treference;
-        avx, dbl : boolean;
+        avx, dbl, use_packed_fma : boolean;
         scalarsize : tcgsize;
       begin
         avx:=UseAVX;
         dbl:=isdouble;
+        { packed-FMA gate for the dot-product reduction: mirror the scalar a*b+c ->
+          fma() contraction gate (tx86addnode.use_fma + try_fma), i.e. fast-math is
+          enabled AND the fputype has an FMA/FMA4 unit.  The reduction recognizer
+          already refuses to build these nodes without fast-math, but re-check here
+          so the gate is explicit and self-contained.  FMA implies an AVX (VEX)
+          encoding, so this only ever fires when avx is already true. }
+        use_packed_fma:=(kind=vok_reduce_dot) and
+          (cs_opt_fastmath in current_settings.optimizerswitches) and
+          ((fpu_capabilities[current_settings.fputype]*[FPUX86_HAS_FMA,FPUX86_HAS_FMA4])<>[]);
         { per-precision instruction and scalar-size selection: single uses the
           ..ps / movss forms over VL=4 lanes, double the ..pd / movsd forms over
           VL=2 lanes; VEX v-forms under an AVX fputype. }
@@ -178,15 +187,21 @@ implementation
             if dbl then movsop:=A_MOVSD else movsop:=A_MOVSS;
           end;
 
-        { --- reduction accumulator init: acc slot := [s,0,0,0] (runs once) --- }
+        { --- reduction accumulator init: accreg := [s,0,0,0] (runs once) ---
+          The packed accumulator is register-resident: allocate the shared virtual
+          mm register here (rg is only live at codegen time) and record it in
+          redctx so the body/finish nodes update/read the SAME register across the
+          whole loop -- no per-iteration store/reload through a stack slot. }
         if kind=vok_reduce_init then
           begin
+            if not assigned(redctx) then
+              internalerror(2026070815);
             { load the incoming scalar s into lane 0 of regs (upper lanes are
               don't-care here) }
-            secondpass(right);   { the incoming scalar single/double s }
+            secondpass(left);   { the incoming scalar single/double seed s }
             regs:=cg.getmmregister(current_asmdata.CurrAsmList,OS_M128);
-            cg.a_loadmm_loc_reg(current_asmdata.CurrAsmList,scalarsize,right.location,regs,mms_movescalar);
-            { regacc := [0,..,0], then merge s into lane 0 with a scalar move so
+            cg.a_loadmm_loc_reg(current_asmdata.CurrAsmList,scalarsize,left.location,regs,mms_movescalar);
+            { accreg := [0,..,0], then merge s into lane 0 with a scalar move so
               the upper lanes stay exactly zero (the register-source path of
               a_loadmm_*_reg would movaps a full 128 bits and clobber them, so the
               merge must be an explicit MOVSS|MOVSD / v-form reg,reg here) }
@@ -201,57 +216,62 @@ implementation
                 current_asmdata.CurrAsmList.concat(taicpu.op_reg_reg(xorop,S_NO,regacc,regacc));
                 current_asmdata.CurrAsmList.concat(taicpu.op_reg_reg(movsop,S_NO,regs,regacc));
               end;
-            secondpass(left);
-            if not (left.location.loc in [LOC_REFERENCE,LOC_CREFERENCE]) then
-              internalerror(2026070810);
-            refacc:=left.location.reference;
-            tcgx86(cg).make_simple_ref(current_asmdata.CurrAsmList,refacc);
-            current_asmdata.CurrAsmList.concat(taicpu.op_reg_ref(movop,S_NO,regacc,refacc));
+            redctx^.accreg:=regacc;
+            redctx^.seeded:=true;
             location_reset(location,LOC_VOID,OS_NO);
             exit;
           end;
 
-        { --- reduction body: acc := acc + b[i..i+3] (+ *c[i..i+3] for dot) --- }
+        { --- reduction body: accreg := accreg + b[i..i+3] (+ *c[i..i+3] for dot).
+          The accumulator stays in redctx^.accreg the whole loop; on an FMA-capable
+          target under fast-math the dot fuses the multiply-add into a single packed
+          vfmadd231ps/pd (same license as the scalar a*b+c -> fma contraction). --- }
         if kind in [vok_reduce_sum,vok_reduce_dot] then
           begin
-            { load the packed accumulator from its slot (left = tempref) }
+            if not (assigned(redctx) and redctx^.seeded) then
+              internalerror(2026070816);
+            regacc:=redctx^.accreg;
+            { load the b[i..i+3] window (left) }
             secondpass(left);
             if not (left.location.loc in [LOC_REFERENCE,LOC_CREFERENCE]) then
-              internalerror(2026070811);
-            refacc:=left.location.reference;
-            tcgx86(cg).make_simple_ref(current_asmdata.CurrAsmList,refacc);
-            regacc:=cg.getmmregister(current_asmdata.CurrAsmList,OS_M128);
-            current_asmdata.CurrAsmList.concat(taicpu.op_ref_reg(movop,S_NO,refacc,regacc));
-            { load the b[i..i+3] window }
-            secondpass(right);
-            if not (right.location.loc in [LOC_REFERENCE,LOC_CREFERENCE]) then
               internalerror(2026070812);
-            refb:=right.location.reference;
+            refb:=left.location.reference;
             tcgx86(cg).make_simple_ref(current_asmdata.CurrAsmList,refb);
             regb:=cg.getmmregister(current_asmdata.CurrAsmList,OS_M128);
             current_asmdata.CurrAsmList.concat(taicpu.op_ref_reg(movop,S_NO,refb,regb));
             if kind=vok_reduce_dot then
               begin
-                { regb := b[i..i+3] * c[i..i+3] }
-                secondpass(third);
-                if not (third.location.loc in [LOC_REFERENCE,LOC_CREFERENCE]) then
+                { load the c[i..i+3] window (right) }
+                secondpass(right);
+                if not (right.location.loc in [LOC_REFERENCE,LOC_CREFERENCE]) then
                   internalerror(2026070813);
-                refc:=third.location.reference;
+                refc:=right.location.reference;
                 tcgx86(cg).make_simple_ref(current_asmdata.CurrAsmList,refc);
                 regc:=cg.getmmregister(current_asmdata.CurrAsmList,OS_M128);
                 current_asmdata.CurrAsmList.concat(taicpu.op_ref_reg(movop,S_NO,refc,regc));
+                if use_packed_fma then
+                  begin
+                    { accreg := regb*regc + accreg  (single fused packed op).
+                      Only under fast-math on an FMA target -- the reduction is
+                      already fast-math-gated, so this reuses that license; the
+                      rounding matches the scalar fma() the -OoFASTMATH a*b+c
+                      contraction would itself have produced. }
+                    if dbl then fmaop:=A_VFMADD231PD else fmaop:=A_VFMADD231PS;
+                    current_asmdata.CurrAsmList.concat(taicpu.op_reg_reg_reg(fmaop,S_NO,regc,regb,regacc));
+                    location_reset(location,LOC_VOID,OS_NO);
+                    exit;
+                  end;
+                { regb := b[i..i+3] * c[i..i+3] }
                 if avx then
                   current_asmdata.CurrAsmList.concat(taicpu.op_reg_reg_reg(mulop,S_NO,regc,regb,regb))
                 else
                   current_asmdata.CurrAsmList.concat(taicpu.op_reg_reg(mulop,S_NO,regc,regb));
               end;
-            { acc := acc + regb }
+            { accreg := accreg + regb }
             if avx then
               current_asmdata.CurrAsmList.concat(taicpu.op_reg_reg_reg(addop,S_NO,regb,regacc,regacc))
             else
               current_asmdata.CurrAsmList.concat(taicpu.op_reg_reg(addop,S_NO,regb,regacc));
-            { store the packed accumulator back to its slot }
-            current_asmdata.CurrAsmList.concat(taicpu.op_reg_ref(movop,S_NO,regacc,refacc));
             location_reset(location,LOC_VOID,OS_NO);
             exit;
           end;
@@ -259,14 +279,10 @@ implementation
         { --- reduction finish: s := p0+p1+p2+p3 (horizontal sum, runs once) --- }
         if kind=vok_reduce_finish then
           begin
-            { load the packed accumulator [p0,p1,p2,p3] from its slot (right) }
-            secondpass(right);
-            if not (right.location.loc in [LOC_REFERENCE,LOC_CREFERENCE]) then
+            { the packed accumulator is already live in redctx^.accreg }
+            if not (assigned(redctx) and redctx^.seeded) then
               internalerror(2026070814);
-            refacc:=right.location.reference;
-            tcgx86(cg).make_simple_ref(current_asmdata.CurrAsmList,refacc);
-            regacc:=cg.getmmregister(current_asmdata.CurrAsmList,OS_M128);
-            current_asmdata.CurrAsmList.concat(taicpu.op_ref_reg(movop,S_NO,refacc,regacc));
+            regacc:=redctx^.accreg;
             regt:=cg.getmmregister(current_asmdata.CurrAsmList,OS_M128);
             if dbl then
               begin

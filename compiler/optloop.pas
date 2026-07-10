@@ -3117,7 +3117,11 @@ unit optloop;
         hascheck : boolean;
         block, vecbody, scalbody : tnode;
         stat, vstat, sstat : tstatementnode;
-        lotemp, hitemp, splattemp, acctemp, seedtemp : ttempcreatenode;
+        lotemp, hitemp, splattemp, seedtemp : ttempcreatenode;
+        { register-resident reduction accumulator: the init node allocates the
+          shared context, the body/finish nodes attach to it }
+        redinit, redbody, redfin : tvectoropnode;
+        redctx : pvecreducectx;
         { reduction (single-precision sum / dot product) recognizer outputs }
         accsym : tabstractvarsym;
         redlhs, redla, redra, redexpr, redprod : tnode;
@@ -3561,13 +3565,12 @@ unit optloop;
         { ---- REDUCTION build (sum / dot product) ---- }
         if vshape in [vok_reduce_sum,vok_reduce_dot] then
           begin
-            { 16-byte packed accumulator slot; allowreg=false so the body can
-              movups-load/store it each iteration (a register cannot persist
-              across the node-per-iteration vector loop) }
-            acctemp:=ctempcreatenode.create(
-              tarraydef.getreusable_vector(eletype,elewidth),
-              elewidth*eletype.size,tt_persistent,false);
-            addstatement(stat,acctemp);
+            { The packed accumulator is register-resident: it lives in a shared
+              xmm register (allocated by the reduce_init backend node at codegen
+              time) that persists across the whole vector loop -- no per-iteration
+              store/reload through a stack slot, so the vector ILP is not offset by
+              memory traffic.  The three cooperating nodes (init before the loop,
+              body in it, finish after it) share one register context. }
 
             { acc := [s,0,..]   (lane 0 keeps the incoming scalar value of s).
               The incoming s is first copied into a memory-backed scalar temp
@@ -3585,18 +3588,21 @@ unit optloop;
             addstatement(stat,cassignmentnode.create(
               ctemprefnode.create(seedtemp),
               cloadnode.create(tsym(accsym),accsym.owner)));
-            addstatement(stat,cvectoropnode.create_reduce_init(
-              ctemprefnode.create(acctemp),
-              ctemprefnode.create(seedtemp),vecdouble));
+            redinit:=cvectoropnode.create_reduce_init(
+              ctemprefnode.create(seedtemp),vecdouble);
+            redctx:=redinit.new_redctx;
+            addstatement(stat,redinit);
 
             { vector loop:  while i<=hi-(VL-1) do begin acc:=acc+window; i:=i+VL end }
             vecbody:=internalstatements(vstat);
             if vshape=vok_reduce_dot then
-              addstatement(vstat,cvectoropnode.create_reduce(
-                ctemprefnode.create(acctemp),bvec.getcopy,cvec.getcopy,true,elewidth,vecdouble))
+              redbody:=cvectoropnode.create_reduce(
+                bvec.getcopy,cvec.getcopy,true,elewidth,vecdouble)
             else
-              addstatement(vstat,cvectoropnode.create_reduce(
-                ctemprefnode.create(acctemp),bvec.getcopy,nil,false,elewidth,vecdouble));
+              redbody:=cvectoropnode.create_reduce(
+                bvec.getcopy,nil,false,elewidth,vecdouble);
+            redbody.attach_redctx(redctx);
+            addstatement(vstat,redbody);
             addstatement(vstat,cassignmentnode.create(
               cloadnode.create(tsym(counter),counter.owner),
               caddnode.create(addn,cloadnode.create(tsym(counter),counter.owner),
@@ -3615,9 +3621,10 @@ unit optloop;
               def of s stays a plain assignment the allocator understands. }
             splattemp:=ctempcreatenode.create(eletype,eletype.size,tt_persistent,false);
             addstatement(stat,splattemp);
-            addstatement(stat,cvectoropnode.create_reduce_finish(
-              ctemprefnode.create(splattemp),
-              ctemprefnode.create(acctemp),elewidth,vecdouble));
+            redfin:=cvectoropnode.create_reduce_finish(
+              ctemprefnode.create(splattemp),elewidth,vecdouble);
+            redfin.attach_redctx(redctx);
+            addstatement(stat,redfin);
             addstatement(stat,cassignmentnode.create(
               cloadnode.create(tsym(accsym),accsym.owner),
               ctemprefnode.create(splattemp)));
@@ -3638,7 +3645,6 @@ unit optloop;
 
             addstatement(stat,ctempdeletenode.create(lotemp));
             addstatement(stat,ctempdeletenode.create(hitemp));
-            addstatement(stat,ctempdeletenode.create(acctemp));
             addstatement(stat,ctempdeletenode.create(seedtemp));
             addstatement(stat,ctempdeletenode.create(splattemp));
 

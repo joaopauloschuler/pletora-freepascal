@@ -423,6 +423,25 @@ interface
          procedures, so the node cannot leak into inline info. }
        tvectoropkind = (vok_arr_arr, vok_arr_scalar, vok_copy, vok_broadcast, vok_minmax,
                         vok_reduce_init, vok_reduce_sum, vok_reduce_dot, vok_reduce_finish);
+
+       { Shared, register-resident accumulator context for a single vectorized
+         reduction (sum / dot product).  The three cooperating reduction nodes --
+         vok_reduce_init (before the loop), vok_reduce_sum/dot (in the loop body)
+         and vok_reduce_finish (after the loop) -- all point to ONE of these so the
+         packed accumulator lives in a persisting xmm register across the whole
+         loop instead of being stored/reloaded through a stack slot every
+         iteration.  vok_reduce_init allocates the virtual mm register at codegen
+         time (rg is not available earlier) and records it here; the body and
+         finish nodes then read/update that same register.  refcount is a plain
+         share count so dogetcopy/free of any subset of the three nodes disposes
+         the record exactly once. }
+       pvecreducectx = ^tvecreducectx;
+       tvecreducectx = record
+          accreg   : tregister;   { the register-resident packed accumulator }
+          seeded   : boolean;     { true once vok_reduce_init has allocated accreg }
+          refcount : longint;     { number of nodes sharing this record }
+       end;
+
        tvectoropnode = class(ttertiarynode)
           op : TOpCG;         { OP_ADD, OP_SUB or OP_IMUL (single-precision) }
           vecwidth : longint; { number of single lanes processed per iteration }
@@ -430,6 +449,7 @@ interface
           scalarleft : boolean; { vok_arr_scalar: true if s is the op's left operand (s op b[i]) }
           ismax : boolean;      { vok_minmax: true for maxps (a[i]:=max(u,v)), false for minps }
           isdouble : boolean;   { false: single (VL=4, ..ps); true: double (VL=2, ..pd) }
+          redctx : pvecreducectx; { shared register-resident accumulator (reduction kinds only) }
           constructor create(a,b,c : tnode; _op : TOpCG; _vecwidth : longint; _isdouble : boolean);virtual;
           constructor create_scalar(a,b,splat : tnode; _op : TOpCG; _scalarleft : boolean; _vecwidth : longint; _isdouble : boolean);
           constructor create_copy(a,b : tnode; _vecwidth : longint; _isdouble : boolean);
@@ -445,9 +465,14 @@ interface
             accumulator slot is initialised with the incoming scalar in lane 0,
             accumulated VL-wide across the loop, then horizontally summed back into
             the scalar. }
-          constructor create_reduce_init(acc,scalar : tnode; _isdouble : boolean);
-          constructor create_reduce(acc,b,c : tnode; _isdot : boolean; _vecwidth : longint; _isdouble : boolean);
-          constructor create_reduce_finish(target,acc : tnode; _vecwidth : longint; _isdouble : boolean);
+          constructor create_reduce_init(seed : tnode; _isdouble : boolean);
+          constructor create_reduce(b,c : tnode; _isdot : boolean; _vecwidth : longint; _isdouble : boolean);
+          constructor create_reduce_finish(target : tnode; _vecwidth : longint; _isdouble : boolean);
+          { allocate a fresh shared reduction context and attach it to self }
+          function new_redctx : pvecreducectx;
+          { attach an existing shared reduction context to self (bumps its share count) }
+          procedure attach_redctx(ctx : pvecreducectx);
+          destructor destroy;override;
           function pass_typecheck : tnode;override;
           function pass_1 : tnode;override;
           function dogetcopy : tnode;override;
@@ -662,9 +687,15 @@ implementation
       end;
 
 
-    constructor tvectoropnode.create_reduce_init(acc,scalar : tnode; _isdouble : boolean);
+    { reduction: the packed accumulator is register-resident (shared via redctx),
+      so these nodes no longer carry a memory-slot operand.
+        init:   left = incoming scalar seed s (kept in lane 0)
+        sum:    left = b[i] window
+        dot:    left = b[i] window   right = c[i] window
+        finish: left = target scalar temp the horizontal sum is written to }
+    constructor tvectoropnode.create_reduce_init(seed : tnode; _isdouble : boolean);
       begin
-        inherited create(vectoropn,acc,scalar,nil);
+        inherited create(vectoropn,seed,nil,nil);
         op:=OP_NONE;
         vecwidth:=0;
         kind:=vok_reduce_init;
@@ -673,9 +704,9 @@ implementation
       end;
 
 
-    constructor tvectoropnode.create_reduce(acc,b,c : tnode; _isdot : boolean; _vecwidth : longint; _isdouble : boolean);
+    constructor tvectoropnode.create_reduce(b,c : tnode; _isdot : boolean; _vecwidth : longint; _isdouble : boolean);
       begin
-        inherited create(vectoropn,acc,b,c);
+        inherited create(vectoropn,b,c,nil);
         op:=OP_ADD;
         vecwidth:=_vecwidth;
         if _isdot then
@@ -687,14 +718,47 @@ implementation
       end;
 
 
-    constructor tvectoropnode.create_reduce_finish(target,acc : tnode; _vecwidth : longint; _isdouble : boolean);
+    constructor tvectoropnode.create_reduce_finish(target : tnode; _vecwidth : longint; _isdouble : boolean);
       begin
-        inherited create(vectoropn,target,acc,nil);
+        inherited create(vectoropn,target,nil,nil);
         op:=OP_ADD;
         vecwidth:=_vecwidth;
         kind:=vok_reduce_finish;
         scalarleft:=false;
         isdouble:=_isdouble;
+      end;
+
+
+    function tvectoropnode.new_redctx : pvecreducectx;
+      begin
+        New(redctx);
+        { accreg is left undefined until vok_reduce_init allocates it; the
+          `seeded` flag guards every read, so no CPU-specific null-register
+          constant is needed here (nbas is architecture-neutral) }
+        redctx^.seeded:=false;
+        redctx^.refcount:=1;
+        result:=redctx;
+      end;
+
+
+    procedure tvectoropnode.attach_redctx(ctx : pvecreducectx);
+      begin
+        redctx:=ctx;
+        if assigned(redctx) then
+          inc(redctx^.refcount);
+      end;
+
+
+    destructor tvectoropnode.destroy;
+      begin
+        if assigned(redctx) then
+          begin
+            dec(redctx^.refcount);
+            if redctx^.refcount<=0 then
+              Dispose(redctx);
+            redctx:=nil;
+          end;
+        inherited destroy;
       end;
 
 
@@ -705,7 +769,8 @@ implementation
           are internally-built temp refs / invariant scalars); just make sure
           they carry a resultdef }
         typecheckpass(left);
-        typecheckpass(right);
+        if assigned(right) then
+          typecheckpass(right);
         if assigned(third) then
           typecheckpass(third);
         resultdef:=voidtype;
@@ -716,7 +781,8 @@ implementation
       begin
         result:=nil;
         firstpass(left);
-        firstpass(right);
+        if assigned(right) then
+          firstpass(right);
         if assigned(third) then
           firstpass(third);
         expectloc:=LOC_VOID;
@@ -734,6 +800,10 @@ implementation
         n.scalarleft:=scalarleft;
         n.ismax:=ismax;
         n.isdouble:=isdouble;
+        { share the same register-resident accumulator context with the copy so a
+          whole-tree clone keeps init/body/finish agreeing on one xmm register }
+        n.redctx:=nil;
+        n.attach_redctx(redctx);
         result:=n;
       end;
 
