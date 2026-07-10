@@ -39,29 +39,32 @@
 #
 #   SELF-HOST GATE (standing regression gate): NO green flag set exists yet
 #   (2026-07).  The first self-host attempts caught real -O4 problems -- exactly
-#   the payoff of this gate -- both currently OPEN as tasklist follow-ups:
+#   the payoff of this gate.  Progress:
 #
-#   1. OPT="-O4"  aborts stage-2 on compiler/rgobj.pas:688: a genuine -O4
-#      MISCOMPILE.  The -O4 store-sink pass (-OoSINK) interacting with the loop
-#      pipeline sinks the unconditional `endspill:=true` re-init of the
+#   1. FIXED (fork commit on branch a3, optloop.pas OptimizeCodeSink): OPT="-O4"
+#      no longer aborts on compiler/rgobj.pas.  The -O4 store-sink pass (-OoSINK)
+#      used to sink the unconditional `endspill:=true` re-init of the
 #      register-spill `repeat endspill:=true; if ... then endspill:=not
-#      spill_registers(...); until endspill;` loop, so `until endspill` re-reads
-#      a stale value -> infinite loop; the same restructuring makes the dataflow
-#      checker emit a spurious "endspill does not seem to be initialized" warning
-#      (treated-as-error -> stage-2 abort).  Reduced reproducer:
-#      unleashed/tests/known_miscompiles/o4_sink_repeat_until_01.pp (correct at
-#      -O2/-O3 and -O4 -OoNOSINK; infinite loop + warning at plain -O4).
+#      spill_registers(...); until endspill;` loop into the single if-arm, so
+#      `until endspill` re-read a stale value -> infinite loop (plus a spurious
+#      "endspill does not seem to be initialized" warning, same root cause).  The
+#      sink now treats a while/repeat loop node reached as the fall-through
+#      successor as a use of V when the loop condition reads V.  Reproducer:
+#      unleashed/tests/known_miscompiles/o4_sink_repeat_until_01.pp and the suite
+#      test unleashed/tests/testfiles/sink_repeat_until/sink_repeat_until_01.pp.
 #
-#   2. OPT="-O4" OPTFORK="-OoNOSINK"  gets PAST rgobj.pas (proving the OPTFORK
-#      level-threading works) but aborts stage-2 on compiler/optfinalvalue.pas:600
-#      with another spurious -O4 "Local variable accs does not seem to be
+#   2. OPEN (tasklist self-host blocker #2): with #1 fixed, plain OPT="-O4" now
+#      gets PAST rgobj.pas but still aborts stage-2 on compiler/optfinalvalue.pas
+#      :600 with a spurious -O4 "Local variable accs does not seem to be
 #      initialized" warning-as-error (accs is a local array filled in one for-k
-#      loop and read in the next; -O4's DFA is over-conservative).  Context-
-#      dependent (needs the full cycle's defines); filed by location.
+#      loop and read in the next; -O4's DFA is over-conservative on loop-filled
+#      locals).  Distinct root cause from #1: neither the sink fix nor -OoNOSINK
+#      clears it.  Context-dependent (needs the full cycle's defines); filed by
+#      location.
 #
-#   So plain -O4 self-host is BLOCKED pending those fixes.  Once green, adopt the
-#   winning flag set here as the documented default gate and (optionally) fold in
-#   the opt-in -Oo* passes one at a time via OPTFORK.
+#   So plain -O4 self-host is BLOCKED pending #2.  Once green, adopt the winning
+#   flag set here as the documented default gate and (optionally) fold in the
+#   opt-in -Oo* passes one at a time via OPTFORK.
 set -e
 FP="$(cd "$(dirname "$0")" && pwd)"
 

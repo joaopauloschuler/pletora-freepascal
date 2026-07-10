@@ -8772,6 +8772,23 @@ unit optloop;
         if DynSetIn(succ.optinfo^.life,idx) then
           exit;
 
+        { SOUNDNESS: succ.optinfo^.life is the successor's live-IN, which we use
+          as a proxy for the if's live-OUT.  That proxy breaks when the if is the
+          last statement of a while/repeat body: tsetnodesuccessors makes such a
+          statement's successor the loop node ITSELF (control flows back through
+          the loop's controlling condition).  For a repeat..until loop the
+          condition is evaluated AFTER this if yet its uses are NOT folded into
+          the loop node's live-in -- they are killed there by the very
+          top-of-body re-definition we are about to sink (optdfa only re-adds the
+          condition use to the loop life for test-at-begin/while loops).  So a
+          `repeat V:=c; if..; until V` back-edge read of V is invisible to the
+          check above; moving the store into one arm would let the other path
+          reach `until V` with a stale value.  Treat any read of V by the loop's
+          controlling condition as a live use and decline the sink. }
+        if (succ.nodetype=whilerepeatn) and
+           sink_refs_sym(twhilerepeatnode(succ).left,sym) then
+          exit;
+
         { exactly one arm consumes V }
         usesthen:=sink_refs_sym(ifstmt.right,sym);
         useselse:=sink_refs_sym(ifstmt.t1,sym);
