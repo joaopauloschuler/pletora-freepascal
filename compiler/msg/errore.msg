@@ -3136,6 +3136,16 @@ cg_h_proc_const=06088_H_Function "$1" proven const by -OoPURE (result depends on
 % reads no global/static/threadvar/referenced memory and has no side effect -- so
 % two calls with equal arguments always yield the same value. This hint is only
 % emitted while the pass is enabled and is shown at hint verbosity (\var{-vh}).
+cg_o_opt_remark=06089_O_$1: $2
+% Structured optimization remark emitted by the \var{-Ooreport} facility (the
+% gcc \var{-fopt-info} / clang \var{-Rpass} counterpart). Each of the fork's
+% \var{-Oo*} loop and vectorizer passes emits one line per applied transform and
+% -- more usefully -- one per missed transform naming the concrete blocking
+% reason, at the position of the affected loop, prefixed by the pass name
+% (\var{$1}). Unlike the per-pass \var{-vn}/\var{-vh} notes it is gated only by
+% \var{-Ooreport} (independent of message verbosity) and carries no
+% \i{Note:}/\i{Hint:} label, so it is machine-greppable. Measure-only: enabling
+% it never changes generated code.
 %
 % \end{description}
 # EndOfTeX

@@ -61,10 +61,25 @@ unit optutils;
     { returns true, if n is a valid node and has life info }
     function has_life_info(n : tnode) : boolean;
 
+    { Optimization-remarks facility (-Ooreport): the gcc -fopt-info /
+      clang -Rpass counterpart shared by the fork's -Oo* passes. Emits one
+      structured line at position pos of the form
+
+        file(line,col): <passname>: <msg>
+
+      for every APPLIED transform and -- the more valuable half -- every MISSED
+      transform naming the concrete blocking reason. Gated ONLY by -Ooreport
+      (independent of message verbosity, no Note:/Hint: label), so it is
+      machine-greppable and orthogonal to the per-pass -vn/-vh notes. A no-op
+      unless -Ooreport is set, so passes may call it unconditionally at their
+      apply/bail-out points. Measure-only: it never changes generated code. }
+    procedure OptRemark(const pos : tfileposinfo;const passname,msg : ansistring);
+
   implementation
 
     uses
       cutils,cdynset,
+      globals,
       verbose,
       optbase,
       ncal,nbas,nflw,nutils,nset,ncon;
@@ -496,6 +511,13 @@ unit optutils;
       begin
         result:=assigned(n) and assigned(n.optinfo) and
           assigned(n.optinfo^.life);
+      end;
+
+
+    procedure OptRemark(const pos : tfileposinfo;const passname,msg : ansistring);
+      begin
+        if cs_opt_report in current_settings.optimizerswitches then
+          MessagePos2(pos,cg_o_opt_remark,passname,msg);
       end;
 
 end.

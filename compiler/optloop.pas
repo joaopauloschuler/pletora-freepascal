@@ -1506,6 +1506,7 @@ unit optloop;
         addstatement(newstatements,oldn);
         addstatement(newstatements,deletetemps);
         n:=newn;
+        OptRemark(oldn.fileinfo,'licm','hoisted '+tostr(nhoists)+' loop-invariant expression(s) into the preheader');
       end;
 
 
@@ -3521,6 +3522,7 @@ unit optloop;
         if reason<>'' then
           begin
             MessagePos1(forn.fileinfo,cg_n_loop_not_vectorized,reason);
+            OptRemark(forn.fileinfo,'vectorize','not vectorized: '+reason);
             exit;
           end;
 
@@ -3642,6 +3644,7 @@ unit optloop;
 
             do_firstpass(block);
             MessagePos1(forn.fileinfo,cg_n_loop_reduction_vectorized,tostr(elewidth));
+            OptRemark(forn.fileinfo,'vectorize','reduction loop vectorized, VF='+tostr(elewidth)+', tail=scalar');
             forn.free;
             n:=block;
             changed:=true;
@@ -3745,9 +3748,15 @@ unit optloop;
 
         do_firstpass(block);
         if vshape=vok_minmax then
-          MessagePos1(forn.fileinfo,cg_n_loop_ifconverted,tostr(elewidth))
+          begin
+            MessagePos1(forn.fileinfo,cg_n_loop_ifconverted,tostr(elewidth));
+            OptRemark(forn.fileinfo,'ifconvert','min/max loop if-converted to packed max/min, VF='+tostr(elewidth));
+          end
         else
-          MessagePos1(forn.fileinfo,cg_n_loop_vectorized,tostr(elewidth));
+          begin
+            MessagePos1(forn.fileinfo,cg_n_loop_vectorized,tostr(elewidth));
+            OptRemark(forn.fileinfo,'vectorize','loop vectorized, VF='+tostr(elewidth)+', tail=scalar');
+          end;
         forn.free;
         n:=block;
         changed:=true;
@@ -4137,6 +4146,12 @@ unit optloop;
         addstatement(stat,ctempdeletenode.create(hitemp));
 
         do_firstpass(block);
+        if dounroll and willprefetch then
+          OptRemark(forn.fileinfo,'unrolldyn','dynamic-trip loop unrolled by '+tostr(uf)+' with software prefetch of '+tostr(nreadbases)+' streamed base(s)')
+        else if dounroll then
+          OptRemark(forn.fileinfo,'unrolldyn','dynamic-trip loop unrolled by '+tostr(uf))
+        else
+          OptRemark(forn.fileinfo,'prefetch','software prefetch inserted for '+tostr(nreadbases)+' streamed base(s)');
         forn.free;
         n:=block;
         changed:=true;
@@ -5277,6 +5292,7 @@ unit optloop;
         if reason<>'' then
           begin
             MessagePos1(forn.fileinfo,cg_n_loop_not_peeled,reason);
+            OptRemark(forn.fileinfo,'looppeel','not peeled: '+reason);
             exit;
           end;
 
@@ -5309,6 +5325,7 @@ unit optloop;
 
         do_firstpass(block);
         MessagePos1(forn.fileinfo,cg_n_loop_peeled,tostr(trip.svalue));
+        OptRemark(forn.fileinfo,'looppeel','loop peeled, '+tostr(trip.svalue)+' iteration(s) unrolled off the head');
         forn.free;
         n:=block;
         changed:=true;
@@ -5573,6 +5590,7 @@ unit optloop;
         if reason<>'' then
           begin
             MessagePos1(forn.fileinfo,cg_n_loop_not_split,reason);
+            OptRemark(forn.fileinfo,'loopsplit','not split: '+reason);
             exit;
           end;
 
@@ -5643,6 +5661,7 @@ unit optloop;
 
         do_firstpass(block);
         MessagePos1(forn.fileinfo,cg_n_loop_split,'');
+        OptRemark(forn.fileinfo,'loopsplit','loop split into two branch-free loops at an induction-variable crossover');
         forn.free;
         n:=block;
         changed:=true;
@@ -6004,8 +6023,12 @@ unit optloop;
             begin
               { diagnose only the first, un-fused candidate, to avoid noise }
               if not fusedany and assigned(s2) then
-                MessagePos1(tfornode(s1.left).fileinfo,cg_n_loop_not_fused,
-                  'the following statement is not a counted for-loop');
+                begin
+                  MessagePos1(tfornode(s1.left).fileinfo,cg_n_loop_not_fused,
+                    'the following statement is not a counted for-loop');
+                  OptRemark(tfornode(s1.left).fileinfo,'loopfuse',
+                    'not fused: the following statement is not a counted for-loop');
+                end;
               break;
             end;
 
@@ -6017,7 +6040,10 @@ unit optloop;
           if reason<>'' then
             begin
               if not fusedany then
-                MessagePos1(forn1.fileinfo,cg_n_loop_not_fused,reason);
+                begin
+                  MessagePos1(forn1.fileinfo,cg_n_loop_not_fused,reason);
+                  OptRemark(forn1.fileinfo,'loopfuse','not fused: '+reason);
+                end;
               break;
             end;
 
@@ -6051,6 +6077,7 @@ unit optloop;
           do_firstpass(fusedfor);
 
           MessagePos(forn1.fileinfo,cg_n_loop_fused);
+          OptRemark(forn1.fileinfo,'loopfuse','two adjacent counted loops fused into one');
           s1.left:=fusedfor;
           s2.left:=cnothingnode.create;
           forn1.free;
@@ -6386,6 +6413,7 @@ unit optloop;
         if reassoc_reason<>'' then
           begin
             MessagePos1(forn.fileinfo,cg_n_loop_not_reassociated,reassoc_reason);
+            OptRemark(forn.fileinfo,'reassoc','not reassociated: '+reassoc_reason);
             exit;
           end;
 
@@ -6480,6 +6508,7 @@ unit optloop;
 
         do_firstpass(block);
         MessagePos1(forn.fileinfo,cg_n_loop_reassociated,tostr(reassoc_k));
+        OptRemark(forn.fileinfo,'reassoc','reduction loop split into '+tostr(reassoc_k)+' partial accumulators');
         forn.free;
         n:=block;
         changed:=true;
@@ -7045,6 +7074,7 @@ unit optloop;
         if ujam_reason<>'' then
           begin
             MessagePos1(outerfor.fileinfo,cg_n_loop_not_unrolljammed,ujam_reason);
+            OptRemark(outerfor.fileinfo,'unrolljam','not unroll-and-jammed: '+ujam_reason);
             exit;
           end;
 
@@ -7128,6 +7158,7 @@ unit optloop;
 
         do_firstpass(block);
         MessagePos1(outerfor.fileinfo,cg_n_loop_unrolljammed,tostr(ujam_k));
+        OptRemark(outerfor.fileinfo,'unrolljam','two-level loop nest unroll-and-jammed, outer factor '+tostr(ujam_k));
         outerfor.free;
         n:=block;
         changed:=true;

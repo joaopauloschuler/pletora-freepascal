@@ -778,7 +778,18 @@ interface
            and no address-taken local or parameter (so no @local can escape into
            the callee's arguments).  Anything not provably safe falls back to a
            normal call.  Opt-in; NOT part of the -O4 defaults }
-         cs_opt_sibcall
+         cs_opt_sibcall,
+         { optimization-remarks facility (-Ooreport): the gcc -fopt-info /
+           clang -Rpass counterpart shared by the fork's -Oo* loop and
+           vectorizer passes. When set, each covered pass emits one structured
+           line per APPLIED transform and -- the more valuable half -- one per
+           MISSED transform naming the concrete blocking reason, at the position
+           of the affected loop, prefixed by the pass name (see the shared
+           OptRemark helper in optutils). Independent of message verbosity
+           (unlike the per-pass -vn notes) and machine-greppable. Measure-only:
+           enabling it never changes generated code. NOT part of the -O4
+           defaults }
+         cs_opt_report
        );
        toptimizerswitches = set of toptimizerswitch;
 
@@ -858,7 +869,8 @@ interface
          'PREDCOM','SRA','STOREMERGE','CASECLUSTER','CROSSJUMP','BLOCKORDER',
          'SINK','STOREMOTION','VRP','REFELIDE','SWITCHTABLE','REE',
          'SHRINKWRAP','GVNPRE','PURE','PARTIALINLINE','STACKALLOC','SLP',
-         'UNROLLDYN','PREFETCH','ICF','IPARA','FINALVALUE','SIBCALL'
+         'UNROLLDYN','PREFETCH','ICF','IPARA','FINALVALUE','SIBCALL',
+         'REPORT'
        );
        WPOptimizerSwitchStr : array [twpoptimizerswitch] of string[14] = (
          'DEVIRTCALLS','OPTVMTS','SYMBOLLIVENESS'
