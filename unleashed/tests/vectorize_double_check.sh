@@ -4,7 +4,9 @@
 # The runtime tests under testfiles/optvect/vect_double_* prove double
 # vectorization is bit-exact; this script proves it actually EMITS 128-bit
 # packed double ops (movupd/addpd, VL=2) and that the transform is correctly
-# gated: with the switch OFF the same loop stays scalar (addsd, no addpd), and
+# gated: with the switch OFF the same loop stays scalar (addsd, no addpd) --
+# -OoVECTORIZE is now in the -O4 default set, so the OFF case must disable it
+# explicitly with -OoNOVECTORIZE -- and
 # a MIXED single/double loop must NEVER vectorize (no addpd) even with the
 # switch on. The bundled byte-based %CHECKBIN_* directive cannot match
 # instruction mnemonics, so we inspect the emitted assembly (-al -s) instead.
@@ -61,7 +63,7 @@ EOF
 mkdir -p "$tmp/on" "$tmp/off" "$tmp/mix"
 cp "$tmp/k.pp" "$tmp/on/"; cp "$tmp/k.pp" "$tmp/off/"; cp "$tmp/m.pp" "$tmp/mix/"
 ( cd "$tmp/on"  && "$CC" -Fu"$RTL" -O4 -OoVECTORIZE -Cfsse64 -al -s k.pp >/dev/null 2>&1 )
-( cd "$tmp/off" && "$CC" -Fu"$RTL" -O4              -Cfsse64 -al -s k.pp >/dev/null 2>&1 )
+( cd "$tmp/off" && "$CC" -Fu"$RTL" -O4 -OoNOVECTORIZE -Cfsse64 -al -s k.pp >/dev/null 2>&1 )
 ( cd "$tmp/mix" && "$CC" -Fu"$RTL" -O4 -OoVECTORIZE -Cfsse64 -al -s m.pp >/dev/null 2>&1 )
 
 on_addpd=$(grep -ci addpd  "$tmp/on/k.s"  || true)

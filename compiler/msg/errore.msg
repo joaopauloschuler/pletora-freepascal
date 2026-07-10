@@ -2984,12 +2984,13 @@ cg_e_intrinsic_not_supported_by_instruction_set=06064_E_Intrinsic not supported 
 % The intrinsic translates into an assembler instruction which is not supported by the instruction set
 % selected by \var{-Cp}
 cg_n_loop_vectorized=06065_N_Loop autovectorized (SSE, $1-wide packed single)
-% The loop-level autovectorizer (\var{-O4 -OoVECTORIZE}) recognized this
-% for-loop and replaced its scalar body with packed SSE operations plus a
-% scalar remainder loop. This diagnostic is only emitted while the vectorize
-% pass is enabled and is shown at note verbosity (\var{-vn}).
+% The loop-level autovectorizer (\var{-OoVECTORIZE}, enabled by default at
+% \var{-O4}) recognized this for-loop and replaced its scalar body with packed
+% SSE operations plus a scalar remainder loop. This diagnostic is only emitted
+% while the vectorize pass is enabled and is shown at note verbosity (\var{-vn}).
 cg_n_loop_not_vectorized=06066_N_Loop not autovectorized: $1
-% The loop-level autovectorizer (\var{-O4 -OoVECTORIZE}) inspected this
+% The loop-level autovectorizer (\var{-OoVECTORIZE}, enabled by default at
+% \var{-O4}) inspected this
 % for-loop but fell back to scalar code. The reason it could not vectorize the
 % loop is given as \var{$1}. This diagnostic is only emitted while the
 % vectorize pass is enabled and is shown at note verbosity (\var{-vn}).
