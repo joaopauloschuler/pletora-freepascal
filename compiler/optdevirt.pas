@@ -16,8 +16,18 @@
     becomes a direct call to TFoo's resolution of VirtMethod's vmt slot (the
     override the runtime dispatch would have selected). The receiver l is still
     loaded and passed as self; only the dispatch changes: no VMT indirect load.
-    Being a direct call, the target additionally becomes a candidate for the
-    ordinary inliner (see the note in psub.TransformNodeTree).
+
+    Inliner integration: a virtual method can never carry po_inline (it is
+    mutually exclusive with po_virtualmethod), so neither the ordinary nor the
+    automatic inliner ever expands a virtual call. Under -OoDEVIRT the body of a
+    small virtual method is instead RETAINED as inlining info without po_inline
+    (psub, next to the auto-inline block); when the receiver is proven to reach
+    exactly one override whose body is a void-result method (procedure), the call
+    is rebound onto that override and expanded by the ordinary inliner in the
+    same routine (tcallnode.devirt_prepare_inline + a re-run of do_optinline in
+    psub.TransformNodeTree). Function-result targets keep the direct-call form
+    (their inline setup must be primed during pass_1, which never ran for a
+    virtual call).
 
     Soundness (correctness over coverage -- a wrong target is a miscompile):
 
@@ -50,7 +60,8 @@
     layout -- is left untouched and only the emitted symbol name is forced, via
     tcallnode.devirtualize_target, exactly like the WPO name substitution.
 
-    Opt-in via -OoDEVIRT; NOT part of the -O4 defaults.
+    Enabled via -OoDEVIRT; also part of the -O4 defaults
+    (genericlevel4optimizerswitches).
 
     This module is free software; see the FPC copying conditions.
 }
@@ -64,8 +75,10 @@ interface
       node;
 
     { rewrite provably-monomorphic virtual calls in the routine tree CODE into
-      direct calls to the constructed class's concrete override }
-    procedure OptimizeDevirt(var code : tnode);
+      direct calls to the constructed class's concrete override. Returns true if
+      at least one call was rebound toward the inliner (an inlineable override),
+      in which case the caller must re-run do_optinline over CODE. }
+    function OptimizeDevirt(var code : tnode) : boolean;
 
 implementation
 
@@ -92,6 +105,7 @@ implementation
         syms    : array of tdevirtsym;
         count   : integer;
         applied : longint;
+        inlined : longint;   { rebinds handed to the inliner (re-run do_optinline) }
       end;
 
 
@@ -347,6 +361,21 @@ implementation
             exit;
           end;
 
+        { If the resolved override is a small inlineable routine, rebind the
+          call so the ordinary inliner expands it (a devirtualized direct call
+          is otherwise never reconsidered for inlining in this routine, since
+          devirt runs after do_optinline). Falls back to the direct-name form
+          when the target is not inlineable / the heuristic declines. }
+        if cn.devirt_prepare_inline(target) then
+          begin
+            inc(ctx^.applied);
+            inc(ctx^.inlined);
+            OptRemark(cn.fileinfo,PASSNAME,
+              'call to '+methodname(target)+
+              ' devirtualized and inlined (receiver constructed as '+cls.typesymbolprettyname+')');
+            exit;
+          end;
+
         cn.devirtualize_target(target);
         inc(ctx^.applied);
         OptRemark(cn.fileinfo,PASSNAME,
@@ -355,20 +384,23 @@ implementation
       end;
 
 
-    procedure OptimizeDevirt(var code : tnode);
+    function OptimizeDevirt(var code : tnode) : boolean;
       var
         ctx : tdevirtctx;
       begin
+        result:=false;
         if not assigned(code) then
           exit;
         ctx.count:=0;
         ctx.applied:=0;
+        ctx.inlined:=0;
         setlength(ctx.syms,0);
         { pass 1: gather constructor provenance / poison facts }
         foreachnodestatic(pm_postprocess,code,@scan_defs,@ctx);
         { pass 2: rewrite provable call sites }
         foreachnodestatic(pm_postprocess,code,@apply_devirt,@ctx);
         setlength(ctx.syms,0);
+        result:=ctx.inlined>0;
       end;
 
 end.

@@ -226,6 +226,20 @@ interface
             for the call convention/parameter layout, and the emitted symbol name
             is forced to PD's, so ncgcal skips the VMT indirect load. }
           procedure devirtualize_target(pd: tprocdef);
+          { -OoDEVIRT inliner integration: after the receiver is proven
+            monomorphic and the concrete override TARGET resolved, try to rebind
+            this virtual call into a direct call to TARGET so the ordinary
+            inliner expands it from TARGET's RETAINED inlining info (a virtual
+            method never carries po_inline, so its body is kept without it -- see
+            psub). TARGET shares the base method's signature (it overrides it),
+            so procdefinition, every parameter symbol and the self type are
+            switched to TARGET's and cnf_do_inline is set. Limited to void-result
+            (procedure) targets whose retained body passes the size/para checks.
+            Returns true iff the call was rebound for inlining (the caller must
+            then re-run do_optinline); returns false leaving the node untouched,
+            so the caller falls back to the direct-name form (devirtualize_target).
+            All checks precede any mutation, so the node is never left half-bound. }
+          function devirt_prepare_inline(target: tprocdef): boolean;
           { true if a forced call name is already set (e.g. Objective-C message
             send, or a prior devirtualization) -> -OoDEVIRT must not touch it }
           function has_forced_call_name: boolean;
@@ -2309,6 +2323,100 @@ implementation
     procedure tcallnode.devirtualize_target(pd: tprocdef);
       begin
         foverrideprocnamedef:=pd;
+      end;
+
+
+    function tcallnode.devirt_prepare_inline(target: tprocdef): boolean;
+      var
+        para     : tcallparanode;
+        selfconv : tnode;
+        oldpd    : tabstractprocdef;
+        lim      : longint;
+        idx      : longint;
+      begin
+        result:=false;
+        { The devirtualization target is a vmt-slot method, hence virtual, and a
+          virtual method can NEVER carry po_inline (mutually exclusive with
+          po_virtualmethod) -- so neither the ordinary nor the auto inliner ever
+          touches it. Under -OoDEVIRT the target's body is instead RETAINED as
+          inlining info without po_inline (see psub.CreateInlineInfo call), so a
+          call proven to reach exactly this override can be expanded here. }
+
+        { inlining must be enabled and the retained body present + usable }
+        if not(cs_do_inline in current_settings.localswitches) then
+          exit;
+        { Restrict to void-result methods (procedures). Inlining a FUNCTION call
+          needs the funcret node / parameter temps prepared during pass_1 under
+          cnf_do_inline (maybe_create_funcret_node, gen_hidden_parameters); a
+          virtual call is not an inline candidate then, so that preparation never
+          ran and cannot be retrofitted here. Procedures need none of it, so they
+          expand safely; functions keep the direct-call devirtualization. }
+        if not is_void(target.returndef) then
+          exit;
+        if not((target.typ=procdef) and
+               target.has_inlininginfo and
+               assigned(target.inlininginfo) and
+               assigned(target.inlininginfo^.code) and
+               not(pio_inline_not_possible in target.implprocoptions) and
+               not(pio_inline_forbidden in target.implprocoptions)) then
+          exit;
+        { only expand a same-unit target: a body loaded from another unit's ppu
+          may reference symbols not resolvable for inlining in this context }
+        if not target.in_currentunit then
+          exit;
+        { the override shares the base method's signature, so the parameter
+          lists correspond position for position }
+        if not(assigned(procdefinition) and
+               (target.paras.count=procdefinition.paras.count)) then
+          exit;
+
+        { size heuristic, mirroring tcallnode.heuristics_favors_inlining but
+          measured against TARGET's retained body }
+        lim:=round(exp((1.0/(inlinelevel/3.0+1))*ln(10000)));
+        if not(node_count(target.inlininginfo^.code,lim)<lim) then
+          exit;
+
+        { every actual parameter must be inline-safe, and every parameter symbol
+          must map to TARGET's list; verify BOTH before mutating anything }
+        oldpd:=procdefinition;
+        para:=tcallparanode(left);
+        while assigned(para) do
+          begin
+            if not para.can_be_inlined then
+              exit;
+            if assigned(para.parasym) and
+               (oldpd.paras.indexof(para.parasym)<0) then
+              exit;
+            para:=tcallparanode(para.right);
+          end;
+
+        { commit: remap every parameter symbol to TARGET's corresponding one
+          (matched by its index in the base list) so replaceparaload matches the
+          loads in TARGET's body; reinterpret the base-typed self value as
+          TARGET's class. All checks above already passed, so no partial state. }
+        para:=tcallparanode(left);
+        while assigned(para) do
+          begin
+            if assigned(para.parasym) then
+              begin
+                idx:=oldpd.paras.indexof(para.parasym);
+                para.parasym:=tparavarsym(target.paras[idx]);
+                if (vo_is_self in para.parasym.varoptions) and
+                   assigned(para.left) and assigned(para.left.resultdef) and
+                   assigned(para.parasym.vardef) and
+                   not equal_defs(para.left.resultdef,para.parasym.vardef) then
+                  begin
+                    selfconv:=ctypeconvnode.create_internal(para.left,para.parasym.vardef);
+                    typecheckpass(selfconv);
+                    para.left:=selfconv;
+                  end;
+              end;
+            para:=tcallparanode(para.right);
+          end;
+
+        procdefinition:=target;
+        include(callnodeflags,cnf_do_inline);
+        result:=true;
       end;
 
 

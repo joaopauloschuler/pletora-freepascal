@@ -120,7 +120,13 @@ unit optcall;
         callnode: tcallnode;
       begin
         result:=fen_false;
-        if not(_n.nodetype=calln) or not(po_inline in tcallnode(_n).procdefinition.procoptions) then
+        { po_inline marks the ordinary inline routines; cnf_do_inline additionally
+          covers -OoDEVIRT targets, which are virtual (never po_inline) but whose
+          body was retained as inlining info and rebound here by
+          tcallnode.devirt_prepare_inline }
+        if not(_n.nodetype=calln) or
+           not((po_inline in tcallnode(_n).procdefinition.procoptions) or
+               (cnf_do_inline in tcallnode(_n).callnodeflags)) then
           exit;
         callnode:=tcallnode(_n);
 

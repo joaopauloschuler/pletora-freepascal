@@ -1293,12 +1293,18 @@ implementation
          Skipped for routines with inline assembler (the receiver's storage may
          be referenced opaquely) or with labels (goto could enter regions the
          provenance scan assumed unreachable). Independent of DFA -- it is a
-         structural whole-tree scan. NOTE: this runs AFTER do_optinline above,
-         so a call devirtualized here does not itself feed the inliner in this
-         routine; wiring the direct target into the inliner is a follow-up. }
+         structural whole-tree scan. This runs AFTER do_optinline above, so a
+         call rebound here toward an inlineable override (OptimizeDevirt returns
+         true) is fed back through do_optinline once more, letting the inliner
+         expand the now-direct target in this same routine; the freshly inlined
+         body is still seen by the DFA/constprop/loop passes that follow. }
        if (cs_opt_devirt in current_settings.optimizerswitches) and
          ((flags*[pi_has_assembler_block,pi_is_assembler,pi_has_label])=[]) then
-         OptimizeDevirt(code);
+         begin
+           if OptimizeDevirt(code) and
+              (cs_do_inline in current_settings.localswitches) then
+             do_optinline(code,updated);
+         end;
 
        if (cs_opt_nodedfa in current_settings.optimizerswitches) and
          { creating dfa is not always possible }
@@ -2434,6 +2440,30 @@ implementation
                 include(procdef.procoptions,po_inline);
                 CreateInlineInfo;
               end;
+          end;
+
+        { -OoDEVIRT: retain the body of a small VIRTUAL method as inlining info
+          so that a call proven to reach exactly this override (devirtualized in
+          another routine of this unit) can be expanded inline. A virtual method
+          can never carry po_inline -- it is mutually exclusive with
+          po_virtualmethod, so both the ordinary and the automatic inliner skip
+          it -- hence the body is kept WITHOUT setting po_inline: normal virtual
+          dispatch is unaffected, only tcallnode.devirt_prepare_inline consumes
+          the retained body. Same soundness gate (checknodeinlining) and size
+          heuristic as auto-inlining; excludes constructors/destructors (never
+          devirtualized) and the same unsafe proc kinds. }
+        if (cs_opt_devirt in current_settings.optimizerswitches) and
+           (po_virtualmethod in procdef.procoptions) and
+           not(po_noinline in procdef.procoptions) and
+           not(procdef.has_inlininginfo) and not(has_nestedprocs) and
+           not(procdef.proctypeoption in [potype_proginit,potype_unitinit,potype_unitfinalize,potype_constructor,
+                                          potype_destructor,potype_class_constructor,potype_class_destructor]) and
+           ((procdef.procoptions*[po_exports,po_external,po_interrupt,po_iocheck,po_assembler,po_abstractmethod])=[]) and
+           (not(procdef.proccalloption in [pocall_safecall])) and
+           heuristics_favors_autoinlining(code) then
+          begin
+            if checknodeinlining(procdef) then
+              CreateInlineInfo;   { deliberately WITHOUT include(procoptions,po_inline) }
           end;
 
         templist:=TAsmList.create;
