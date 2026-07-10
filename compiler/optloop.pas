@@ -110,6 +110,75 @@ unit optloop;
           number_unrolls:=1;
       end;
 
+    { --- -OoPURE consumer helpers for the loop-family passes -----------------
+
+      Several loop passes scan a body / region and treat ANY call as a hard
+      barrier or disqualifier.  When -OoPURE has proved the callee's attributes
+      a resolved DIRECT call is far weaker than that:
+
+        * a CONST routine reads and writes NO memory, is side-effect free and
+          non-trapping -- it can neither observe nor clobber any memory the pass
+          cares about and can never raise, so it is transparent to any of these
+          transforms (reorder / duplicate with a shifted counter / promote a
+          global to a register across it);
+
+        * a PURE routine additionally MAY read global/heap memory (but writes
+          none): it is transparent only to passes whose sole concern is store
+          ordering AND that never keep a promoted value out of memory across it
+          (a pure callee could read the stale in-memory copy).
+
+      Both classifiers require a statically resolved ordinary/direct call and
+      reject the aggregate-return machinery (funcret/init/cleanup nodes perform
+      hidden stores) and indirect/virtual/procvar targets, mirroring the
+      -OoDEADSTORE (optdeadstore.el_classify_call) model. }
+
+    function loop_call_target(n : tnode) : tprocdef;
+      var
+        cn : tcallnode;
+        pd : tprocdef;
+      begin
+        result:=nil;
+        if not(cs_opt_pure in current_settings.optimizerswitches) then
+          exit;
+        if not assigned(n) or (n.nodetype<>calln) then
+          exit;
+        cn:=tcallnode(n);
+        { resolved direct call only (excludes indirect / procvar targets) }
+        if not assigned(cn.procdefinition) or not(cn.procdefinition is tprocdef) then
+          exit;
+        pd:=tprocdef(cn.procdefinition);
+        { a method call must dispatch to a statically known body }
+        if assigned(cn.methodpointer) and
+           ((po_virtualmethod in pd.procoptions) or
+            (po_abstractmethod in pd.procoptions)) then
+          exit;
+        { aggregate-return machinery performs hidden stores -> stay a barrier }
+        if assigned(cn.funcretnode) or assigned(cn.callinitblock) or
+           assigned(cn.callcleanupblock) then
+          exit;
+        result:=pd;
+      end;
+
+    { a resolved direct call whose target -OoPURE proved CONST (no memory read,
+      no memory write, no side effect, non-trapping) }
+    function loop_is_const_call(n : tnode) : boolean;
+      var
+        pd : tprocdef;
+      begin
+        pd:=loop_call_target(n);
+        result:=assigned(pd) and proc_is_const(pd);
+      end;
+
+    { a resolved direct call whose target -OoPURE proved PURE or CONST (writes
+      no memory; a bare PURE routine may still read global memory) }
+    function loop_is_pure_call(n : tnode) : boolean;
+      var
+        pd : tprocdef;
+      begin
+        pd:=loop_call_target(n);
+        result:=assigned(pd) and proc_is_pure(pd);
+      end;
+
     type
       treplaceinfo = record
         node : tnode;
@@ -6217,7 +6286,23 @@ unit optloop;
             exit(fen_norecurse_true);
           end;
         case n.nodetype of
-          calln,addrn,assignn,forn,whilerepeatn,
+          calln:
+            { a resolved direct call to a routine -OoPURE proved PURE or CONST is
+              side-effect free and non-trapping, so duplicating it with a
+              shifted counter (the reassociation) is sound.  PURE (not only
+              CONST) is admissible here because the reduction body's ONLY store
+              is to the non-address-taken local accumulator, which no callee can
+              name -- so nothing in the loop writes memory a pure callee could
+              read, and regrouping the additions re-reads identical values.
+              Keep recursing into the argument subtrees so an accumulator
+              reference or other unsafe construct inside an argument is still
+              caught. }
+            if not loop_is_pure_call(n) then
+              begin
+                preassoc_safety(arg)^.bad:=true;
+                result:=fen_norecurse_true;
+              end;
+          addrn,assignn,forn,whilerepeatn,
           breakn,continuen,goton,labeln,exitn,raisen,tryexceptn,tryfinallyn,onn:
             begin
               preassoc_safety(arg)^.bad:=true;
@@ -6243,6 +6328,20 @@ unit optloop;
           else
             ;
         end;
+      end;
+
+
+    function reassoc_note_call_cb(var n : tnode; arg : pointer) : foreachnoderesult;
+      { detects a pure/const call admitted into the reduction addend by the
+        relaxed reassoc_safety_cb, for an accurate -OoREPORT remark }
+      begin
+        if (n.nodetype=calln) and loop_is_pure_call(n) then
+          begin
+            pboolean(arg)^:=true;
+            result:=fen_norecurse_true;
+          end
+        else
+          result:=fen_false;
       end;
 
 
@@ -6324,6 +6423,7 @@ unit optloop;
         exprk, accref : tnode;
         j : longint;
         lo, hi : tconstexprint;
+        hasrelaxedcall : boolean;
 
       function reassoc_reason : string;
         begin
@@ -6514,7 +6614,15 @@ unit optloop;
 
         do_firstpass(block);
         MessagePos1(forn.fileinfo,cg_n_loop_reassociated,tostr(reassoc_k));
-        OptRemark(forn.fileinfo,'reassoc','reduction loop split into '+tostr(reassoc_k)+' partial accumulators');
+        if cs_opt_report in current_settings.optimizerswitches then
+          begin
+            hasrelaxedcall:=false;
+            foreachnodestatic(pm_postprocess,exprnode,@reassoc_note_call_cb,@hasrelaxedcall);
+            if hasrelaxedcall then
+              OptRemark(forn.fileinfo,'reassoc','reduction loop split into '+tostr(reassoc_k)+' partial accumulators (addend contains a proven pure/const call kept in the body via -OoPURE)')
+            else
+              OptRemark(forn.fileinfo,'reassoc','reduction loop split into '+tostr(reassoc_k)+' partial accumulators');
+          end;
         forn.free;
         n:=block;
         changed:=true;
@@ -8765,11 +8873,42 @@ unit optloop;
           unaryminusn,notn:
             result:=(([cs_check_overflow,cs_check_range]*n.localswitches)=[]) and
                     sm_node_safe(tunarynode(n).left);
+          calln:
+            { a resolved direct call to a routine -OoPURE proved CONST reads and
+              writes NO memory, is side-effect free and non-trapping: it can
+              neither observe nor clobber the promoted global (nor any other
+              memory) and can never raise before the post-loop store, so it is
+              transparent to the promotion.  PURE is NOT sufficient here -- a
+              pure routine may READ global memory, and it would read the promoted
+              global's stale in-memory copy while the live value sits in the
+              register temp.  The argument subtrees must themselves be safe
+              (recursed below), which also keeps them non-trapping. }
+            begin
+              result:=loop_is_const_call(n);
+              if result then
+                result:=sm_node_safe(tcallnode(n).left);
+            end;
+          callparan:
+            result:=sm_node_safe(tcallparanode(n).paravalue) and
+                    sm_node_safe(tcallparanode(n).nextpara);
           else
-            { calln, inlinen, derefn, subscriptn, vecn, divn, modn, nested
+            { inlinen, derefn, subscriptn, vecn, divn, modn, nested
               forn/whilerepeatn, break/continue/goto/raise/try, ... -> decline }
             result:=false;
         end;
+      end;
+
+    { detects a proven-CONST call kept in the loop body by the relaxed whitelist,
+      for an accurate -OoREPORT remark }
+    function sm_has_constcall_cb(var n: tnode; arg: pointer): foreachnoderesult;
+      begin
+        if (n.nodetype=calln) and loop_is_const_call(n) then
+          begin
+            pboolean(arg)^:=true;
+            result:=fen_norecurse_true;
+          end
+        else
+          result:=fen_false;
       end;
 
     function sm_find_var(data: PStoreMotionData; sym: tsymentry): TStoreMotionVar;
@@ -8843,6 +8982,7 @@ unit optloop;
         NewWrapper: TStatementNode;
         NewNode, NewCopy: tnode;
         promoted: integer;
+        hasconstcall: boolean;
       begin
         result:=fen_false;
         if not (n.nodetype in [forn,whilerepeatn]) or (nf_internal in n.flags) then
@@ -8936,6 +9076,18 @@ unit optloop;
               NewNode.fileinfo:=n.fileinfo;
               addstatement(NewWrapper,NewNode);
               v:=TStoreMotionVar(v.Previous);
+            end;
+
+          if cs_opt_report in current_settings.optimizerswitches then
+            begin
+              hasconstcall:=false;
+              foreachnodestatic(pm_postprocess,NewCopy,@sm_has_constcall_cb,@hasconstcall);
+              if hasconstcall then
+                OptRemark(n.fileinfo,'storemotion',
+                  'promoted '+tostr(data.Vars.Count)+' invariant-address global(s) to register temps across a loop body containing a proven-const call (-OoPURE)')
+              else
+                OptRemark(n.fileinfo,'storemotion',
+                  'promoted '+tostr(data.Vars.Count)+' invariant-address global(s) to register temps for the loop');
             end;
 
           n.Free;
