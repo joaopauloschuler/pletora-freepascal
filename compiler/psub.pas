@@ -1243,6 +1243,30 @@ implementation
       end;
 
 
+    { recursively gather the procdef and (parsed) code tree of every nested
+      routine of pi into the parallel lists defs/bodies, for
+      CollectNestedProcDefSyms.  Nested routines are parsed with their parent,
+      so their code trees are available when the parent's DFA runs (the parent's
+      generate_code precedes generate_code_tree's descent into the nest). }
+    procedure collect_nested_bodies(pi : tprocinfo;defs,bodies : tfplist);
+      var
+        hpi : tprocinfo;
+      begin
+        hpi:=pi.get_first_nestedproc;
+        while assigned(hpi) do
+          begin
+            if assigned(tcgprocinfo(hpi).code) and
+               not(df_generic in hpi.procdef.defoptions) then
+              begin
+                defs.Add(hpi.procdef);
+                bodies.Add(tcgprocinfo(hpi).code);
+              end;
+            collect_nested_bodies(hpi,defs,bodies);
+            hpi:=tprocinfo(hpi.next);
+          end;
+      end;
+
+
     procedure tcgprocinfo.TransformNodeTree;
       var
         i : integer;
@@ -1251,9 +1275,12 @@ implementation
         RedoDFA : boolean;
         loopfillsyms : tfplist;
         guardsyms : tfplist;
+        nestedsyms : tfplist;
+        nesteddefs,nestedbodies : tfplist;
       begin
        loopfillsyms:=tfplist.Create;
        guardsyms:=tfplist.Create;
+       nestedsyms:=tfplist.Create;
        { inlining is a heuristics, so we do this very early }
        do_optinline(code,updated);
 
@@ -1345,6 +1372,26 @@ implementation
              unaffected. }
            if (flags*[pi_has_assembler_block,pi_is_assembler,pi_uses_exceptions,pi_has_label])=[] then
              CollectCorrelatedGuardSyms(code,guardsyms);
+
+           { record locals of this routine that are assigned only inside a
+             nested routine which the routine calls before reading them.  The
+             DFA does not model a nested-procedure call as a definition of the
+             captured parent local, so its later "does not seem to be
+             initialized" warning is a false positive; skip it in the warning
+             loop.  Diagnostic only -- liveness and noregvarinitneeded are
+             untouched, so codegen is unaffected. }
+           if has_nestedprocs and assigned(procdef.localst) then
+             begin
+               nesteddefs:=tfplist.Create;
+               nestedbodies:=tfplist.Create;
+               try
+                 collect_nested_bodies(self,nesteddefs,nestedbodies);
+                 CollectNestedProcDefSyms(code,procdef.localst,nesteddefs,nestedbodies,nestedsyms);
+               finally
+                 nesteddefs.Free;
+                 nestedbodies.Free;
+               end;
+             end;
 
            if cs_opt_constant_propagate in current_settings.optimizerswitches then
              begin
@@ -1739,7 +1786,10 @@ implementation
                            (loopfillsyms.IndexOf(tloadnode(dfabuilder.nodemap[i]).symtableentry)>=0)) and
                        { skip correlated if-guard false positives (see above) }
                        not((tnode(dfabuilder.nodemap[i]).nodetype=loadn) and
-                           (guardsyms.IndexOf(tloadnode(dfabuilder.nodemap[i]).symtableentry)>=0)) then
+                           (guardsyms.IndexOf(tloadnode(dfabuilder.nodemap[i]).symtableentry)>=0)) and
+                       { skip nested-procedure-def false positives (see above) }
+                       not((tnode(dfabuilder.nodemap[i]).nodetype=loadn) and
+                           (nestedsyms.IndexOf(tloadnode(dfabuilder.nodemap[i]).symtableentry)>=0)) then
                        CheckAndWarn(UserCode,tnode(dfabuilder.nodemap[i]));
                    end
                  else
@@ -1815,6 +1865,7 @@ implementation
 
        loopfillsyms.Free;
        guardsyms.Free;
+       nestedsyms.Free;
       end;
 
 

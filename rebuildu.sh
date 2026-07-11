@@ -85,19 +85,41 @@
 #      guardcorr_dfa_01.pp (%OPT="-O4 -Sew") and
 #      unleashed/tests/guardcorr_dfa_check.sh (over-suppression guards).
 #
-#   4. OPEN (tasklist self-host blocker #4): with #3 fixed, plain OPT="-O4" now
-#      gets PAST pstatmnt.pas but aborts stage-2 (ppc2) on
-#      compiler/x86/aoptx86.pas:19282 with spurious "Local variable anchors of a
-#      managed type / acount does not seem to be initialized" (and :19555
-#      anchor) warnings-as-error.  DISTINCT root cause: a local assigned ONLY
-#      inside a NESTED procedure/function (CollectAnchors/FindAnchor) that the
-#      enclosing routine (DoCrossJump) calls before reading it -- the -O3/-O4 DFA
-#      does not model a nested-proc call as a definition of the captured parent
-#      local; NOT a loop-fill or correlated guard.  Warning-only, CLEAN at -O2,
-#      fires at -O3/-O4, present in upstream FPC 3.2.2 too.  Reduced reproducer:
-#      unleashed/tests/known_miscompiles/o4_nestedproc_def_uninit_01.pp.
+#   4. FIXED (fork commit on branch a3, optdfa.pas CollectNestedProcDefSyms
+#      + psub.pas wiring): the spurious -O4 "Local variable anchors/acount/anchor
+#      does not seem to be initialized" at compiler/x86/aoptx86.pas (DoCrossJump
+#      via nested CollectAnchors/FindAnchor) is gone.  Root cause: a parent local
+#      assigned ONLY inside a NESTED procedure that the enclosing routine calls
+#      before reading it; the DFA does not model a nested-proc call as a def of
+#      the captured local.  Warning-only, CLEAN at -O2 (the node DFA cs_opt_nodedfa
+#      only runs at -O3+), fires at -O3/-O4, present in upstream FPC 3.2.2 too.
+#      The fix suppresses the diagnostic ONLY for a local written by a nested
+#      routine that is actually CALLED in the routine's nest (genuine uninit reads
+#      still warn), never touching liveness / noregvarinitneeded -- codegen is
+#      unaffected.  Reproducer + regression: unleashed/tests/testfiles/
+#      nestedprocdef_dfa/nestedprocdef_dfa_01.pp (%OPT="-O4 -Sew") and
+#      unleashed/tests/nestedprocdef_dfa_check.sh (over-suppression guards).
+#      With #4 fixed, plain OPT="-O4" now compiles the WHOLE compiler past
+#      aoptx86.pas -- no more uninitialised-variable aborts.
 #
-#   So plain -O4 self-host is BLOCKED pending #4.  Once green, adopt the winning
+#   5. OPEN (tasklist self-host blocker #5): the FIRST plain-`-O4` MISCOMPILE
+#      (blockers #1-#4 were all warning-only).  With #4 fixed, OPT="-O4" compiles
+#      the whole compiler, but the stage-2 compiler ppc2 (built by ppc1 at -O4)
+#      is MISCOMPILED and crashes (EAccessViolation) on ANY input, aborting the
+#      cycle at `next` while rebuilding system.pp.  Bisected to the fork's
+#      "sibling tail-call frame reuse" peephole (TX86AsmOptimizer.PostPeepholeOptCall,
+#      compiler/x86/aoptx86.pas ~18743, DebugMsg "CallFrameRet2Jmp done"), gated
+#      DIRECTLY on cs_opt_level4 (NOT the -OoSIBCALL toggle -- so disabling every
+#      level-4 -Oo pass does not help; -O2/-O3 are clean).  It hoists a copy of the
+#      frame teardown (leaq N(%rsp),%rsp / addq $N,%rsp + callee-saved pops) ABOVE
+#      a tail call and turns the call into a jmp, but MISSES stack-passed callee
+#      arguments: a callee with >6 int/ptr args reads them from the outgoing-param
+#      area in the just-released frame -> garbage.  Reduced reproducer:
+#      unleashed/tests/known_miscompiles/o4_sibcall_frame_reuse_stackargs_01.pp
+#      (ppcx64 -O4 -> garbage/FAIL, -O3/-O2 -> ok).  Fix: refuse the hoist when the
+#      callee has stack-passed parameters (or preserve the outgoing stack args).
+#
+#   So plain -O4 self-host is BLOCKED pending #5.  Once green, adopt the winning
 #   flag set here as the documented default gate and (optionally) fold in the
 #   opt-in -Oo* passes one at a time via OPTFORK.
 set -e

@@ -32,6 +32,7 @@ unit optdfa;
 
     uses
       cclasses,
+      symbase,
       node,optutils;
 
     type
@@ -65,6 +66,19 @@ unit optdfa;
       still-structured tree.  The DFA "uninitialized" warning is a false
       positive for these variables; suppression is diagnostic-only. }
     procedure CollectCorrelatedGuardSyms(code : tnode;syms : tfplist);
+
+    { Collect into syms every local of the current routine that is written inside
+      a nested routine (child procdef) which is actually called somewhere in the
+      current routine's nest.  The -O3/-O4 uninitialized-variable DFA does not
+      model a call to a nested routine as a (potential) definition of the parent
+      locals that routine captures and writes, so a parent local assigned only in
+      such a nested routine and read after the call is spuriously flagged.  This
+      is a false positive; suppression is diagnostic-only (liveness /
+      noregvarinitneeded untouched, so codegen is unaffected).  nesteddefs and
+      nestedbodies are parallel lists: the procdef and code tree of every nested
+      routine (at any depth) of the current routine. }
+    procedure CollectNestedProcDefSyms(parentcode : tnode;parentlocalst : tsymtable;
+                                       nesteddefs,nestedbodies : tfplist;syms : tfplist);
 
   implementation
 
@@ -1563,6 +1577,76 @@ unit optdfa;
           regionsyms.Free;
           regions.Free;
           cands.Free;
+        end;
+      end;
+
+
+    { --- nested-procedure-def uninitialized-variable false positive --- }
+
+    { collect the procdefs of every routine called in a subtree }
+    function np_collect_calldefs(var n : tnode; arg : pointer) : foreachnoderesult;
+      begin
+        result:=fen_false;
+        if (n.nodetype=calln) and assigned(tcallnode(n).procdefinition) and
+           (tfplist(arg).IndexOf(tcallnode(n).procdefinition)<0) then
+          tfplist(arg).Add(tcallnode(n).procdefinition);
+      end;
+
+    type
+      tnpwriterec = record
+        parentlocalst : tsymtable;
+        syms : tfplist;
+      end;
+      pnpwriterec = ^tnpwriterec;
+
+    { collect writes (nf_write loads) to locals owned by parentlocalst -- i.e.
+      captured locals of the current routine written from a nested routine }
+    function np_collect_parentwrites(var n : tnode; arg : pointer) : foreachnoderesult;
+      var
+        s : tsym;
+      begin
+        result:=fen_false;
+        if (n.nodetype=loadn) and (nf_write in n.flags) then
+          begin
+            s:=tloadnode(n).symtableentry;
+            if assigned(s) and (s.typ=localvarsym) and
+               (s.owner=pnpwriterec(arg)^.parentlocalst) and
+               (pnpwriterec(arg)^.syms.IndexOf(s)<0) then
+              pnpwriterec(arg)^.syms.Add(s);
+          end;
+      end;
+
+    procedure CollectNestedProcDefSyms(parentcode : tnode;parentlocalst : tsymtable;
+                                       nesteddefs,nestedbodies : tfplist;syms : tfplist);
+      var
+        calldefs : tfplist;
+        rec : tnpwriterec;
+        nb : tnode;
+        i : longint;
+      begin
+        if not(assigned(parentcode) and assigned(parentlocalst)) or
+           (nestedbodies.Count=0) then
+          exit;
+        calldefs:=tfplist.Create;
+        try
+          { every routine called from the parent body or from any nested body:
+            a nested routine that is never called cannot have defined the local }
+          foreachnodestatic(parentcode,@np_collect_calldefs,calldefs);
+          for i:=0 to nestedbodies.Count-1 do
+            begin
+              nb:=tnode(nestedbodies[i]);
+              foreachnodestatic(nb,@np_collect_calldefs,calldefs);
+            end;
+          rec.parentlocalst:=parentlocalst;
+          rec.syms:=syms;
+          for i:=0 to nestedbodies.Count-1 do
+            if calldefs.IndexOf(nesteddefs[i])>=0 then
+              begin
+                nb:=tnode(nestedbodies[i]);
+                foreachnodestatic(nb,@np_collect_parentwrites,@rec);
+              end;
+        finally
+          calldefs.Free;
         end;
       end;
 
