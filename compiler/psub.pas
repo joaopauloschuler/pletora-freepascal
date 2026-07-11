@@ -364,9 +364,20 @@ implementation
             _no_inline('global goto');
             exit;
           end;
+        { NB: an ORDINARY `exit`/`exit(value)` inside a nested construct (loop,
+          if, case, even try/finally) is NOT gated here -- the inliner already
+          handles it: the spliced body carries nf_block_with_exit (psub.pas
+          CreateInlineInfo), so every exit inside it is lowered to a jump to the
+          per-inline-site exit label rather than the caller's real exit, and
+          exit(value) first assigns the funcret temp (texitnode.pass_typecheck).
+          pi_has_nested_exit is set ONLY by the MacPas non-local
+          `Exit(EnclosingRoutine)` (pexpr.pas), which longjmp/label-jumps out to
+          a SPECIFIC enclosing procedure's frame and is inherently nested-scope;
+          splicing it into an arbitrary caller would jump into a frame that does
+          not exist there, so it stays refused (soundness). }
         if pi_has_nested_exit in current_procinfo.flags then
           begin
-            _no_inline('nested exit');
+            _no_inline('non-local Exit of an enclosing routine');
             exit;
           end;
         if pi_calls_c_varargs in current_procinfo.flags then
