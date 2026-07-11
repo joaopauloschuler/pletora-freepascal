@@ -42,7 +42,7 @@ interface
             over a packed register (transforms xreg in place). }
           function transc_splat_ref(bits : longint) : treference;
           function transc_fsplat_ref(v : single) : treference;
-          procedure emit_vec_expf(list : TAsmList; xreg : tregister; avx : boolean; mmsz : tcgsize);
+          procedure emit_vec_expf(list : TAsmList; xreg : tregister; avx : boolean; mmsz : tcgsize; expm1 : boolean);
        end;
 
        tx86inlinenode = class(tcginlinenode)
@@ -159,14 +159,15 @@ implementation
       end;
 
 
-    procedure tx86vectoropnode.emit_vec_expf(list : TAsmList; xreg : tregister; avx : boolean; mmsz : tcgsize);
+    procedure tx86vectoropnode.emit_vec_expf(list : TAsmList; xreg : tregister; avx : boolean; mmsz : tcgsize; expm1 : boolean);
       { Transform the packed-single register xreg in place from x to an
-        approximate exp(x), inlined as the classic Cephes single-precision expf
-        (the sse_mathfun.h form): clamp x to the finite range, range-reduce
-        n:=round(x*log2e) via cvtps2dq (round-to-nearest, no branch), evaluate a
-        degree-5 minimax polynomial on the remainder r=x-n*ln2 (ln2 split into a
-        hi+lo pair for accuracy), and scale by 2^n built by inserting n+127 into
-        the IEEE exponent field (paddd + pslld 23).  SSE2-only integer/convert
+        approximate exp(x) (expm1=false) or exp(x)-1 (expm1=true, the
+        cancellation-free expm1 used by tanh), inlined as the classic Cephes
+        single-precision expf (the sse_mathfun.h form): clamp x to the finite range,
+        range-reduce n:=round(x*log2e) via cvtps2dq (round-to-nearest, no branch),
+        evaluate a degree-5 minimax polynomial on the remainder r=x-n*ln2 (ln2 split
+        into a hi+lo pair for accuracy), and scale by 2^n built by inserting n+127
+        into the IEEE exponent field (paddd + pslld 23).  SSE2-only integer/convert
         ops (with AVX VEX v-forms when available), so it runs at the x86_64
         baseline fputype.  Worst-case error over [-87,88] is ~1 ulp / <1e-6
         relative vs libm expf; inputs outside [exp_lo,exp_hi] (incl. +-Inf) are
@@ -281,10 +282,12 @@ implementation
         op2r(A_MULPS,A_VMULPS,xreg,y); op2m(A_ADDPS,A_VADDPS,transc_fsplat_ref(P4),y);
         op2r(A_MULPS,A_VMULPS,xreg,y); op2m(A_ADDPS,A_VADDPS,transc_fsplat_ref(P5),y);
 
-        { y := y*z + r + 1.0 }
+        { y := y*z + r   (= e^r - 1, the expm1 of the reduced remainder r; adding
+          the +1.0 below restores the full mantissa e^r for the plain exp path) }
         op2r(A_MULPS,A_VMULPS,z,y);
         op2r(A_ADDPS,A_VADDPS,xreg,y);
-        op2m(A_ADDPS,A_VADDPS,transc_fsplat_ref(1.0),y);
+        if not expm1 then
+          op2m(A_ADDPS,A_VADDPS,transc_fsplat_ref(1.0),y);
 
         { pow2n := 2^n  (ni := (n + 127) << 23, reinterpreted as float) }
         op2m(A_PADDD,A_VPADDD,transc_splat_ref(127),ni);
@@ -293,8 +296,25 @@ implementation
         else
           list.concat(taicpu.op_const_reg(A_PSLLD,S_NO,23,ni));
 
-        { result := y * 2^n, left in xreg for the caller to store }
-        op2r(A_MULPS,A_VMULPS,ni,y);
+        if expm1 then
+          begin
+            { expm1(x) = 2^n*(e^r - 1) + (2^n - 1).  The (2^n - 1) term is formed as
+              its OWN value (2^n - 1.0) -- exact for the power-of-two 2^n whenever
+              2^n-1 < 2^24 -- so at n=0 it is EXACTLY 0.0 and the result is exactly
+              e^r-1 = y.  This is the whole point of the expm1 form: a plain
+              exp(x)-1 near x=0 rounds e^x to ~1.0 and then subtracts 1.0, losing
+              every significant bit of the tiny true value (catastrophic
+              cancellation); here no such subtraction of nearly-equal quantities
+              ever happens, so the small-argument RELATIVE error is preserved. }
+            movr(ni,tmp);
+            op2m(A_SUBPS,A_VSUBPS,transc_fsplat_ref(1.0),tmp);   { tmp := 2^n - 1 }
+            op2r(A_MULPS,A_VMULPS,ni,y);                         { y := 2^n*(e^r-1) }
+            op2r(A_ADDPS,A_VADDPS,tmp,y);                        { y := expm1(x) }
+          end
+        else
+          { result := y * 2^n }
+          op2r(A_MULPS,A_VMULPS,ni,y);
+        { result left in xreg for the caller to store }
         movr(y,xreg);
       end;
 
@@ -592,11 +612,12 @@ implementation
           exp is emitted inline (emit_vec_expf); the softmax shape exp(b[i]-m)
           subtracts the pre-broadcast bias slot (third) from the window first;
           sigmoid and tanh are built on it:
-            sigmoid(x) = 1/(1+exp(-x))
-            tanh(x)    = 2/(1+exp(-2x)) - 1  = 2*sigmoid(2x) - 1
-          so the source window is first scaled (by -1 for sigmoid, -2 for tanh) to
-          feed exp(-x) / exp(-2x), and the reciprocal is a packed divps (accurate,
-          not an rcpps approximation). Single precision, 128-bit only. }
+            sigmoid(x) = 1/(1+exp(-x))       ( scale x by -1, feed expf, packed divps )
+            tanh(x)    = t/(t+2), t=expm1(2x) ( a cancellation-free expm1 form -- at
+                         x~0, t~2x and t/(t+2)~x with full RELATIVE precision, unlike
+                         the old 2/(1+exp(-2x))-1 whose final -1 cancelled the tiny
+                         near-zero value; the reciprocal is a packed divps, not an
+                         rcpps approximation ). }
         if kind=vok_transc then
           begin
             { load b[i..i+VL-1] into regb }
@@ -627,53 +648,70 @@ implementation
                       else
                         current_asmdata.CurrAsmList.concat(taicpu.op_reg_reg(A_SUBPS,S_NO,regc,regb));
                     end;
-                  emit_vec_expf(current_asmdata.CurrAsmList,regb,avx,mmsize);
+                  emit_vec_expf(current_asmdata.CurrAsmList,regb,avx,mmsize,false);
                   resreg:=regb;
                 end;
-              tf_sigmoid,tf_tanh:
+              tf_sigmoid:
                 begin
-                  { regb := scale*x   (scale = -1 for sigmoid, -2 for tanh) }
-                  if transfunc=tf_tanh then
-                    refc:=transc_fsplat_ref(-2.0)
-                  else
-                    refc:=transc_fsplat_ref(-1.0);
+                  { sigmoid(x) = 1/(1+exp(-x)) }
+                  { regb := -x }
+                  refc:=transc_fsplat_ref(-1.0);
                   if avx then
                     current_asmdata.CurrAsmList.concat(taicpu.op_ref_reg_reg(A_VMULPS,S_NO,refc,regb,regb))
                   else
                     current_asmdata.CurrAsmList.concat(taicpu.op_ref_reg(A_MULPS,S_NO,refc,regb));
-                  { regb := exp(scale*x) }
-                  emit_vec_expf(current_asmdata.CurrAsmList,regb,avx,mmsize);
-                  { regb := 1 + regb  (denominator) }
+                  { regb := exp(-x) }
+                  emit_vec_expf(current_asmdata.CurrAsmList,regb,avx,mmsize,false);
+                  { regb := 1 + exp(-x)  (denominator) }
                   refc:=transc_fsplat_ref(1.0);
                   if avx then
                     current_asmdata.CurrAsmList.concat(taicpu.op_ref_reg_reg(A_VADDPS,S_NO,refc,regb,regb))
                   else
                     current_asmdata.CurrAsmList.concat(taicpu.op_ref_reg(A_ADDPS,S_NO,refc,regb));
-                  { regc := numerator (1 for sigmoid, 2 for tanh) }
+                  { regc := 1 ; regc := regc / (1+exp(-x)) }
                   regc:=cg.getmmregister(current_asmdata.CurrAsmList,mmsize);
-                  if transfunc=tf_tanh then
-                    refc:=transc_fsplat_ref(2.0)
-                  else
-                    refc:=transc_fsplat_ref(1.0);
+                  refc:=transc_fsplat_ref(1.0);
                   if avx then
                     current_asmdata.CurrAsmList.concat(taicpu.op_ref_reg(A_VMOVAPS,S_NO,refc,regc))
                   else
                     current_asmdata.CurrAsmList.concat(taicpu.op_ref_reg(A_MOVAPS,S_NO,refc,regc));
-                  { regc := regc / (1+e) }
                   if avx then
                     current_asmdata.CurrAsmList.concat(taicpu.op_reg_reg_reg(A_VDIVPS,S_NO,regb,regc,regc))
                   else
                     current_asmdata.CurrAsmList.concat(taicpu.op_reg_reg(A_DIVPS,S_NO,regb,regc));
-                  { tanh: regc := regc - 1 }
-                  if transfunc=tf_tanh then
-                    begin
-                      refc:=transc_fsplat_ref(1.0);
-                      if avx then
-                        current_asmdata.CurrAsmList.concat(taicpu.op_ref_reg_reg(A_VSUBPS,S_NO,refc,regc,regc))
-                      else
-                        current_asmdata.CurrAsmList.concat(taicpu.op_ref_reg(A_SUBPS,S_NO,refc,regc));
-                    end;
                   resreg:=regc;
+                end;
+              tf_tanh:
+                begin
+                  { tanh(x) = t/(t+2)  with t = expm1(2x): the expm1 form keeps the
+                    small-argument RELATIVE error (near x=0, t~2x and t/(t+2)~x) that
+                    the previous 2*sigmoid(2x)-1 lost to the trailing -1 cancellation }
+                  { regb := 2*x }
+                  refc:=transc_fsplat_ref(2.0);
+                  if avx then
+                    current_asmdata.CurrAsmList.concat(taicpu.op_ref_reg_reg(A_VMULPS,S_NO,refc,regb,regb))
+                  else
+                    current_asmdata.CurrAsmList.concat(taicpu.op_ref_reg(A_MULPS,S_NO,refc,regb));
+                  { regb := expm1(2x) = t }
+                  emit_vec_expf(current_asmdata.CurrAsmList,regb,avx,mmsize,true);
+                  { regc := t + 2  (denominator; always >= 1 since t >= -1, so the
+                    divps never divides by zero) }
+                  regc:=cg.getmmregister(current_asmdata.CurrAsmList,mmsize);
+                  if avx then
+                    current_asmdata.CurrAsmList.concat(taicpu.op_reg_reg(A_VMOVAPS,S_NO,regb,regc))
+                  else
+                    current_asmdata.CurrAsmList.concat(taicpu.op_reg_reg(A_MOVAPS,S_NO,regb,regc));
+                  refc:=transc_fsplat_ref(2.0);
+                  if avx then
+                    current_asmdata.CurrAsmList.concat(taicpu.op_ref_reg_reg(A_VADDPS,S_NO,refc,regc,regc))
+                  else
+                    current_asmdata.CurrAsmList.concat(taicpu.op_ref_reg(A_ADDPS,S_NO,refc,regc));
+                  { regb := t / (t+2) }
+                  if avx then
+                    current_asmdata.CurrAsmList.concat(taicpu.op_reg_reg_reg(A_VDIVPS,S_NO,regc,regb,regb))
+                  else
+                    current_asmdata.CurrAsmList.concat(taicpu.op_reg_reg(A_DIVPS,S_NO,regc,regb));
+                  resreg:=regb;
                 end;
             end;
             { every ttranscfunc value (tf_exp/tf_tanh/tf_sigmoid) assigns resreg

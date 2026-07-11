@@ -126,11 +126,16 @@ compile ksig.pp -O4 -Cfsse64
 [ "$(cnt 'cvtps2dq' "$tmp/ksig.s")" -eq 0 ] || { echo "FAIL: sigmoid inline packed path without switch"; rc=1; }
 
 # ---- tanh: ON vectorizes; OFF keeps the math-unit tanh call ----
+# The lower-cancellation tanh is t/(t+2) with t=expm1(2x): still the packed expf
+# range-reduction (cvtps2dq) + polynomial (mulps), and a packed divps for the
+# t/(t+2) reciprocal -- no libm tanh call survives in the vector body.
 compile ktanh.pp -O4 -OoAPPROXTRANS -Cfsse64
 tsig="$tmp/ktanh.s"
-tanh_cvt=$(cnt 'cvtps2dq' "$tsig")
-echo "tanh    ON  : cvtps2dq=$tanh_cvt (>=1)"
+tanh_cvt=$(cnt 'cvtps2dq' "$tsig"); tanh_div=$(cnt '(^|[^v])divps' "$tsig"); tanh_mul=$(cnt '(^|[^v])mulps' "$tsig")
+echo "tanh    ON  : cvtps2dq=$tanh_cvt (>=1)  divps=$tanh_div (>=1, t/(t+2))  mulps=$tanh_mul (>=4, polynomial)"
 [ "$tanh_cvt" -ge 1 ] || { echo "FAIL: tanh not vectorized with -OoAPPROXTRANS"; rc=1; }
+[ "$tanh_div" -ge 1 ] || { echo "FAIL: tanh reciprocal t/(t+2) (divps) absent"; rc=1; }
+[ "$tanh_mul" -ge 4 ] || { echo "FAIL: tanh expm1 polynomial absent (mulps<4)"; rc=1; }
 
 compile ktanh.pp -O4 -Cfsse64
 toff="$tmp/ktanh.s"
