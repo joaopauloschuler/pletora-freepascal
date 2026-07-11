@@ -53,6 +53,117 @@ type
        );
    end;
 
+{ ------------------------------------------------------------------------
+  64-byte over-alignment of dynamic-array ELEMENT DATA.
+
+  When FPC_DYNARRAY_ALIGN64 is defined, the element data of every dynamic
+  array is placed on a 64-byte boundary, so 256-bit AVX streaming kernels
+  reading @a[0] never pay a cache-line-split penalty on their loads (see
+  tasklist.md L260).  It is OPT-IN, not default; see the gating note below.
+
+  The PUBLIC layout is UNCHANGED: refcount sits at data-2*ptrsize, high at
+  data-ptrsize, and @a[0] at data - exactly as before.  Only the heap
+  *placement* differs: the block is over-allocated and the header pointer
+  ('newp', with data = newp+sizeof(tdynarray)) is positioned so that
+  newp+sizeof(tdynarray) is 64-aligned.  The original heap-block base is
+  stashed in a pointer slot immediately below the header (at
+  newp-sizeof(pointer)) so the memory manager can still free/realloc the real
+  block.
+
+  Because a separately compiled RTL's allocation behaviour cannot be steered
+  by a caller-side -Oo codegen switch (the RTL .o is already emitted), this is
+  an RTL compile-time behaviour, not an -Oo switch.  All dynarray allocation,
+  reallocation and freeing funnel through the four helpers below, so producers
+  and consumers stay consistent.  Constant dynarrays (refcount -1, static
+  read-only data) are never freed and never reach fpc_dynarray_freemem. }
+
+{ 64-byte over-alignment is OPT-IN: build the RTL with -dFPC_DYNARRAY_ALIGN64
+  to enable it.  It ships OFF by default because the measurement for this
+  landing (tasklist.md L260) found the stock FPC large-block allocator already
+  returns >=32-byte-aligned data for every L2/L3-sized dynamic array (the
+  256-bit-streaming regime), so the cache-line-split penalty the over-alignment
+  removes (align_probe: +79.5% at L2 on 16-mod-32 data) does not actually occur
+  for streaming-sized buffers; only tiny L1-resident arrays land at the
+  split-prone 16-mod-32 offset, where the penalty is ~3%.  Meanwhile the slack
+  and the alloc-copy realloc cost ~9% on small-array churn.  The mechanism is
+  correct and self-hosts, and is kept available (opt-in) for allocators/hosts
+  where large buffers *do* land split-prone; it is simply not a default win on
+  this AVX2 host. }
+
+{$ifdef FPC_DYNARRAY_ALIGN64}
+const
+  DynArrayDataAlign = 64;
+
+function fpc_dynarray_getmem(datasize : sizeint) : pdynarray;
+  var
+    rawbase : pointer;
+    dataaddr : ptruint;
+  begin
+    { room for: caller data + original-base slot + header + alignment padding }
+    rawbase:=getmem(datasize+sizeof(pointer)+sizeof(tdynarray)+DynArrayDataAlign);
+    { smallest 64-aligned data address that leaves room for header+base slot below it }
+    dataaddr:=(ptruint(rawbase)+sizeof(pointer)+sizeof(tdynarray)+(DynArrayDataAlign-1)) and not ptruint(DynArrayDataAlign-1);
+    fpc_dynarray_getmem:=pdynarray(dataaddr-sizeof(tdynarray));
+    { stash the real allocation base just below the header }
+    PPointer(dataaddr-sizeof(tdynarray)-sizeof(pointer))^:=rawbase;
+  end;
+
+function fpc_dynarray_allocmem(datasize : sizeint) : pdynarray;
+  begin
+    fpc_dynarray_allocmem:=fpc_dynarray_getmem(datasize);
+    { zero only the element data; header is written by the caller }
+    fillchar((pointer(fpc_dynarray_allocmem)+sizeof(tdynarray))^,datasize,0);
+  end;
+
+procedure fpc_dynarray_freemem(hdr : pdynarray);
+  begin
+    { recover the real allocation base from the slot below the header }
+    freemem(PPointer(pointer(hdr)-sizeof(pointer))^);
+  end;
+
+function fpc_dynarray_realloc(oldhdr : pdynarray;olddatasize,newdatasize : sizeint) : pdynarray;
+  var
+    newhdr : pdynarray;
+    movebytes : sizeint;
+  begin
+    { the underlying block is over-aligned, so a plain ReallocMem could change
+      the data alignment; allocate a fresh aligned block and copy instead. }
+    newhdr:=fpc_dynarray_getmem(newdatasize);
+    movebytes:=olddatasize;
+    if newdatasize<movebytes then
+      movebytes:=newdatasize;
+    { preserve the header (refcount+high) and the shared data prefix; callers
+      that read newp^.high after realloc rely on the header being carried over }
+    move(oldhdr^,newhdr^,sizeof(tdynarray)+movebytes);
+    fpc_dynarray_freemem(oldhdr);
+    fpc_dynarray_realloc:=newhdr;
+  end;
+{$else FPC_DYNARRAY_ALIGN64}
+function fpc_dynarray_getmem(datasize : sizeint) : pdynarray;
+  begin
+    fpc_dynarray_getmem:=getmem(datasize+sizeof(tdynarray));
+  end;
+
+function fpc_dynarray_allocmem(datasize : sizeint) : pdynarray;
+  begin
+    fpc_dynarray_allocmem:=AllocMem(datasize+sizeof(tdynarray));
+  end;
+
+procedure fpc_dynarray_freemem(hdr : pdynarray);
+  begin
+    freemem(hdr);
+  end;
+
+function fpc_dynarray_realloc(oldhdr : pdynarray;olddatasize,newdatasize : sizeint) : pdynarray;
+  var
+    realp : pdynarray;
+  begin
+    realp:=oldhdr;
+    fpc_dynarray_realloc:=reallocmem(realp,newdatasize+sizeof(tdynarray));
+  end;
+{$endif FPC_DYNARRAY_ALIGN64}
+
+
 procedure fpc_dynarray_rangecheck(p : pointer;i : tdynarrayindex);[Public,Alias:'FPC_DYNARRAY_RANGECHECK']; compilerproc;
   begin
      if not(assigned(p)) or (i<0) or (i>pdynarray(p-sizeof(tdynarray))^.high) then
@@ -91,7 +202,7 @@ procedure fpc_dynarray_clear(var p : pointer;ti : pointer); [Public,Alias:'FPC_D
         ti:=pdynarraytypedata(aligntoqword(ti+2+PByte(ti)[1]))^.elType;
         if assigned(ti) then
           int_finalizearray(pv,PPointer(ti)^,pv[-1].high+1);
-        freemem(pv-1);
+        fpc_dynarray_freemem(pv-1);
       end;
   end;
 
@@ -130,7 +241,7 @@ procedure fpc_dynarray_setlength(var p : pointer;pti : pointer;
      movelen,size,_size,elesize,oldlen,newlen : sizeint;
      { contains the "fixed" pointers where the refcount }
      { and high are at positive offsets                 }
-     realp,newp : pdynarray;
+     newp : pdynarray;
      ti,eletypemngd : pointer;
 
   begin
@@ -165,7 +276,7 @@ procedure fpc_dynarray_setlength(var p : pointer;pti : pointer;
           oldlen:=pdynarray(p-sizeof(tdynarray))^.high+1;
           if pdynarray(p-sizeof(tdynarray))^.refcount<>1 then
             begin
-               newp:=getmem(size);
+               newp:=fpc_dynarray_getmem(size-sizeof(tdynarray));
                { make an unique copy }
                movelen:=oldlen;
                if newlen<movelen then
@@ -189,14 +300,13 @@ procedure fpc_dynarray_setlength(var p : pointer;pti : pointer;
                { Finalize if shrinking. }
                if assigned(eletypemngd) and (newlen<oldlen) then
                  int_finalizearray(p+elesize*newlen,eletypemngd,oldlen-newlen);
-               realp:=p-sizeof(tdynarray);
-               newp:=reallocmem(realp,size);
+               newp:=fpc_dynarray_realloc(pdynarray(p-sizeof(tdynarray)),elesize*oldlen,size-sizeof(tdynarray));
             end;
        end
      else
        begin
           oldlen:=0;
-          newp:=AllocMem(size);
+          newp:=fpc_dynarray_allocmem(size-sizeof(tdynarray));
        end;
      if newlen>oldlen then
        begin
@@ -260,6 +370,7 @@ function fpc_array_to_dynarray_copy(psrc : pointer;ti : pointer;
     ) : fpc_stub_dynarray;[Public,Alias:'FPC_ARR_TO_DYNARR_COPY'];compilerproc;
   var
     size : sizeint;
+    newp : pdynarray;
   begin
      fpc_dynarray_clear(pointer(result),ti);
      if psrc=nil then
@@ -288,10 +399,10 @@ function fpc_array_to_dynarray_copy(psrc : pointer;ti : pointer;
 
      { create new array }
      size:=elesize*count;
-     getmem(pointer(result),size+sizeof(tdynarray));
-     pdynarray(result)^.refcount:=1;
-     pdynarray(result)^.high:=count-1;
-     inc(pointer(result),sizeof(tdynarray));
+     newp:=fpc_dynarray_getmem(size);
+     newp^.refcount:=1;
+     newp^.high:=count-1;
+     pointer(result):=pointer(newp)+sizeof(tdynarray);
      { copy data }
      move(pointer(psrc+elesize*lowidx)^,pointer(result)^,size);
 
@@ -308,7 +419,7 @@ procedure fpc_dynarray_delete(var p : pointer;source,count : SizeInt;pti : point
       { oldp is the same as p, actual header is accessed as oldp[-1].
         newp fairly points to the new header, array data starts at newp[1].
         realp takes the hit of being a var-parameter to ReallocMem not eligible for living in a register. }
-      oldp,newp,realp : pdynarray;
+      oldp,newp : pdynarray;
       ti,eletypemngd : pointer;
 
    begin
@@ -344,7 +455,7 @@ procedure fpc_dynarray_delete(var p : pointer;source,count : SizeInt;pti : point
      if oldp[-1].refcount<>1 then
        begin
           { make an unique copy }
-          newp:=getmem(elesize*newlen+sizeof(tdynarray));
+          newp:=fpc_dynarray_getmem(elesize*newlen);
           newp^.refcount:=1;
           { copy the elements that we still need }
           move(oldp^,pointer(newp+1)^,source*elesize);
@@ -373,8 +484,7 @@ procedure fpc_dynarray_delete(var p : pointer;source,count : SizeInt;pti : point
           move((pointer(oldp)+(source+count)*elesize)^,(pointer(oldp)+source*elesize)^,(newlen-source)*elesize);
 
           { resize the array }
-          realp:=oldp-1;
-          newp:=reallocmem(realp,elesize*newlen+sizeof(tdynarray));
+          newp:=fpc_dynarray_realloc(oldp-1,elesize*(newlen+count),elesize*newlen);
         end;
     newp^.high:=newlen-1;
     p:=newp+1;
@@ -385,7 +495,7 @@ procedure fpc_dynarray_insert(var p : pointer;source : SizeInt;data : pointer;co
   var
     newlen : tdynarrayindex;
     elesize,dataofs : sizeint;
-    oldp,newp,realp : pdynarray;
+    oldp,newp : pdynarray;
     ti,eletypemngd : pointer;
   begin
     if count=0 then
@@ -421,7 +531,7 @@ procedure fpc_dynarray_insert(var p : pointer;source : SizeInt;data : pointer;co
 
     if not assigned(oldp) or (oldp^.refcount<>1) then
       begin
-        newp:=getmem(elesize*newlen+sizeof(tdynarray));
+        newp:=fpc_dynarray_getmem(elesize*newlen);
 
         { copy leading elements. No-op when not Assigned(oldp) because in this case source = 0. }
         move(oldp[1],newp[1],source*elesize);
@@ -453,8 +563,7 @@ procedure fpc_dynarray_insert(var p : pointer;source : SizeInt;data : pointer;co
           dataofs:=data-pointer(oldp);
 
         { resize the array }
-        realp:=oldp; { 'realp' as a 'var'-parameter avoids taking 'oldp' address. }
-        newp:=reallocmem(realp,elesize*newlen+sizeof(tdynarray));
+        newp:=fpc_dynarray_realloc(oldp,elesize*(newlen-count),elesize*newlen);
 
         { Fixup overlapping 'data'. }
         if dataofs>=0 then
@@ -485,7 +594,7 @@ procedure fpc_dynarray_insert(var p : pointer;source : SizeInt;data : pointer;co
 procedure fpc_dynarray_concat_multi(var dest : pointer; pti: pointer; const sarr:array of pointer); compilerproc;
   var
     i,firstnonempty,elesize,totallen,copybytes,newdestdatapos : sizeint;
-    newp,realp,copysrc,olddestp : pdynarray;
+    newp,copysrc,olddestp : pdynarray;
     ti,eletypemngd,copydest : pointer;
   begin
     totallen:=0;
@@ -535,8 +644,7 @@ procedure fpc_dynarray_concat_multi(var dest : pointer; pti: pointer; const sarr
             if newdestdatapos=totallen then { Dest doesn't occur among inputs. }
               int_FinalizeArray(olddestp,eletypemngd,olddestp[-1].high+1);
           end;
-        realp:=olddestp-1;
-        newp:=reallocmem(realp,totallen*elesize+sizeof(tdynarray));
+        newp:=fpc_dynarray_realloc(olddestp-1,(olddestp[-1].high+1)*elesize,totallen*elesize);
         { First array can be skipped if appending. }
         if olddestp=sarr[firstnonempty] then
           inc(firstnonempty);
@@ -545,7 +653,7 @@ procedure fpc_dynarray_concat_multi(var dest : pointer; pti: pointer; const sarr
       begin
         olddestp:=nil; { Realloc case is distinguished later as assigned(olddestp). }
         { allocate new array }
-        newp:=getmem(totallen*elesize+sizeof(tdynarray));
+        newp:=fpc_dynarray_getmem(totallen*elesize);
         newp^.refcount:=1;
       end;
 
@@ -593,7 +701,7 @@ procedure fpc_dynarray_concat_multi(var dest : pointer; pti: pointer; const sarr
 procedure fpc_dynarray_concat(var dest : pointer; pti: pointer; const src1,src2 : pointer); compilerproc;
   var
     totallen,elesize,ofs2 : sizeint;
-    newp,realp,olddestp,copysrc : pdynarray;
+    newp,olddestp,copysrc : pdynarray;
     ti,eletypemngd : pointer;
   begin
     if not assigned(src1) or not assigned(src2) then
@@ -621,8 +729,7 @@ procedure fpc_dynarray_concat(var dest : pointer; pti: pointer; const src1,src2 
         if assigned(eletypemngd) and (olddestp<>src1) and (olddestp<>src2) then
           int_FinalizeArray(olddestp,eletypemngd,olddestp[-1].high+1);
 
-        realp:=olddestp-1;
-        newp:=reallocmem(realp,totallen*elesize+sizeof(tdynarray));
+        newp:=fpc_dynarray_realloc(olddestp-1,(olddestp[-1].high+1)*elesize,totallen*elesize);
         { Copy src2 first, as in the case of olddestp = src2 it must be copied first and in other cases the order does not matter. }
         copysrc:=src2;
         if copysrc=olddestp then
@@ -647,7 +754,7 @@ procedure fpc_dynarray_concat(var dest : pointer; pti: pointer; const src1,src2 
     else
       begin
         { allocate new array }
-        newp:=getmem(totallen*elesize+sizeof(tdynarray));
+        newp:=fpc_dynarray_getmem(totallen*elesize);
         newp^.refcount:=1;
         move(src1^,newp[1],ofs2);
         move(src2^,(pointer(newp+1)+ofs2)^,(pdynarray(src2)[-1].high+1)*elesize);
