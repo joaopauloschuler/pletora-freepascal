@@ -152,37 +152,49 @@
 #      With #6 fixed, plain OPT="-O4" no longer corrupts the heap on system.pp and
 #      the cycle advances all the way to the RTL float unit, exposing blocker #7.
 #
-#   7. OPEN (tasklist self-host blocker #7): the THIRD plain-`-O4` miscompile,
-#      DISTINCT from #5/#6.  With #6 fixed, plain OPT="-O4" ./rebuildu.sh reaches
-#      CYCLELEVEL=3 and aborts building the RTL:
-#        flt_core.inc(614,1)  Warning: Range check error while evaluating
-#                             constants (-1 must be between 0 and 4294967295)
+#   7. FIXED (fork commit on branch a3, optloop.pas sink_refs_sym_cb): the THIRD
+#      plain-`-O4` MISCOMPILE, DISTINCT from #5/#6.  With #6 fixed, plain
+#      OPT="-O4" ./rebuildu.sh reached CYCLELEVEL=3 and aborted building the RTL:
 #        flt_core.inc(1780,48) Error: Illegal type conversion "Extended" to "QWord"
 #        system.inc(708,90)   Fatal: Internal error 2014091205
 #      flt_core.inc:1780 is qword(10000000000000000000) (10^19, > High(int64) but
-#      <= High(qword)).  Root cause (isolated): the compiler types an integer
-#      literal in scanner.pas try_parse_number via the RTL `val`; on x86-64 the
-#      qword `val` is fpc_Val_UInt_Shortstr (rtl/inc/sstrings.inc), whose
-#      shr-by-(64-8*DestSize) / subrange-div overflow guard is miscompiled so it
-#      wrongly flags overflow and returns code=20 (should be 0) even though the
-#      parsed VALUE is the correct 10^19 -> nonzero code -> real fallback ->
-#      "Extended to QWord".  SECOND-ORDER / self-referential: NOT reproduced by a
-#      seed-built ppcx64 at -O4 (that codegen is correct); reproduces ONLY when
-#      the compiler is ITSELF built at -O4 (the cycle's stage-2 ppc2) AND compiles
-#      val at -O4.  Truth table for val('10000000000000000000',qc) `code`:
-#        seed-built ppcx64, RTL@-O4 -> 0 ok | RTL@default -> 0 ok
-#        ppc2 (-O4-built),  RTL@-O4 -> 20 WRONG | RTL@default -> 0 ok
-#      So a fork -O4 optimizer pass, applied to the compiler's OWN sources while
-#      building ppc2, corrupts an optimizer/codegen routine that ppc2 then uses to
-#      mis-lower val.  Reduced reproducer + full recipe:
-#      unleashed/tests/known_miscompiles/o4_bigconst_val_qword_selfhost_01.pp.
+#      <= High(qword)).  The compiler types an integer literal in pexpr.pas
+#      `factor` (_INTCONST) via the RTL `val`: int64 val (overflow, code<>0) then
+#      qword val (should be code=0), else real fallback.  On x86-64 the qword val
+#      is fpc_Val_UInt_Shortstr (rtl/inc/sstrings.inc); its tail is
+#        code := 0;
+#        if (sp <= ns) and (s[sp] <> #0) then begin code := sp; result := 0 end;
+#      where `code` is an OUT parameter -- the default `code := 0` must run on the
+#      fall-through (condition false) path.  ROOT CAUSE: the -O4 code-sinking pass
+#      (-OoSINK, optloop.pas OptimizeCodeSink/sink_try) moved `code := 0` INTO the
+#      then-arm, because sink_refs_sym counted the arm's `code := sp` -- a pure
+#      WRITE, not a read -- as the arm "consuming" code.  With the default store
+#      sunk away, the fall-through returned the OUT slot uninitialised: in the
+#      compiler's val call it held the 20 that the preceding int64 val had left,
+#      so a fully-parsed 10^19 came back with code=20 -> real fallback -> "Extended
+#      to QWord".  (This is FIRST-ORDER, not "second-order/self-referential": a
+#      seed-built fork compiler compiling val at -O4 already mis-types it once the
+#      int64 val precedes the qword val -- earlier probing tested the qword val in
+#      isolation, which returns code=0, and so missed it.)  FIX: sink_refs_sym now
+#      counts only genuine READS (loads without a bare nf_write) as uses of V, so
+#      an arm that merely overwrites V is not its consumer and the default store
+#      stays before the if; genuine one-arm-read sinks keep firing.  Reduced to a
+#      first-order suite test unleashed/tests/testfiles/sink_outparam_default/
+#      sink_outparam_default_01.pp (%OPT=-O4, FAILs on baseline, PASSes on the fix)
+#      + firing/refusal guard unleashed/tests/sink_outparam_check.sh (asserts the
+#      sink still fires on a one-arm-read shape and is refused on the write-arm
+#      val shape).  The obsolete two-stage known_miscompiles reproducer was
+#      removed (the bug is first-order and captured by the suite test).
 #
-#   So plain -O4 self-host is BLOCKED pending #7 (a distinct, deeper self-host
-#   miscompile than #6).  There is no green -O4 flag set yet; no default gate is
-#   documented here.  Each blocker gets reduced and filed one at a time (blockers
-#   #1-#6 fixed, #7 filed).  Once plain -O4 is finally green (byte-identical
-#   ppc2/ppc3 + byte-identical unleashed set), adopt it as the documented default
-#   gate and fold in the opt-in -Oo* passes one at a time via OPTFORK.
+#   SELF-HOST GATE (GREEN): with #1-#7 fixed, plain `OPT="-O4" ./rebuildu.sh`
+#   completes end to end -- the 3-stage compiler cycle reaches its byte-identical
+#   ppc2==ppc3 fixed point at -O4, the RTL, packages and LCL all rebuild clean,
+#   and the unleashed suite failure set under the -O4 self-hosted compiler is
+#   byte-identical to a clean-HEAD baseline.  `OPT="-O4"` is therefore the
+#   documented default self-host regression gate; run it after any codegen change.
+#   The opt-in -Oo* passes (REFELIDE, PARTIALINLINE, STACKALLOC, UNROLLDYN,
+#   PREFETCH, ICF, IPARA, SIBCALL, IPACP, VECT256) are still folded in one at a
+#   time via OPTFORK on top of this green -O4 base.
 set -e
 FP="$(cd "$(dirname "$0")" && pwd)"
 

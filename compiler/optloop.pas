@@ -8711,14 +8711,25 @@ unit optloop;
       begin
         result:=fen_false;
         if (n.nodetype=loadn) and
-           (tloadnode(n).symtableentry=psinkrefctx(arg)^.sym) then
+           (tloadnode(n).symtableentry=psinkrefctx(arg)^.sym) and
+           { A load node that is the destination of an assignment (nf_write set,
+             nf_modify clear) is a pure WRITE of V, not a read/use of it: the
+             old value is not consumed, it is overwritten.  Counting such a
+             write as a "use" of V is unsound for the arm-consumption test in
+             sink_try -- e.g. `code:=0; if cond then begin code:=sp; ... end`
+             (fpc_Val_UInt_Shortstr): the then-arm only WRITES code, yet was
+             seen as its sole consumer, so `code:=0` got sunk into that arm and
+             the fall-through path (cond false) returned code uninitialised.
+             Only genuine reads (plain loads, or read-modify-write loads that
+             carry nf_modify) consume V and must be tracked here. }
+           not((nf_write in n.flags) and not(nf_modify in n.flags)) then
           begin
             psinkrefctx(arg)^.found:=true;
             result:=fen_norecurse_true;
           end;
       end;
 
-    { true if subtree n contains any load of symbol sym }
+    { true if subtree n contains any read (use) of symbol sym }
     function sink_refs_sym(n : tnode; sym : tsym) : boolean;
       var
         ctx : tsinkrefctx;
@@ -8872,6 +8883,7 @@ unit optloop;
         sn.statement:=cnothingnode.create;
         do_firstpass(sn.left);
         do_firstpass(newblock);
+        OptRemark(assign.fileinfo,'sink','pure assignment sunk into the single if-arm that reads it');
         result:=true;
       end;
 
