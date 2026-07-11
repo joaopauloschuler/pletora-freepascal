@@ -314,7 +314,6 @@ implementation
 
       var
         i : integer;
-        currpara : tparavarsym;
         asmreason : shortstring;
       begin
         result := false;
@@ -428,31 +427,25 @@ implementation
             exit;
           end;
 
+        { FPC Unleashed: open-array / array-of-const value parameters used to
+          block inlining because an open array is 0-based inside the callee while
+          the actual may be a differently-based array (e.g. array[1..N]): a naive
+          splice would re-typecheck a[i] as a fixed-array index and subtract the
+          actual's low bound from the callee's 0-based i.  tcallnode.replaceparaload
+          now re-applies the call-boundary conversion (wraps a non-zero-based
+          static-array actual in a typeconv to the open-array parameter type) so
+          the spliced accesses keep the callee's 0-based view; a dynamic-array
+          actual is kept out of line at the call site (ncal.check_inlining).
+          `array of const` actuals are always `[...]` constructors (0-based), so
+          those inline unconditionally.  `array of variant` is NOT covered by the
+          open-array re-basing path (is_open_array is false for it) and can take a
+          differently-based static actual, so it keeps the refusal. }
         for i:=0 to procdef.paras.count-1 do
-          begin
-            currpara:=tparavarsym(procdef.paras[i]);
-            case currpara.vardef.typ of
-              arraydef :
-                begin
-                  if is_array_of_const(currpara.vardef) or
-                     is_variant_array(currpara.vardef) then
-                    begin
-                      _no_inline('array of const');
-                      exit;
-                    end;
-                  { open arrays might need re-basing of the index, i.e. if you pass
-                    an array[1..10] as open array, you have to add 1 to all index operations
-                    if you directly inline it }
-                  if is_open_array(currpara.vardef) then
-                    begin
-                      _no_inline('open array');
-                      exit;
-                    end;
-                end;
-              else
-                ;
+          if is_variant_array(tparavarsym(procdef.paras[i]).vardef) then
+            begin
+              _no_inline('array of variant');
+              exit;
             end;
-        end;
         result:=true;
       end;
 

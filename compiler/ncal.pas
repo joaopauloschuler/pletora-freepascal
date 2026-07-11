@@ -5134,6 +5134,25 @@ implementation
             para:=tcallparanode(parameters);
             while assigned(para) do
               begin
+                { FPC Unleashed (checknodeinlining refusal d): open-array value
+                  params are inlinable (replaceparaload re-bases a non-zero-based
+                  static array actual by re-applying the boundary typeconv), and
+                  static arrays, array constructors, slices, open strings and
+                  passed-through open arrays all splice correctly.  A DYNAMIC
+                  array actual, however, is itself a pointer to its data, and the
+                  spliced open-array access derefs the param location once more
+                  (one indirection too many -> wild pointer).  Reconstructing the
+                  dynarray->openarray boundary (deref + runtime high) inside the
+                  splice is not yet done, so keep those calls out of line. }
+                if assigned(para.parasym) and
+                   is_open_array(para.parasym.vardef) and
+                   assigned(para.left) and assigned(para.left.resultdef) and
+                   is_dynamic_array(para.left.resultdef) then
+                  begin
+                    Comment(V_lineinfo+V_Debug,'Not inlining "'+tprocdef(procdefinition).procsym.realname+'", open-array parameter has a dynamic-array actual');
+                    exclude(callnodeflags,cnf_do_inline);
+                    break;
+                  end;
                 if not para.can_be_inlined then
                   begin
                     Comment(V_lineinfo+V_Debug,'Not inlining "'+tprocdef(procdefinition).procsym.realname+
@@ -5479,6 +5498,33 @@ implementation
                       n.free;
                       n:=temp;
                       typecheckpass(n);
+                      { FPC Unleashed (checknodeinlining refusal d): an OPEN ARRAY
+                        parameter indexes 0-based (low(a)=0), but its actual may be
+                        a NON-zero-based static array -- e.g. array[1..N].  The
+                        actual load carries a transparent open-array resultdef at
+                        the call boundary, but re-typechecking the spliced load
+                        reverts it to the static array's own def, so the spliced
+                        a[i] would index as a static array and subtract the
+                        actual's low bound from the callee's 0-based i (reading
+                        actual[i-1]).  Re-apply the exact conversion the call
+                        boundary performs -- wrap the actual in a typeconv to the
+                        open-array parameter type -- so the spliced accesses index
+                        the same 0-based view the callee was compiled against.
+                        Only non-zero-based static arrays need it; dynamic arrays,
+                        other open arrays and array constructors are already
+                        0-based and must NOT be wrapped (a dynarray->openarray
+                        reference conversion would be wrong / crash). }
+                      if is_open_array(paras.parasym.vardef) and
+                         assigned(n.resultdef) and
+                         (n.resultdef.typ=arraydef) and
+                         not is_open_array(n.resultdef) and
+                         not is_dynamic_array(n.resultdef) and
+                         not is_array_constructor(n.resultdef) and
+                         (tarraydef(n.resultdef).lowrange<>0) then
+                        begin
+                          n:=ctypeconvnode.create_internal(n,paras.parasym.vardef);
+                          typecheckpass(n);
+                        end;
                       result := fen_true;
                     end;
                 end;
