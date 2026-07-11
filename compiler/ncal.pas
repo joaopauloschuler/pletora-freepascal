@@ -5239,6 +5239,35 @@ implementation
       end;
 
 
+    { FPC Unleashed (cross-unit inline-asm splicing): true when the inline body
+      contains an asm STATEMENT block flagged asmnf_crossunit_unsafe at ppu-write
+      time (nbas.tasmnode.buildderefimpl) -- i.e. one whose tai references a
+      module-local symbol that cannot be reconstructed in the splicing unit. Such
+      a body is kept out of line when inlined across units. }
+    function find_crossunit_unsafe_asm(var n : tnode; arg : pointer) : foreachnoderesult;
+      begin
+        result:=fen_false;
+        if (n.nodetype=asmn) and
+           not(asmnf_get_asm_position in tasmnode(n).asmnodeflags) and
+           ((asmnf_crossunit_unsafe in tasmnode(n).asmnodeflags) or
+            { in-memory body of a unit compiled in THIS process: its module-local
+              asm symbols are use-after-free once spliced cross-unit, so refuse
+              (only a ppu-deserialized body has its symbols re-resolved safely) }
+            not(asmnf_from_ppu in tasmnode(n).asmnodeflags)) then
+          begin
+            pboolean(arg)^:=true;
+            result:=fen_norecurse_true;
+          end;
+      end;
+
+
+    function inline_body_has_crossunit_unsafe_asm(code : tnode) : boolean;
+      begin
+        result:=false;
+        foreachnodestatic(code,@find_crossunit_unsafe_asm,@result);
+      end;
+
+
     procedure tcallnode.check_inlining;
       var
         st   : tsymtable;
@@ -5251,23 +5280,25 @@ implementation
            heuristics_favors_inlining then
           begin
             include(callnodeflags,cnf_do_inline);
-            { An inline body containing ANY asm STATEMENT block can only be
-              spliced into a SAME-UNIT caller.  The block's tai operands survive
-              a ppu round trip incompletely: tcompilerppufile.getasmsymbol always
-              returns nil (asm symbols are module-local and never serialized), so
-              a top_ref to a GLOBAL loses its symbol and a top_local param/local/
-              result operand cannot be matched against the call's parasyms.  The
-              operand size (`ot`) and effective 2-operand order are likewise not
-              reconstructed.  A previous guard only excluded top_local-referencing
-              bodies, which let a GLOBAL-only asm block inline cross-unit and
-              miscompile (null-symbol store -> SIGSEGV / assembler size error).
-              Refuse every asm-block body loaded from another unit -- it stays
-              out-of-line and runs correctly. }
+            { FPC Unleashed (cross-unit inline-asm splicing): an inline body's asm
+              STATEMENT block is stored as a raw tai list in the ppu.  The tai
+              round trip now reconstructs the operand size (opsize), the 2-operand
+              order (FOperandOrder) and every GLOBAL top_ref symbol (re-resolved
+              by name against the splicing unit), so a block whose operands are
+              all registers/constants/top_local params-locals-result/global refs
+              can be spliced cross-unit.  A block that references a module-local
+              symbol (a local asm label, a non-global top_ref, an ait_const sym,
+              ...) cannot be reconstructed in another unit and is flagged
+              asmnf_crossunit_unsafe at ppu-write time -- refuse only those, and
+              keep them out of line (runs correctly). }
             if not procdefinition.in_currentunit and
                (pi_has_assembler_block in tprocdef(procdefinition).inlininginfo^.flags) then
               begin
-                Comment(V_lineinfo+V_Debug,'Not inlining "'+tprocdef(procdefinition).procsym.realname+'", body contains an asm block loaded from another unit');
-                exclude(callnodeflags,cnf_do_inline);
+                if inline_body_has_crossunit_unsafe_asm(tprocdef(procdefinition).inlininginfo^.code) then
+                  begin
+                    Comment(V_lineinfo+V_Debug,'Not inlining "'+tprocdef(procdefinition).procsym.realname+'", asm block references a symbol that cannot be reconstructed across units');
+                    exclude(callnodeflags,cnf_do_inline);
+                  end;
               end;
             { An `inherited` call in the body (only class methods reach here --
               psub.checknodeinlining refuses every other self shape) rebinds its

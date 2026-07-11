@@ -121,7 +121,27 @@ interface
            the label-uniquing/copy path even though the enclosing routine is not
            itself marked po_inline, so local asm labels stay unique across the
            multiple call sites the inline body is expanded into. }
-         asmnf_inline_copy
+         asmnf_inline_copy,
+         { FPC Unleashed (cross-unit inline-asm splicing): set at ppuload time
+           (tasmnode.ppuload) -- this asm body was DESERIALIZED from a ppu, so
+           its tai symbols were re-resolved by name against THIS module (valid,
+           live).  An asm body WITHOUT this flag is the in-memory parse tree of a
+           unit compiled in the same process; when spliced cross-unit its module-
+           local asm symbols are use-after-free (the block was written to ppu but
+           the live copy still points at the defining module's asmdata objects),
+           so ncal.check_inlining keeps such a cross-unit call out of line.  Never
+           serialized (excluded before ppuwrite). }
+         asmnf_from_ppu,
+         { FPC Unleashed (cross-unit inline-asm splicing): set at buildderefimpl
+           (ppu write) time when this asm block references a module-local symbol
+           that cannot be reconstructed in another unit -- a local asm label, a
+           top_ref/relsymbol or ait_const sym whose bind is not a global/external
+           one, or any tai the round trip does not fully reconstruct.  A body
+           carrying such a block is kept out of line cross-unit (ncal.check_
+           inlining); a block WITHOUT this flag is cross-unit-safe (registers,
+           constants, top_local params/locals/result and global top_ref symbols
+           all round-trip). }
+         asmnf_crossunit_unsafe
        );
 
        TAsmNodeFlags = set of TAsmNodeFlag;
@@ -543,6 +563,7 @@ implementation
     uses
       verbose,globals,systems,
       ppu,
+      aasmbase,
       symsym,symconst,symdef,defutil,defcmp,
       pass_1,
       nutils,nld,ncnv,
@@ -1574,6 +1595,9 @@ implementation
       begin
         inherited ppuload(t,ppufile);
         ppufile.getset(tppuset1(asmnodeflags));
+        { deserialized from a ppu: its tai symbols are re-resolved by name against
+          this module and safe to splice cross-unit (see asmnf_from_ppu) }
+        include(asmnodeflags,asmnf_from_ppu);
         if not(asmnf_get_asm_position in asmnodeflags) then
           begin
             p_asm:=TAsmList.create;
@@ -1597,7 +1621,8 @@ implementation
         hp : tai;
       begin
         inherited ppuwrite(ppufile);
-        ppufile.putset(tppuset1(asmnodeflags));
+        { asmnf_from_ppu is a load-time property, not part of the stored body }
+        ppufile.putset(tppuset1(asmnodeflags-[asmnf_from_ppu]));
 { TODO: FIXME Add saving of register sets}
         if not(asmnf_get_asm_position in asmnodeflags) then
           begin
@@ -1613,6 +1638,56 @@ implementation
       end;
 
 
+    { FPC Unleashed (cross-unit inline-asm splicing): true when every tai in the
+      block round-trips through a ppu into ANOTHER unit soundly, so the block can
+      be spliced cross-unit.  Safe content is registers, constants, top_local
+      param/local/result operands and top_ref/relsymbol operands whose symbol is
+      a global/external one (re-resolved by name in the loading unit).  A local
+      asm label, a module-local (non-global) top_ref symbol, an ait_const with a
+      symbol, or any other symbol-carrying tai cannot be reconstructed in the
+      splicing unit and makes the block cross-unit-unsafe. }
+    function asm_block_crossunit_safe(l : TAsmList) : boolean;
+      const
+        crossunit_global = [AB_EXTERNAL,AB_COMMON,AB_GLOBAL,AB_WEAK_EXTERNAL,
+          AB_PRIVATE_EXTERN,AB_IMPORT,AB_LAZY,AB_INDIRECT,AB_EXTERNAL_INDIRECT,
+          AB_WEAK];
+
+      function sym_ok(s : tasmsymbol) : boolean;
+        begin
+          sym_ok:=(not assigned(s)) or (s.bind in crossunit_global);
+        end;
+
+      var
+        hp : tai;
+        i  : longint;
+      begin
+        asm_block_crossunit_safe:=true;
+        if not assigned(l) then
+          exit;
+        hp:=tai(l.first);
+        while assigned(hp) do
+          begin
+            case hp.typ of
+              { benign: no cross-unit symbol identity }
+              ait_comment,ait_align,ait_regalloc,ait_tempalloc,
+              ait_marker,ait_force_line,ait_cfi,ait_none :
+                ;
+              ait_instruction :
+                for i:=0 to tai_cpu_abstract(hp).ops-1 do
+                  if tai_cpu_abstract(hp).oper[i]^.typ=top_ref then
+                    if not(sym_ok(tai_cpu_abstract(hp).oper[i]^.ref^.symbol) and
+                           sym_ok(tai_cpu_abstract(hp).oper[i]^.ref^.relsymbol)) then
+                      exit(false);
+              else
+                { ait_label / ait_const-with-sym / ait_symbol / directives / any
+                  other symbol- or structure-carrying tai: not reconstructable }
+                exit(false);
+            end;
+            hp:=tai(hp.next);
+          end;
+      end;
+
+
     procedure tasmnode.buildderefimpl;
       var
         hp : tai;
@@ -1620,6 +1695,8 @@ implementation
         inherited buildderefimpl;
         if not(asmnf_get_asm_position in asmnodeflags) then
           begin
+            if not asm_block_crossunit_safe(p_asm) then
+              include(asmnodeflags,asmnf_crossunit_unsafe);
             hp:=tai(p_asm.first);
             while assigned(hp) do
              begin

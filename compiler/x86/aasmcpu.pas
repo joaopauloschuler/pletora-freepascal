@@ -33,6 +33,7 @@ interface
       globtype,verbose,
       cpubase,
       cgbase,cgutils,
+      symtype,
       aasmbase,aasmtai,aasmsym,
       ogbase;
 
@@ -644,6 +645,15 @@ interface
          FOperandOrder : TOperandOrder;
          procedure init(_size : topsize); { this need to be called by all constructor }
       public
+         { FPC Unleashed (cross-unit inline-asm splicing): opsize and the
+           operand order are x86-specific taicpu fields absent from the generic
+           tai_cpu_abstract ppu serialization.  Without them a spliced-cross-unit
+           instruction lost its size suffix (`mov imm8s,mem32` assembler error)
+           and had its 2-operand order re-swapped (FOperandOrder defaulted to
+           op_intel while the operands were stored in op_att order).  Serialize
+           both so a loaded body assembles identically to the same-unit splice. }
+         constructor ppuload(t:taitype;ppufile:tcompilerppufile);override;
+         procedure ppuwrite(ppufile:tcompilerppufile);override;
          { the next will reset all instructions that can change in pass 2 }
          procedure ResetPass1;override;
          procedure ResetPass2;override;
@@ -1980,6 +1990,22 @@ implementation
         end;
 
         result:=true;
+      end;
+
+
+    constructor taicpu.ppuload(t:taitype;ppufile:tcompilerppufile);
+      begin
+        inherited ppuload(t,ppufile);
+        opsize:=topsize(ppufile.getbyte);
+        FOperandOrder:=TOperandOrder(ppufile.getbyte);
+      end;
+
+
+    procedure taicpu.ppuwrite(ppufile:tcompilerppufile);
+      begin
+        inherited ppuwrite(ppufile);
+        ppufile.putbyte(byte(opsize));
+        ppufile.putbyte(byte(FOperandOrder));
       end;
 
 

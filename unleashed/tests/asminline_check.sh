@@ -25,13 +25,15 @@
 #   * MANAGED operands (any passing convention) and BY-VALUE aggregate
 #     parameters/locals; TP-style INLINE() placeholders.
 #
-# Refused across units (kept out-of-line, runs correctly): ANY asm-block body
-# loaded from another unit -- its tai operands do not survive the ppu round
-# trip (tcompilerppufile.getasmsymbol returns nil, so a GLOBAL top_ref loses its
-# symbol; operand size/order are not reconstructed; a top_local cannot be matched
-# to the call's parasyms).  This covers global-only blocks too (a previous guard
-# only excluded local-referencing ones, letting a global-only block miscompile
-# cross-unit).
+# CROSS-UNIT: an asm-block body loaded from another unit now inlines too when
+# all its operands round-trip through the ppu soundly -- registers, constants,
+# top_local params/locals/result and GLOBAL top_ref symbols (re-resolved by name
+# against the splicing unit).  The tai serialization was extended to record the
+# operand size (opsize), the 2-operand order (FOperandOrder) and every top_ref/
+# relsymbol by name+bind+typ (see asm_inline_crossunit_check.sh).  A body whose
+# asm references a symbol that CANNOT be reconstructed cross-unit (a local asm
+# label, a non-global top_ref, an ait_const sym) is flagged cross-unit-unsafe at
+# ppu-write time and kept out of line (runs correctly).
 #
 # This proves each direction inlines-or-refuses as intended AND runs correctly.
 #
@@ -179,10 +181,12 @@ inlined_notes=$(printf '%s\n' "$notes" | grep -cE '(INCG|CLAMPZERO|ADDASM|MADD|I
 out="$( ulimit -v 3000000; timeout 60 "$tmp/run" )"; runrc=$?
 
 # ---------------------------------------------------------------------------
-# Part 2: cross-unit -- ANY asm-block body stays OUT-OF-LINE (sound), runs
-# correctly.  Covers a local/param/result-referencing block AND a global-only
-# block (the previously-miscompiling case: its top_ref symbol is dropped by the
-# ppu round trip, so inlining it cross-unit stored through a null symbol).
+# Part 2: cross-unit.  A SAFE asm-block body (value params + result AND a
+# global-only block) now INLINES across units -- the tai serialization records
+# operand size/order and re-resolves the GLOBAL top_ref symbol by name.  An
+# UNSAFE body (a local asm label, unreconstructable cross-unit) stays out of
+# line.  Both run correctly.  (Full cross-unit coverage: asm_inline_crossunit_
+# check.sh.)
 # ---------------------------------------------------------------------------
 cat > "$tmp/uax.pas" <<'EOF'
 {$mode objfpc}
@@ -191,6 +195,7 @@ interface
 var srcg, dstg: longint;
 function addasm(a, b: longint): longint; inline;
 procedure cpy; inline;
+function clampz(x: longint): longint; inline;
 implementation
 function addasm(a, b: longint): longint; inline;
 begin
@@ -207,6 +212,19 @@ begin
     movl %eax, dstg(%rip)
   end;
 end;
+{ UNSAFE cross-unit: an AB_LOCAL asm label cannot be reconstructed in another
+  unit, so this body is flagged cross-unit-unsafe and stays out of line. }
+function clampz(x: longint): longint; inline;
+begin
+  asm
+    movl x, %eax
+    cmpl $0, %eax
+    jge .Lok
+    xorl %eax, %eax
+  .Lok:
+    movl %eax, result
+  end;
+end;
 end.
 EOF
 cat > "$tmp/mx.pas" <<'EOF'
@@ -216,13 +234,14 @@ uses uax;
 begin
   srcg := 77; dstg := 0;
   cpy;
-  writeln(addasm(30, 12), ' ', dstg);
+  writeln(addasm(30, 12), ' ', dstg, ' ', clampz(-3), ' ', clampz(9));
 end.
 EOF
 "$CC" -Fu"$RTL" -O4 -FE"$tmp" "$tmp/uax.pas" >/dev/null 2>&1
-"$CC" -Fu"$RTL" -Fu"$tmp" -FE"$tmp" -O4 -al -s "$tmp/mx.pas" -o"$tmp/mxbin" >/dev/null 2>&1
+"$CC" -Fu"$RTL" -Fu"$tmp" -FE"$tmp" -O4 -al -s "$tmp/mx.pas" >/dev/null 2>&1
 xu_calls=$(grep -cE 'call[[:space:]]+.*ADDASM' "$tmp/mx.s" || true)
 xu_cpy_calls=$(grep -cE 'call[[:space:]]+.*CPY' "$tmp/mx.s" || true)
+xu_clampz_calls=$(grep -cE 'call[[:space:]]+.*CLAMPZ' "$tmp/mx.s" || true)
 "$CC" -Fu"$RTL" -Fu"$tmp" -FE"$tmp" -O4 "$tmp/mx.pas" -o"$tmp/mxrun" >/dev/null 2>&1
 xu_out="$( ulimit -v 3000000; timeout 60 "$tmp/mxrun" )"; xu_rc=$?
 
@@ -230,7 +249,7 @@ echo "CODEGEN : incg=$incg_calls clamp=$clamp_calls addasm=$addasm_calls madd=$m
 echo "        : incg-inlined=$incg_inlined (>=1) clamp-inlined=$clamp_inlined (>=2) dup-labels=$dup_labels (0)"
 echo "NOTES   : touchstr-reason=$touchstr_reason (expect 1) inlined-wrongly-noted=$inlined_notes (expect 0)"
 echo "RUNTIME : out='$out' (expect '9 7 123 15 60 142 99 88 x') rc=$runrc (0)"
-echo "CROSSUNIT: addasm-call=$xu_calls cpy-call=$xu_cpy_calls (>=1, out-of-line) out='$xu_out' (expect '42 77') rc=$xu_rc (0)"
+echo "CROSSUNIT: addasm-call=$xu_calls cpy-call=$xu_cpy_calls (0, inlined) clampz-call=$xu_clampz_calls (>=1, out-of-line) out='$xu_out' (expect '42 77 0 9') rc=$xu_rc (0)"
 
 rc=0
 [ "$incg_calls"   -eq 0 ] || { echo "FAIL: incg not inlined"; rc=1; }
@@ -248,10 +267,11 @@ rc=0
 [ "$inlined_notes" -eq 0 ] || { echo "FAIL: an inlined asm routine wrongly reported as not inlined"; rc=1; }
 [ "$out" = "9 7 123 15 60 142 99 88 x" ] || { echo "FAIL: wrong runtime result '$out'"; rc=1; }
 [ "$runrc"        -eq 0 ] || { echo "FAIL: program did not run cleanly (rc=$runrc)"; rc=1; }
-[ "$xu_calls"     -ge 1 ] || { echo "FAIL: cross-unit local-asm routine was inlined (unsound)"; rc=1; }
-[ "$xu_cpy_calls" -ge 1 ] || { echo "FAIL: cross-unit global-only asm routine was inlined (unsound)"; rc=1; }
-[ "$xu_out" = "42 77" ]   || { echo "FAIL: cross-unit out-of-line result wrong '$xu_out'"; rc=1; }
+[ "$xu_calls"     -eq 0 ] || { echo "FAIL: cross-unit value-param asm routine was NOT inlined"; rc=1; }
+[ "$xu_cpy_calls" -eq 0 ] || { echo "FAIL: cross-unit global-only asm routine was NOT inlined"; rc=1; }
+[ "$xu_clampz_calls" -ge 1 ] || { echo "FAIL: cross-unit local-label asm routine was inlined (unsound)"; rc=1; }
+[ "$xu_out" = "42 77 0 9" ] || { echo "FAIL: cross-unit result wrong '$xu_out'"; rc=1; }
 [ "$xu_rc"        -eq 0 ] || { echo "FAIL: cross-unit program did not run cleanly (rc=$xu_rc)"; rc=1; }
 
-[ "$rc" -eq 0 ] && echo "PASS: global-only, label-branching, value-param/local/result AND by-reference (var/out/constref) asm blocks inline same-unit (no call, correct, labels uniqued, no dup, read+write through the site); managed operand stays out-of-line with its note; cross-unit asm bodies (local- AND global-referencing) stay out-of-line and correct; all variants run (incl -O4 -Sew)"
+[ "$rc" -eq 0 ] && echo "PASS: global-only, label-branching, value-param/local/result AND by-reference (var/out/constref) asm blocks inline same-unit (no call, correct, labels uniqued, no dup, read+write through the site); managed operand stays out-of-line with its note; cross-unit SAFE asm bodies (value-param AND global-only) now inline and run bit-exact, while a local-label body stays out-of-line and correct; all variants run (incl -O4 -Sew)"
 exit "$rc"

@@ -50,7 +50,11 @@ const
     (it's a cardinal) }
   { bumped to 33: per-procdef cross-unit optimizer summary blob added to the
     ibprocdef entry (shared -OoPURE / -OoIPARA summary serialization) }
-  CurrentPPULongVersion = 35;
+  { bumped to 36: inline-body asm tai serialization now records operand size
+    (opsize), operand order (FOperandOrder) and top_ref/relsymbol/label symbols
+    by name+bind+typ so an asm block can be spliced cross-unit (FPC Unleashed
+    cross-unit inline-asm splicing) }
+  CurrentPPULongVersion = 36;
 
   { Tags for the per-procdef optimizer-summary blob streamed inside the
     ibprocdef entry (see tprocdef.ppuwrite/ppuload). The blob is a self-
