@@ -125,20 +125,26 @@ implementation
 *****************************************************************************}
 
     function tx86vectoropnode.transc_splat_ref(bits : longint) : treference;
-      { emit a 16-byte rodata block holding the 32-bit pattern `bits` replicated
-        across all vecwidth single lanes, and return a symbol reference to it.
-        Used to broadcast an -OoAPPROXTRANS polynomial/range-reduction constant so
-        a packed op applies the identical value in every lane. }
+      { emit a rodata block holding the 32-bit pattern `bits` replicated across all
+        vecwidth single lanes (16 bytes at 128-bit / VL=4, 32 bytes at 256-bit ymm /
+        VL=8), and return a symbol reference to it. Used to broadcast an
+        -OoAPPROXTRANS polynomial/range-reduction constant so a packed op applies
+        the identical value in every lane. The block is aligned to its full width
+        (vecwidth*4 bytes) so the aligned (v)movaps loads over it are legal -- a
+        256-bit vmovaps requires 32-byte alignment, so a ymm splat cannot reuse the
+        128-bit 16-byte alignment. }
       var
         l : tasmlabel;
         i : longint;
+        algn : longint;
       begin
+        algn:=const_align(vecwidth*4);
         current_asmdata.getdatalabel(l);
-        new_section(current_asmdata.asmlists[al_typedconsts],sec_rodata_norel,l.name,const_align(16));
+        new_section(current_asmdata.asmlists[al_typedconsts],sec_rodata_norel,l.name,algn);
         current_asmdata.asmlists[al_typedconsts].concat(Tai_label.Create(l));
         for i:=1 to vecwidth do
           current_asmdata.asmlists[al_typedconsts].concat(tai_const.create_32bit(bits));
-        reference_reset_symbol(result,l,0,const_align(16),[]);
+        reference_reset_symbol(result,l,0,algn,[]);
       end;
 
 
@@ -165,7 +171,13 @@ implementation
         baseline fputype.  Worst-case error over [-87,88] is ~1 ulp / <1e-6
         relative vs libm expf; inputs outside [exp_lo,exp_hi] (incl. +-Inf) are
         clamped so the result saturates to ~0 / ~FLT_MAX and never traps; a NaN
-        lane yields an unspecified finite value (never a trap). }
+        lane yields an unspecified finite value (never a trap).
+
+        Width-parametric: mmsz selects the register width, so the SAME body serves
+        the 128-bit xmm (VL=4) path and the 256-bit ymm (VL=8) path -- at ymm the
+        float ops are AVX1 (VMULPS/VADDPS/... ), but the 2^n exponent build
+        (VPADDD/VPSLLD ymm) is AVX2, so the recognizer only widens vok_transc to
+        ymm on an AVX2 fputype (optloop.vect_transc_want_ymm). }
       const
         LOG2EF =  1.44269504088896341;
         { clamp so the reduced exponent n = round(x*log2e) stays within

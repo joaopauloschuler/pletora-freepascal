@@ -148,5 +148,52 @@ compile kdbl.pp -O4 -OoAPPROXTRANS -Cfsse64
 [ "$(cnt 'cvtps2dq' "$tmp/kdbl.s")" -eq 0 ] || { echo "FAIL: double-array exp wrongly vectorized (single-only path)"; rc=1; }
 echo "exp dbl ON  : cvtps2dq=0 (double array correctly declined)"
 
-[ "$rc" -eq 0 ] && echo "PASS: -OoAPPROXTRANS lowers exp/sigmoid/tanh single loops to an inline packed expf only when enabled, and declines indirect/double shapes"
+# ---- AVX2 256-bit ymm path (-OoVECT256 on an AVX2 fputype) ----
+# The inline packed expf widens to 256-bit ymm ONLY when -OoVECT256 is requested
+# AND the fputype has an AVX2 unit: the 2^n exponent build (vpaddd + vpslld) is an
+# AVX2 integer op at 256-bit width. On an AVX2 fputype the whole expf body runs on
+# ymm registers (vcvtps2dq/vmulps/vpaddd all %ymm); on an AVX-ONLY fputype the
+# transcendental stays 128-bit (no vpaddd %ymm) even though ordinary float loops
+# still widen to ymm; on SSE there is no ymm at all.
+compile kexp.pp -O4 -OoAPPROXTRANS -OoVECT256 -Cfavx2
+y="$tmp/kexp.s"
+y_ymm=$(cnt 'vcvtps2dq[[:space:]]+%ymm' "$y")
+y_vpaddd=$(cnt 'vpaddd[[:space:]]+.*%ymm' "$y")
+y_vpslld=$(cnt 'vpslld[[:space:]]+.*%ymm' "$y")
+y_vmul=$(cnt 'vmulps[[:space:]]+.*%ymm' "$y")
+echo "exp ymm AVX2: vcvtps2dq.ymm=$y_ymm (>=1)  vpaddd.ymm=$y_vpaddd (>=1)  vpslld.ymm=$y_vpslld (>=1)  vmulps.ymm=$y_vmul (>=4)"
+[ "$y_ymm" -ge 1 ]    || { echo "FAIL: AVX2 exp range-reduction not widened to ymm"; rc=1; }
+[ "$y_vpaddd" -ge 1 ] || { echo "FAIL: AVX2 exp 2^n exponent build (vpaddd) not on ymm"; rc=1; }
+[ "$y_vpslld" -ge 1 ] || { echo "FAIL: AVX2 exp 2^n exponent build (vpslld) not on ymm"; rc=1; }
+[ "$y_vmul" -ge 4 ]   || { echo "FAIL: AVX2 exp polynomial not on ymm (vmulps.ymm<4)"; rc=1; }
+
+# sigmoid + tanh also widen to ymm on AVX2
+compile ksig.pp -O4 -OoAPPROXTRANS -OoVECT256 -Cfavx2
+[ "$(cnt 'vpaddd[[:space:]]+.*%ymm' "$tmp/ksig.s")" -ge 1 ] || { echo "FAIL: AVX2 sigmoid expf not widened to ymm"; rc=1; }
+compile ktanh.pp -O4 -OoAPPROXTRANS -OoVECT256 -Cfavx2
+[ "$(cnt 'vpaddd[[:space:]]+.*%ymm' "$tmp/ktanh.s")" -ge 1 ] || { echo "FAIL: AVX2 tanh expf not widened to ymm"; rc=1; }
+echo "sig/tanh ymm AVX2: vpaddd.ymm>=1 (expf widened)"
+
+# AVX-only fputype: transcendental must STAY 128-bit (no ymm exponent build) even
+# with -OoVECT256, because vpaddd/vpslld ymm need AVX2 -- but an ordinary float
+# add loop still widens to ymm, proving VECT256 is otherwise active.
+cat > "$tmp/kmix.pp" <<'EOF'
+program kmix;
+{$mode objfpc}{$H+}
+type TS = array of single;
+procedure act(a,b: TS); var i: longint; begin for i:=0 to high(a) do a[i]:=exp(b[i]); end;
+procedure add(a,b,c: TS); var i: longint; begin for i:=0 to high(a) do a[i]:=b[i]+c[i]; end;
+var a,b,c: TS;
+begin SetLength(a,64); SetLength(b,64); SetLength(c,64); act(a,b); add(a,b,c); Writeln(a[0]:0:3); end.
+EOF
+compile kmix.pp -O4 -OoAPPROXTRANS -OoVECT256 -Cfavx
+km="$tmp/kmix.s"
+km_transc_ymm=$(cnt 'vpaddd[[:space:]]+.*%ymm' "$km")
+km_ymm=$(cnt '%ymm' "$km")
+echo "exp ymm AVX1: transc.vpaddd.ymm=$km_transc_ymm (must be 0)  any.ymm=$km_ymm (>=1, float loop still widened)"
+[ "$km_transc_ymm" -eq 0 ] || { echo "FAIL: transc widened to ymm on an AVX-only (no AVX2) fputype"; rc=1; }
+[ "$km_ymm" -ge 1 ]        || { echo "FAIL: -OoVECT256 produced no ymm at all on AVX fputype"; rc=1; }
+[ "$(cnt 'cvtps2dq' "$km")" -ge 1 ] || { echo "FAIL: AVX1 transc lost its 128-bit expf"; rc=1; }
+
+[ "$rc" -eq 0 ] && echo "PASS: -OoAPPROXTRANS lowers exp/sigmoid/tanh single loops to an inline packed expf only when enabled, widens to 256-bit ymm on an AVX2 fputype under -OoVECT256, and declines indirect/double shapes"
 exit "$rc"

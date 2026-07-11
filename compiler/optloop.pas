@@ -3251,6 +3251,24 @@ unit optloop;
 {$endif}
       end;
 
+    function vect_transc_want_ymm : boolean;
+      { -OoAPPROXTRANS at 256-bit (ymm) width. The inline packed expf builds 2^n
+        by inserting the biased exponent into the IEEE field with packed 32-bit
+        integer add/shift (paddd + pslld); at 256-bit those are VPADDD/VPSLLD ymm,
+        which are AVX2 instructions -- an AVX-only unit can widen the float ops
+        (VMULPS/VADDPS/... ymm are AVX1) but NOT the integer exponent build. So the
+        transcendental body only widens to ymm when -OoVECT256 is requested AND the
+        fputype has an AVX2 unit; otherwise it stays at the SSE2-safe 128-bit (VL=4)
+        width regardless of VECT256. }
+      begin
+{$if defined(i386) or defined(x86_64)}
+        vect_transc_want_ymm:=vect_want_ymm and
+          (FPUX86_HAS_AVX2 in fpu_capabilities[current_settings.fputype]);
+{$else}
+        vect_transc_want_ymm:=false;
+{$endif}
+      end;
+
     function vect_widthtag : string;
       { -OoREPORT width suffix: appended to the vectorize remark ONLY when the
         256-bit ymm width was chosen (-OoVECT256 on an AVX fputype). The default
@@ -4040,12 +4058,13 @@ unit optloop;
           register width from vecwidth*element-size. }
         if vect_want_ymm then
           elewidth:=elewidth*2;
-        { -OoAPPROXTRANS is emitted as 128-bit (VL=4) only: the 2^n exponent build
-          uses packed 32-bit integer add/shift (paddd/pslld) which need AVX2 at
-          256-bit width, whereas the VECT256 gate only requires an AVX unit. Keep
-          the transcendental body at the SSE2-safe 128-bit width; an AVX2 ymm path
-          is a follow-up. }
-        if vshape=vok_transc then
+        { -OoAPPROXTRANS width: the 2^n exponent build uses packed 32-bit integer
+          add/shift (paddd/pslld), which at 256-bit are VPADDD/VPSLLD ymm -- AVX2
+          instructions. So the transcendental body widens to 256-bit (VL=8) only
+          under -OoVECT256 on an AVX2 fputype (vect_transc_want_ymm); on an AVX-only
+          or SSE fputype it stays at the SSE2-safe 128-bit (VL=4) width even when
+          VECT256 doubled elewidth above. }
+        if (vshape=vok_transc) and not vect_transc_want_ymm then
           elewidth:=4;
 
         { ---- build the replacement statement block ---- }
