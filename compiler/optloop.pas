@@ -181,6 +181,46 @@ unit optloop;
         result:=assigned(pd) and proc_is_pure(pd);
       end;
 
+    { -OoMODREF generalisation of loop_is_pure_call: a resolved direct call whose
+      mod/ref summary proves it writes NO memory (modref_writes = mr_none) and
+      cannot trap.  This is exactly as reorderable as a proven-PURE call -- writes
+      nothing, non-trapping, and any memory it READS is re-read identically when
+      the surrounding reduction's only store is the non-address-taken local
+      accumulator (which no callee can name) -- but it admits routines -OoPURE
+      leaves unproven, e.g. an ineligible signature (an open-array / managed /
+      hidden parameter) that reads its by-ref/global input and writes nothing. }
+    function loop_is_modref_writefree_call(n : tnode) : boolean;
+      var
+        pd : tprocdef;
+        para : tcallparanode;
+      begin
+        result:=false;
+        if not(cs_opt_modref in current_settings.optimizerswitches) then
+          exit;
+        pd:=loop_call_target(n);
+        if not(assigned(pd) and modref_summary_available(pd) and
+               (pd.modref_writes=mr_none) and not modref_pd_can_trap(pd)) then
+          exit;
+        { -OoREASSOC duplicates the addend (with a shifted counter) and
+          re-firstpasses each copy.  That copy step mishandles a call actual that
+          carries a hidden/managed/open-array conversion (a fixed array bound to
+          an open-array parameter re-typechecks as its element type), so restrict
+          this relaxation to calls whose every actual is a plain simple-typed
+          value -- exactly the shapes the counter-substitution re-firstpass
+          handles.  (The -OoPURE path never reaches such signatures: the purity
+          analysis rejects open-array / managed / hidden parameters outright.) }
+        para:=tcallparanode(tcallnode(n).left);
+        while assigned(para) do
+          begin
+            if assigned(para.paravalue) and
+               not(assigned(para.paravalue.resultdef) and
+                   (para.paravalue.resultdef.typ in [orddef,enumdef,floatdef,pointerdef])) then
+              exit;
+            para:=tcallparanode(para.nextpara);
+          end;
+        result:=true;
+      end;
+
     type
       treplaceinfo = record
         node : tnode;
@@ -6374,10 +6414,14 @@ unit optloop;
               is to the non-address-taken local accumulator, which no callee can
               name -- so nothing in the loop writes memory a pure callee could
               read, and regrouping the additions re-reads identical values.
+              -OoMODREF widens this to any call whose summary proves it writes no
+              memory and cannot trap (loop_is_modref_writefree_call): same
+              argument, but it reaches routines -OoPURE could not prove pure
+              (e.g. an open-array/hidden-parameter signature that only reads).
               Keep recursing into the argument subtrees so an accumulator
               reference or other unsafe construct inside an argument is still
               caught. }
-            if not loop_is_pure_call(n) then
+            if not loop_is_pure_call(n) and not loop_is_modref_writefree_call(n) then
               begin
                 preassoc_safety(arg)^.bad:=true;
                 result:=fen_norecurse_true;
@@ -6416,6 +6460,20 @@ unit optloop;
         relaxed reassoc_safety_cb, for an accurate -OoREPORT remark }
       begin
         if (n.nodetype=calln) and loop_is_pure_call(n) then
+          begin
+            pboolean(arg)^:=true;
+            result:=fen_norecurse_true;
+          end
+        else
+          result:=fen_false;
+      end;
+
+    function reassoc_note_modref_cb(var n : tnode; arg : pointer) : foreachnoderesult;
+      { detects a call admitted into the reduction addend by the -OoMODREF
+        write-free relaxation but NOT provable pure by -OoPURE, for the remark }
+      begin
+        if (n.nodetype=calln) and loop_is_modref_writefree_call(n) and
+           not loop_is_pure_call(n) then
           begin
             pboolean(arg)^:=true;
             result:=fen_norecurse_true;
@@ -6516,6 +6574,7 @@ unit optloop;
         j : longint;
         lo, hi : tconstexprint;
         hasrelaxedcall : boolean;
+        hasmodrefcall : boolean;
 
       function reassoc_reason : string;
         begin
@@ -6721,8 +6780,12 @@ unit optloop;
         if cs_opt_report in current_settings.optimizerswitches then
           begin
             hasrelaxedcall:=false;
+            hasmodrefcall:=false;
             foreachnodestatic(pm_postprocess,exprnode,@reassoc_note_call_cb,@hasrelaxedcall);
-            if hasrelaxedcall then
+            foreachnodestatic(pm_postprocess,exprnode,@reassoc_note_modref_cb,@hasmodrefcall);
+            if hasmodrefcall then
+              OptRemark(forn.fileinfo,'reassoc','reduction loop split into '+tostr(reassoc_k)+' partial accumulators (addend contains a mod/ref write-free non-trapping call kept in the body via -OoMODREF)')
+            else if hasrelaxedcall then
               OptRemark(forn.fileinfo,'reassoc','reduction loop split into '+tostr(reassoc_k)+' partial accumulators (addend contains a proven pure/const call kept in the body via -OoPURE)')
             else
               OptRemark(forn.fileinfo,'reassoc','reduction loop split into '+tostr(reassoc_k)+' partial accumulators');
