@@ -53,16 +53,33 @@
 #      unleashed/tests/known_miscompiles/o4_sink_repeat_until_01.pp and the suite
 #      test unleashed/tests/testfiles/sink_repeat_until/sink_repeat_until_01.pp.
 #
-#   2. OPEN (tasklist self-host blocker #2): with #1 fixed, plain OPT="-O4" now
-#      gets PAST rgobj.pas but still aborts stage-2 on compiler/optfinalvalue.pas
-#      :600 with a spurious -O4 "Local variable accs does not seem to be
-#      initialized" warning-as-error (accs is a local array filled in one for-k
-#      loop and read in the next; -O4's DFA is over-conservative on loop-filled
-#      locals).  Distinct root cause from #1: neither the sink fix nor -OoNOSINK
-#      clears it.  Context-dependent (needs the full cycle's defines); filed by
-#      location.
+#   2. FIXED (fork commit on branch a3, optdfa.pas CollectLoopFillCoveredSyms
+#      + psub.pas wiring): the spurious -O4 "Local variable accs does not seem
+#      to be initialized" at compiler/optfinalvalue.pas:600 is gone.  Root cause:
+#      the DFA models a partial element write arr[i]:=x as a full def of arr, but
+#      the for-node liveness re-adds the whole successor life because the loop
+#      body "might run 0 times", so a local array element-filled in one counted
+#      for-loop and element-read in later for-loops (accs) is spuriously flagged.
+#      It is warning-only (codegen keeps arr initialised); the fix suppresses the
+#      diagnostic ONLY for the provably-safe matched loop-fill shape (all
+#      accesses are arr[c] with c a counter of loops sharing the fill bounds, or
+#      a nested subrange arr[j], j in 0..k-1), never touching liveness /
+#      noregvarinitneeded -- so codegen is unaffected and genuine uninitialised
+#      reads still warn.  Reproducer + regression:
+#      unleashed/tests/testfiles/loopfill_dfa/loopfill_dfa_01.pp (%OPT="-O4 -Sew")
+#      and unleashed/tests/loopfill_dfa_check.sh (over-suppression guards).
 #
-#   So plain -O4 self-host is BLOCKED pending #2.  Once green, adopt the winning
+#   3. OPEN (tasklist self-host blocker #3): with #2 fixed, plain OPT="-O4" now
+#      gets PAST optfinalvalue.pas but aborts stage-2 (ppc2) on
+#      compiler/pstatmnt.pas:5352 with a spurious "Local variable remaining_sym
+#      does not seem to be initialized" warning-as-error.  DISTINCT root cause: a
+#      scalar assigned inside `if cond then ...` and read inside another `if cond`
+#      guarded by the SAME boolean (correlated if-guards the DFA cannot relate);
+#      NOT a loop-fill.  Warning-only, present in upstream FPC 3.2.2 too.
+#      Reduced reproducer: unleashed/tests/known_miscompiles/
+#      o4_correlated_guard_uninit_01.pp.
+#
+#   So plain -O4 self-host is BLOCKED pending #3.  Once green, adopt the winning
 #   flag set here as the documented default gate and (optionally) fold in the
 #   opt-in -Oo* passes one at a time via OPTFORK.
 set -e

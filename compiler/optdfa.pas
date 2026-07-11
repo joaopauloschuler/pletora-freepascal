@@ -31,6 +31,7 @@ unit optdfa;
   interface
 
     uses
+      cclasses,
       node,optutils;
 
     type
@@ -51,6 +52,13 @@ unit optdfa;
 
     procedure CheckAndWarn(code : tnode;nodetosearch : tnode);
 
+    { Collect into syms every local/static array variable whose only accesses are
+      matched loop-fill / loop-read shapes (see the block comment at the
+      implementation of LoopFillCovered).  Must be called on the still-structured
+      for-node tree, before ConvertForLoops lowers the loops.  The DFA
+      "uninitialized" warning is a false positive for these variables. }
+    procedure CollectLoopFillCoveredSyms(code : tnode;syms : tfplist);
+
   implementation
 
     uses
@@ -58,11 +66,11 @@ unit optdfa;
       systems,
       constexp,
       verbose,
-      symconst,symdef,symsym,
+      symconst,symtype,symdef,symsym,
       defutil,
       procinfo,
       nutils,htypechk,
-      nbas,nflw,ncal,nset,nld,nadd,
+      nbas,nflw,ncal,nset,nld,nadd,nmem,ncnv,ncon,
       optbase;
 
 
@@ -866,6 +874,341 @@ unit optdfa;
             end;
           else
             ;
+        end;
+      end;
+
+
+    { ----------------------------------------------------------------------
+      Loop-fill false-positive suppression.
+
+      The DFA models a partial element write  arr[i]:=x  as a full def of arr
+      (see tvecnode/tsubscriptnode.mark_write, which propagate nf_write to the
+      base load).  In straight-line code this makes  arr[3]:=x; y:=arr[0];  not
+      warn.  Inside a for-loop, however, the for-node liveness handler re-adds
+      the successor's whole life because the body "might run 0 times", so the
+      classic idiom
+
+        for i:=lo to hi do arr[i]:=...;    // fill
+        for i:=lo to hi do ... arr[i] ...  // read, possibly several loops
+
+      spuriously flags arr as "does not seem to be initialized" (this is a
+      long-standing imprecision, present in upstream FPC 3.2.2 too).  It is a
+      warning-only artefact: codegen stays conservative (arr keeps its
+      register/init because it is live at entry), so nothing is miscompiled.
+
+      LoopFillCovers recognises exactly this shape and suppresses the WARNING
+      only (it never touches liveness / noregvarinitneeded, so it cannot cause
+      a miscompile).  It is sound-precise rather than a blanket suppression: it
+      fires only when EVERY access to the variable is  arr[c]  with c the
+      counter of an enclosing for-loop, all those loops share syntactically
+      identical bounds, and at least one of them writes arr[c] (a filler).
+      Then every element that is read was written by the filler over the same
+      index range, so the diagnostic is provably a false positive.  Any read
+      not covered by such a matched fill (e.g. arr[k] with k not a matching
+      loop counter) keeps warning as before. }
+
+    type
+      tloopfillrec = record
+        sym : tsym;        { the variable under inspection }
+        loopvar : tsym;    { counter of the loop currently being scanned }
+        list : tfplist;    { collected base load nodes of sym[loopvar] }
+        haswrite : boolean;{ some sym[loopvar] access is a write (filler) }
+      end;
+      ploopfillrec = ^tloopfillrec;
+
+      tsymloadrec = record
+        sym : tsym;
+        list : tfplist;
+      end;
+      psymloadrec = ^tsymloadrec;
+
+    function lf_stripconvs(n : tnode) : tnode;
+      begin
+        while assigned(n) and (n.nodetype=typeconvn) do
+          n:=ttypeconvnode(n).left;
+        result:=n;
+      end;
+
+    function lf_loopvarsym(f : tfornode) : tsym;
+      var
+        l : tnode;
+      begin
+        result:=nil;
+        l:=lf_stripconvs(f.left);
+        if assigned(l) and (l.nodetype=loadn) then
+          result:=tloadnode(l).symtableentry;
+      end;
+
+    function lf_boundsequal(a,b : tfornode) : boolean;
+      begin
+        result:=((lnf_backward in a.loopflags)=(lnf_backward in b.loopflags)) and
+                assigned(a.right) and assigned(b.right) and a.right.isequal(b.right) and
+                assigned(a.t1) and assigned(b.t1) and a.t1.isequal(b.t1);
+      end;
+
+    { is n exactly  sym[loopvar]  (module type conversions) ? returns the base
+      load node of sym, or nil }
+    function lf_matched_base(n : tnode;sym,loopvar : tsym) : tnode;
+      var
+        b,idx : tnode;
+      begin
+        result:=nil;
+        if n.nodetype<>vecn then
+          exit;
+        b:=lf_stripconvs(tvecnode(n).left);
+        idx:=lf_stripconvs(tvecnode(n).right);
+        if assigned(b) and (b.nodetype=loadn) and (tloadnode(b).symtableentry=sym) and
+           assigned(idx) and (idx.nodetype=loadn) and (tloadnode(idx).symtableentry=loopvar) then
+          result:=b;
+      end;
+
+    function lf_collect_forns(var n : tnode; arg : pointer) : foreachnoderesult;
+      begin
+        if n.nodetype=forn then
+          tfplist(arg).Add(n);
+        result:=fen_false;
+      end;
+
+    function lf_collect_symloads(var n : tnode; arg : pointer) : foreachnoderesult;
+      begin
+        if (n.nodetype=loadn) and (tloadnode(n).symtableentry=psymloadrec(arg)^.sym) then
+          psymloadrec(arg)^.list.Add(n);
+        result:=fen_false;
+      end;
+
+    function lf_collect_covered(var n : tnode; arg : pointer) : foreachnoderesult;
+      var
+        rec : ploopfillrec;
+        b,lhs : tnode;
+      begin
+        result:=fen_false;
+        rec:=ploopfillrec(arg);
+        case n.nodetype of
+          vecn:
+            begin
+              b:=lf_matched_base(n,rec^.sym,rec^.loopvar);
+              if assigned(b) then
+                begin
+                  if rec^.list.IndexOf(b)<0 then
+                    rec^.list.Add(b);
+                  if nf_write in b.flags then
+                    rec^.haswrite:=true;
+                end;
+            end;
+          assignn:
+            begin
+              lhs:=lf_stripconvs(tassignmentnode(n).left);
+              if assigned(lf_matched_base(lhs,rec^.sym,rec^.loopvar)) then
+                rec^.haswrite:=true;
+            end;
+          callparan:
+            begin
+              if assigned(tcallparanode(n).parasym) and
+                 (tcallparanode(n).parasym.varspez in [vs_var,vs_out]) then
+                begin
+                  lhs:=lf_stripconvs(tcallparanode(n).left);
+                  if assigned(lf_matched_base(lhs,rec^.sym,rec^.loopvar)) then
+                    rec^.haswrite:=true;
+                end;
+            end;
+          else
+            ;
+        end;
+      end;
+
+    { collect into ploopfillrec.list every distinct local/static array symbol
+      that appears as base of  sym[loopvar]  (rec^.loopvar) }
+    function lf_collect_candidates(var n : tnode; arg : pointer) : foreachnoderesult;
+      var
+        rec : ploopfillrec;
+        b : tnode;
+        s : tsym;
+        vardef : tdef;
+      begin
+        result:=fen_false;
+        if n.nodetype<>vecn then
+          exit;
+        rec:=ploopfillrec(arg);
+        b:=lf_stripconvs(tvecnode(n).left);
+        if not(assigned(b) and (b.nodetype=loadn)) then
+          exit;
+        s:=tloadnode(b).symtableentry;
+        if not(assigned(s) and (s.typ in [localvarsym,staticvarsym])) then
+          exit;
+        { index must be the loop counter }
+        if lf_matched_base(n,s,rec^.loopvar)=nil then
+          exit;
+        vardef:=tabstractnormalvarsym(s).vardef;
+        if not(assigned(vardef) and (vardef.typ=arraydef)) then
+          exit;
+        if rec^.list.IndexOf(s)<0 then
+          rec^.list.Add(s);
+      end;
+
+    { Does the bound expression t reference the counter of a filler loop as
+      loadn(fv)  or  loadn(fv)-1  with fv in fillervars?  Such a bound is
+      provably <= the fill upper bound (the filler counter never exceeds its own
+      top), so a reader loop nested in the filler with this "to" and the same
+      "from" only reads already-filled indices. }
+    function lf_le_filler_bound(t : tnode;fillervars : tfplist) : boolean;
+      var
+        b : tnode;
+      begin
+        result:=false;
+        b:=lf_stripconvs(t);
+        if not assigned(b) then
+          exit;
+        if (b.nodetype=loadn) and (fillervars.IndexOf(tloadnode(b).symtableentry)>=0) then
+          result:=true
+        else if (b.nodetype=subn) and
+                (lf_stripconvs(taddnode(b).right).nodetype=ordconstn) and
+                (tordconstnode(lf_stripconvs(taddnode(b).right)).value=1) then
+          begin
+            b:=lf_stripconvs(taddnode(b).left);
+            result:=(b.nodetype=loadn) and (fillervars.IndexOf(tloadnode(b).symtableentry)>=0);
+          end;
+      end;
+
+    { True if EVERY access to the local/static array variable sym in code is a
+      matched loop-fill / loop-read shape (see the block comment above): every
+      access is sym[c] with c the counter of a for-loop that either has bounds
+      syntactically identical to the fill loop, or is nested in the fill loop
+      with the same lower bound and an upper bound of  fillcounter  /
+      fillcounter-1  (a subrange of the fill range).  At least one loop must
+      write sym[c] (a filler).  forns must already hold every for-node of code.
+      Then the DFA "not initialized" warning for sym is a false positive. }
+    function LoopFillCovered(code : tnode;sym : tsym;forns : tfplist) : boolean;
+      var
+        covered,fillervars : tfplist;
+        symloads : tsymloadrec;
+        covrec : tloopfillrec;
+        sig : tfornode;
+        i,j : longint;
+        f : tfornode;
+        lv : tsym;
+      begin
+        result:=false;
+        covered:=tfplist.Create;
+        fillervars:=tfplist.Create;
+        symloads.sym:=sym;
+        symloads.list:=tfplist.Create;
+        try
+          { pass 1: locate the filler loop(s) and the shared fill range.  All
+            fillers must agree on their bounds. }
+          sig:=nil;
+          for i:=0 to forns.Count-1 do
+            begin
+              f:=tfornode(forns[i]);
+              lv:=lf_loopvarsym(f);
+              if not assigned(lv) then
+                continue;
+              covrec.sym:=sym;
+              covrec.loopvar:=lv;
+              covrec.list:=tfplist.Create;
+              covrec.haswrite:=false;
+              foreachnodestatic(f.t2,@lf_collect_covered,@covrec);
+              if (covrec.list.Count>0) and covrec.haswrite then
+                begin
+                  if sig=nil then
+                    sig:=f
+                  else if not lf_boundsequal(sig,f) then
+                    begin
+                      covrec.list.Free;
+                      exit;   { fillers with different ranges -> keep warning }
+                    end;
+                  if fillervars.IndexOf(lv)<0 then
+                    fillervars.Add(lv);
+                end;
+              covrec.list.Free;
+            end;
+          if sig=nil then
+            exit;   { no filler -> keep warning }
+
+          { pass 2: every access loop must be a covered shape, and we collect the
+            base loads it covers }
+          for i:=0 to forns.Count-1 do
+            begin
+              f:=tfornode(forns[i]);
+              lv:=lf_loopvarsym(f);
+              if not assigned(lv) then
+                continue;
+              covrec.sym:=sym;
+              covrec.loopvar:=lv;
+              covrec.list:=tfplist.Create;
+              covrec.haswrite:=false;
+              foreachnodestatic(f.t2,@lf_collect_covered,@covrec);
+              if covrec.list.Count>0 then
+                begin
+                  if not(lf_boundsequal(sig,f) or
+                         (assigned(f.right) and assigned(sig.right) and
+                          f.right.isequal(sig.right) and
+                          lf_le_filler_bound(f.t1,fillervars))) then
+                    begin
+                      covrec.list.Free;
+                      exit;   { uncovered index range -> keep warning }
+                    end;
+                  for j:=0 to covrec.list.Count-1 do
+                    if covered.IndexOf(covrec.list[j])<0 then
+                      covered.Add(covrec.list[j]);
+                end;
+              covrec.list.Free;
+            end;
+
+          { every load of sym must be a covered sym[matching-loopvar] access }
+          foreachnodestatic(code,@lf_collect_symloads,@symloads);
+          result:=true;
+          for i:=0 to symloads.list.Count-1 do
+            if covered.IndexOf(symloads.list[i])<0 then
+              begin
+                result:=false;
+                break;
+              end;
+        finally
+          covered.Free;
+          fillervars.Free;
+          symloads.list.Free;
+        end;
+      end;
+
+
+    procedure CollectLoopFillCoveredSyms(code : tnode;syms : tfplist);
+      var
+        forns : tfplist;
+        candrec : tloopfillrec;
+        i,j : longint;
+        f : tfornode;
+        lv : tsym;
+        s : tsym;
+      begin
+        if not assigned(code) then
+          exit;
+        forns:=tfplist.Create;
+        candrec.list:=tfplist.Create;   { candidate symbols }
+        try
+          foreachnodestatic(code,@lf_collect_forns,forns);
+          if forns.Count=0 then
+            exit;
+          { gather candidate variables: any sym written/read as sym[loopvar] }
+          for i:=0 to forns.Count-1 do
+            begin
+              f:=tfornode(forns[i]);
+              lv:=lf_loopvarsym(f);
+              if not assigned(lv) then
+                continue;
+              candrec.sym:=nil;
+              candrec.loopvar:=lv;
+              foreachnodestatic(f.t2,@lf_collect_candidates,@candrec);
+            end;
+          { test each candidate }
+          for j:=0 to candrec.list.Count-1 do
+            begin
+              s:=tsym(candrec.list[j]);
+              if (syms.IndexOf(s)<0) and LoopFillCovered(code,s,forns) then
+                syms.Add(s);
+            end;
+        finally
+          forns.Free;
+          candrec.list.Free;
         end;
       end;
 

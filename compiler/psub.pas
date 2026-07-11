@@ -1249,7 +1249,9 @@ implementation
         UserCode : TNode;
         updated,
         RedoDFA : boolean;
+        loopfillsyms : tfplist;
       begin
+       loopfillsyms:=tfplist.Create;
        { inlining is a heuristics, so we do this very early }
        do_optinline(code,updated);
 
@@ -1321,6 +1323,14 @@ implementation
            dfabuilder.createdfainfo(code);
            include(flags,pi_dfaavailable);
            RedoDFA:=false;
+
+           { record local/static arrays that are element-filled and element-read
+             by matched counted for-loops, on the still-structured for-node tree
+             (ConvertForLoops below lowers the for-nodes to while-loops).  Their
+             later DFA "does not seem to be initialized" warning is a false
+             positive; skip it in the warning loop.  Diagnostic only -- liveness
+             and noregvarinitneeded are untouched, so codegen is unaffected. }
+           CollectLoopFillCoveredSyms(code,loopfillsyms);
 
            if cs_opt_constant_propagate in current_settings.optimizerswitches then
              begin
@@ -1709,7 +1719,10 @@ implementation
                        { function result is passed by var but it must be initialized }
                        not(vo_is_funcret in tparavarsym(tloadnode(dfabuilder.nodemap[i]).symtableentry).varoptions)) or
                        { do not warn about initialized hidden parameters }
-                       ((tparavarsym(tloadnode(dfabuilder.nodemap[i]).symtableentry).varoptions*[vo_is_high_para,vo_is_parentfp,vo_is_result,vo_is_self])<>[]))) then
+                       ((tparavarsym(tloadnode(dfabuilder.nodemap[i]).symtableentry).varoptions*[vo_is_high_para,vo_is_parentfp,vo_is_result,vo_is_self])<>[]))) and
+                       { skip matched loop-fill false positives (see above) }
+                       not((tnode(dfabuilder.nodemap[i]).nodetype=loadn) and
+                           (loopfillsyms.IndexOf(tloadnode(dfabuilder.nodemap[i]).symtableentry)>=0)) then
                        CheckAndWarn(UserCode,tnode(dfabuilder.nodemap[i]));
                    end
                  else
@@ -1782,6 +1795,8 @@ implementation
              longjmp is performed }
           not(m_non_local_goto in current_settings.modeswitches) then
          do_consttovar(code);
+
+       loopfillsyms.Free;
       end;
 
 
