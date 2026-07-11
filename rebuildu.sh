@@ -125,35 +125,64 @@
 #      With #5 fixed, OPT="-O4" now builds a WORKING stage-2 compiler (ppc2 runs on
 #      simple inputs) -- the cycle advances to CYCLELEVEL=3, exposing blocker #6.
 #
-#   6. OPEN (tasklist self-host blocker #6): the SECOND plain-`-O4` codegen
-#      miscompile, DISTINCT from and independent of #5 (it reproduces with the #5
-#      peephole fully disabled).  With #5 fixed, ppc2 compiles hello but still
-#      CRASHES (EAccessViolation / memory corruption) compiling complex sources
-#      like the RTL's system.pp, aborting the cycle at CYCLELEVEL=3.  Single-pass
-#      -OoNO* bisection while building ppc2 pins it to exactly ONE pass:
-#      -OoUNROLLJAM (cs_opt_unrolljam, unroll-and-jam, gated in -O4).  The only
-#      routine unroll-and-jammed in the whole compiler is TMessage.ResetStates
+#   6. FIXED (fork commit on branch a3, optloop.pas OptimizeUnrollJam): the
+#      SECOND plain-`-O4` MISCOMPILE, DISTINCT from and independent of #5 (it
+#      reproduced with the #5 peephole fully disabled).  With #5 fixed, ppc2
+#      compiled hello but CRASHED (EAccessViolation / memory corruption)
+#      compiling complex sources like the RTL's system.pp, aborting the cycle at
+#      CYCLELEVEL=3.  Single-pass -OoNO* bisection pinned it to -OoUNROLLJAM
+#      (cs_opt_unrolljam, unroll-and-jam, gated in -O4).  The only routine
+#      unroll-and-jammed in the whole compiler is TMessage.ResetStates
 #      (compiler/cmsgs.pas:482, "outer factor 4"), whose INNER loop trip count
-#      msgidxmax[i] DEPENDS ON THE OUTER COUNTER i; jamming K inner loops with
-#      different trip counts drives all K rows with one wrong bound -> wrong
-#      values + out-of-bounds stores that corrupt the heap (surfacing later as a
-#      corrupt virtual dispatch in symtable.pas search_macro).  Reduced reproducer:
-#      unleashed/tests/known_miscompiles/o4_unrolljam_varying_inner_bound_01.pp
-#      (ppcx64 -O4 -> FAIL, -O4 -OoNOUNROLLJAM / -O3 / -O2 -> ok).  Fix: the pass
-#      must refuse to jam (or peel/guard) when the inner loop count is not
-#      invariant across the unrolled outer iterations.
+#      msgidxmax[i] DEPENDS ON THE OUTER COUNTER i.  Unroll-and-jam collapses the
+#      K per-outer-iteration inner loops into ONE loop driven by a SINGLE inner
+#      bound -- sound only when that bound is invariant across the K unrolled
+#      outer iterations; here rows i..i+3 have DIFFERENT lengths, so one wrong
+#      bound drove all K rows -> out-of-bounds stores that corrupted the heap.
+#      The recognizer's iload_total=iload_subscript rule did NOT catch it:
+#      msgidxmax[i] is a "bare subscript" of i, so it passed.  Fix: after
+#      locating the inner for, require both bounds (and step) to be provably
+#      invariant across the unrolled outer iterations (new ujam_bound_variant_cb
+#      rejects a bound that reads the outer/inner counter, a renamed accumulator,
+#      or ANY memory indirection -- array element, deref, field, call); the
+#      classic rectangular nest (constant / outer-invariant bounds) keeps firing.
+#      Reproducer promoted to suite test
+#      unleashed/tests/testfiles/optunrolljam/unrolljam_varying_inner_bound_01.pp
+#      (%OPT=-O4) + firing/refusal guard unleashed/tests/unrolljam_check.sh.
+#      With #6 fixed, plain OPT="-O4" no longer corrupts the heap on system.pp and
+#      the cycle advances all the way to the RTL float unit, exposing blocker #7.
 #
-#   So plain -O4 self-host is BLOCKED pending #6.  OPT="-O4"
-#   OPTFORK="-OoNOUNROLLJAM" (the seed never sees -Oo*, so it must go through
-#   OPTFORK) clears #6's crash and lets the cycle advance further, but then hits
-#   yet ANOTHER distinct -O4 issue at CYCLELEVEL=3 (ppc2 miscompiles the RTL:
-#   "Illegal type conversion Extended to QWord" / internal error 2014091205 at
-#   system.inc) -- so more blockers remain past #6 and there is no green -O4 flag
-#   set yet; no default gate is documented here.  Each blocker gets reduced and
-#   filed one at a time (blockers #1-#5 fixed, #6 filed).  Once plain -O4 is
-#   finally green (byte-identical ppc2/ppc3 + byte-identical unleashed set),
-#   adopt it as the documented default gate and fold in the opt-in -Oo* passes one
-#   at a time via OPTFORK.
+#   7. OPEN (tasklist self-host blocker #7): the THIRD plain-`-O4` miscompile,
+#      DISTINCT from #5/#6.  With #6 fixed, plain OPT="-O4" ./rebuildu.sh reaches
+#      CYCLELEVEL=3 and aborts building the RTL:
+#        flt_core.inc(614,1)  Warning: Range check error while evaluating
+#                             constants (-1 must be between 0 and 4294967295)
+#        flt_core.inc(1780,48) Error: Illegal type conversion "Extended" to "QWord"
+#        system.inc(708,90)   Fatal: Internal error 2014091205
+#      flt_core.inc:1780 is qword(10000000000000000000) (10^19, > High(int64) but
+#      <= High(qword)).  Root cause (isolated): the compiler types an integer
+#      literal in scanner.pas try_parse_number via the RTL `val`; on x86-64 the
+#      qword `val` is fpc_Val_UInt_Shortstr (rtl/inc/sstrings.inc), whose
+#      shr-by-(64-8*DestSize) / subrange-div overflow guard is miscompiled so it
+#      wrongly flags overflow and returns code=20 (should be 0) even though the
+#      parsed VALUE is the correct 10^19 -> nonzero code -> real fallback ->
+#      "Extended to QWord".  SECOND-ORDER / self-referential: NOT reproduced by a
+#      seed-built ppcx64 at -O4 (that codegen is correct); reproduces ONLY when
+#      the compiler is ITSELF built at -O4 (the cycle's stage-2 ppc2) AND compiles
+#      val at -O4.  Truth table for val('10000000000000000000',qc) `code`:
+#        seed-built ppcx64, RTL@-O4 -> 0 ok | RTL@default -> 0 ok
+#        ppc2 (-O4-built),  RTL@-O4 -> 20 WRONG | RTL@default -> 0 ok
+#      So a fork -O4 optimizer pass, applied to the compiler's OWN sources while
+#      building ppc2, corrupts an optimizer/codegen routine that ppc2 then uses to
+#      mis-lower val.  Reduced reproducer + full recipe:
+#      unleashed/tests/known_miscompiles/o4_bigconst_val_qword_selfhost_01.pp.
+#
+#   So plain -O4 self-host is BLOCKED pending #7 (a distinct, deeper self-host
+#   miscompile than #6).  There is no green -O4 flag set yet; no default gate is
+#   documented here.  Each blocker gets reduced and filed one at a time (blockers
+#   #1-#6 fixed, #7 filed).  Once plain -O4 is finally green (byte-identical
+#   ppc2/ppc3 + byte-identical unleashed set), adopt it as the documented default
+#   gate and fold in the opt-in -Oo* passes one at a time via OPTFORK.
 set -e
 FP="$(cd "$(dirname "$0")" && pwd)"
 
