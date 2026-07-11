@@ -3474,6 +3474,12 @@ unit optloop;
         ismaxop : boolean;
         { -OoAPPROXTRANS: which approximate transcendental the vok_transc body computes }
         transfn : ttranscfunc;
+        { -OoAPPROXTRANS softmax shape: for  exp(b[i]-m)  this holds the
+          loop-invariant single scalar m (subtracted per lane before the packed
+          expf via a hoisted broadcast); nil for the bare  exp(b[i])  / sigmoid /
+          tanh shapes. }
+        transbias : tnode;
+        transbiassplat : ttempcreatenode;
         mminl : tinlinenode;
         splata, splatb : ttempcreatenode;
         windowa, windowb : tnode;
@@ -3580,12 +3586,41 @@ unit optloop;
           elem_arg:=true;
         end;
 
+      { -OoAPPROXTRANS softmax shape: true if argn peels to  b[i] - m  where b is a
+        simple single-precision dynamic-array element of the loop counter and m is a
+        provably loop-invariant single scalar (the row/vector max the caller
+        subtracts for numerical stability before exp).  On success bvec holds the
+        element access and transbias holds the scalar m (broadcast once and
+        subtracted per lane before the packed expf). The exp argument is thus not a
+        bare element, which the plain elem_arg path (correctly) declines. }
+      function elem_minus_scalar(argn : tnode) : boolean;
+        var a : tnode;
+        begin
+          elem_minus_scalar:=false;
+          a:=rangeelim_skip_typeconv(argn);
+          if not assigned(a) or (a.nodetype<>subn) then
+            exit;
+          { left must be b[i], a single-precision element of the loop counter }
+          if vect_elem_reason(taddnode(a).left,counter,bvec)<>'' then
+            exit;
+          if vect_elem_isdouble(bvec) then
+            exit;
+          { right must be a provably loop-invariant single scalar }
+          if vect_invariant_scalar_reason(taddnode(a).right,counter,false)<>'' then
+            exit;
+          transbias:=taddnode(a).right;
+          elem_minus_scalar:=true;
+        end;
+
       { -OoAPPROXTRANS: recognize an approximate single-precision transcendental
         activation body and, on a full match, set vshape:=vok_transc, transfn and
         bvec (the source array element) and return true.  Returns false (fall
         through to the other RHS shapes) when the body is not one of these forms.
         Recognized (exp() has already been lowered to an fpc_exp_real call):
           exp:      a[i] := exp(b[i])
+          softmax:  a[i] := exp(b[i]-m)  (m loop-invariant single scalar, set
+                    into transbias and subtracted per lane before the packed expf)
+          tanh:     a[i] := tanh(b[i])
           sigmoid:  a[i] := 1/(1+exp(-b[i])) }
       function try_transc : boolean;
         var
@@ -3595,11 +3630,11 @@ unit optloop;
           { approximate transcendentals are single-precision only }
           if vecdouble or not assigned(rhs) then
             exit;
-          { exp:  a[i] := exp(b[i]) }
+          { exp:  a[i] := exp(b[i])  or the softmax shape  a[i] := exp(b[i]-m) }
           arg:=exp_call_arg(rhs);
           if assigned(arg) then
             begin
-              if elem_arg(arg,false) then
+              if elem_arg(arg,false) or elem_minus_scalar(arg) then
                 begin
                   transfn:=tf_exp;
                   vshape:=vok_transc;
@@ -3705,6 +3740,7 @@ unit optloop;
           mmA_vec:=nil; mmB_vec:=nil; mmA_scalar:=nil; mmB_scalar:=nil;
           ismaxop:=false;
           transfn:=tf_exp;
+          transbias:=nil;
 
           { REDUCTION shape:  s := s + b[i]  (sum)  or  s := s + b[i]*c[i]  (dot
             product), recognized before the element-wise store shapes because its
@@ -4019,6 +4055,8 @@ unit optloop;
         mmB_scalar:=nil;
         ismaxop:=false;
         transfn:=tf_exp;
+        transbias:=nil;
+        transbiassplat:=nil;
         mminl:=nil;
         accsym:=nil;
         redlhs:=nil;
@@ -4196,6 +4234,21 @@ unit optloop;
               ctemprefnode.create(splattemp),scalarnode.getcopy,elewidth,vecdouble));
           end;
 
+        { -OoAPPROXTRANS softmax  exp(b[i]-m): broadcast the loop-invariant scalar m
+          ONCE into a memory splat slot [m,m,..] before the vector loop, exactly like
+          the vok_arr_scalar path; the transc body subtracts it per lane before the
+          packed expf. }
+        transbiassplat:=nil;
+        if (vshape=vok_transc) and assigned(transbias) then
+          begin
+            transbiassplat:=ctempcreatenode.create(
+              tarraydef.getreusable_vector(eletype,elewidth),
+              elewidth*eletype.size,tt_persistent,false);
+            addstatement(stat,transbiassplat);
+            addstatement(stat,cvectoropnode.create_broadcast(
+              ctemprefnode.create(transbiassplat),transbias.getcopy,elewidth,vecdouble));
+          end;
+
         { if-conversion (vok_minmax): each min/max operand is either an array
           element window or an invariant scalar broadcast once into a splat slot.
           Build windowa/windowb (the packed operand nodes) accordingly. }
@@ -4241,7 +4294,11 @@ unit optloop;
           vok_minmax:
             addstatement(vstat,cvectoropnode.create_minmax(avec.getcopy,windowa,windowb,ismaxop,elewidth));
           vok_transc:
-            addstatement(vstat,cvectoropnode.create_transc(avec.getcopy,bvec.getcopy,transfn,elewidth));
+            if assigned(transbiassplat) then
+              addstatement(vstat,cvectoropnode.create_transc_bias(avec.getcopy,bvec.getcopy,
+                ctemprefnode.create(transbiassplat),transfn,elewidth))
+            else
+              addstatement(vstat,cvectoropnode.create_transc(avec.getcopy,bvec.getcopy,transfn,elewidth));
           else
             internalerror(2026070706);
         end;

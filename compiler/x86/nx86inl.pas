@@ -589,7 +589,9 @@ implementation
           end;
 
         { --- approximate transcendental: a[i..i+VL-1] := f(b[i..i+VL-1]) ---
-          exp is emitted inline (emit_vec_expf); sigmoid and tanh are built on it:
+          exp is emitted inline (emit_vec_expf); the softmax shape exp(b[i]-m)
+          subtracts the pre-broadcast bias slot (third) from the window first;
+          sigmoid and tanh are built on it:
             sigmoid(x) = 1/(1+exp(-x))
             tanh(x)    = 2/(1+exp(-2x)) - 1  = 2*sigmoid(2x) - 1
           so the source window is first scaled (by -1 for sigmoid, -2 for tanh) to
@@ -609,6 +611,22 @@ implementation
             case transfunc of
               tf_exp:
                 begin
+                  { softmax shape exp(b[i]-m): subtract the pre-broadcast [m,..]
+                    slot (third) from the b[i] window before the packed expf }
+                  if assigned(third) then
+                    begin
+                      secondpass(third);
+                      if not (third.location.loc in [LOC_REFERENCE,LOC_CREFERENCE]) then
+                        internalerror(2026071104);
+                      refc:=third.location.reference;
+                      tcgx86(cg).make_simple_ref(current_asmdata.CurrAsmList,refc);
+                      regc:=cg.getmmregister(current_asmdata.CurrAsmList,mmsize);
+                      current_asmdata.CurrAsmList.concat(taicpu.op_ref_reg(movop,S_NO,refc,regc));
+                      if avx then
+                        current_asmdata.CurrAsmList.concat(taicpu.op_reg_reg_reg(A_VSUBPS,S_NO,regc,regb,regb))
+                      else
+                        current_asmdata.CurrAsmList.concat(taicpu.op_reg_reg(A_SUBPS,S_NO,regc,regb));
+                    end;
                   emit_vec_expf(current_asmdata.CurrAsmList,regb,avx,mmsize);
                   resreg:=regb;
                 end;

@@ -148,6 +148,57 @@ compile kdbl.pp -O4 -OoAPPROXTRANS -Cfsse64
 [ "$(cnt 'cvtps2dq' "$tmp/kdbl.s")" -eq 0 ] || { echo "FAIL: double-array exp wrongly vectorized (single-only path)"; rc=1; }
 echo "exp dbl ON  : cvtps2dq=0 (double array correctly declined)"
 
+# ---- softmax shape exp(b[i]-m) : m a loop-invariant scalar -> vectorizes ----
+# The max-subtraction argument is not a bare array element, so the plain exp
+# recognizer would decline it; the extended recognizer subtracts a broadcast m
+# per lane before the packed expf (still cvtps2dq + polynomial mulps).
+cat > "$tmp/ksm.pp" <<'EOF'
+program ksm;
+{$mode objfpc}{$H+}
+type TS = array of single;
+procedure act(a,b: TS; m: single);
+var i: longint;
+begin for i:=0 to high(a) do a[i]:=exp(b[i]-m); end;
+var a,b: TS;
+begin SetLength(a,64); SetLength(b,64); act(a,b,3.0); Writeln(a[0]:0:3); end.
+EOF
+compile ksm.pp -O4 -OoAPPROXTRANS -Cfsse64
+smf="$tmp/ksm.s"
+sm_cvt=$(cnt 'cvtps2dq' "$smf"); sm_mul=$(cnt '(^|[^v])mulps' "$smf")
+echo "softmax ON  : cvtps2dq=$sm_cvt (>=1)  mulps=$sm_mul (>=4, polynomial)"
+[ "$sm_cvt" -ge 1 ] || { echo "FAIL: softmax exp(b[i]-m) not vectorized with -OoAPPROXTRANS"; rc=1; }
+[ "$sm_mul" -ge 4 ] || { echo "FAIL: softmax polynomial absent (mulps<4)"; rc=1; }
+
+# element-minus-element exp(b[i]-c[i]) is NOT softmax (c[i] not a scalar) -> decline
+cat > "$tmp/ksmee.pp" <<'EOF'
+program ksmee;
+{$mode objfpc}{$H+}
+type TS = array of single;
+procedure act(a,b,c: TS);
+var i: longint;
+begin for i:=0 to high(a) do a[i]:=exp(b[i]-c[i]); end;
+var a,b,c: TS;
+begin SetLength(a,64); SetLength(b,64); SetLength(c,64); act(a,b,c); Writeln(a[0]:0:3); end.
+EOF
+compile ksmee.pp -O4 -OoAPPROXTRANS -Cfsse64
+[ "$(cnt 'cvtps2dq' "$tmp/ksmee.s")" -eq 0 ] || { echo "FAIL: exp(b[i]-c[i]) wrongly vectorized (right operand is not a loop-invariant scalar)"; rc=1; }
+echo "softmax ee  : cvtps2dq=0 (element-minus-element correctly declined)"
+
+# scalar-minus-element exp(m-b[i]) is NOT softmax (left must be the element) -> decline
+cat > "$tmp/ksmse.pp" <<'EOF'
+program ksmse;
+{$mode objfpc}{$H+}
+type TS = array of single;
+procedure act(a,b: TS; m: single);
+var i: longint;
+begin for i:=0 to high(a) do a[i]:=exp(m-b[i]); end;
+var a,b: TS;
+begin SetLength(a,64); SetLength(b,64); act(a,b,3.0); Writeln(a[0]:0:3); end.
+EOF
+compile ksmse.pp -O4 -OoAPPROXTRANS -Cfsse64
+[ "$(cnt 'cvtps2dq' "$tmp/ksmse.s")" -eq 0 ] || { echo "FAIL: exp(m-b[i]) wrongly vectorized (left operand is not the array element)"; rc=1; }
+echo "softmax se  : cvtps2dq=0 (scalar-minus-element correctly declined)"
+
 # ---- AVX2 256-bit ymm path (-OoVECT256 on an AVX2 fputype) ----
 # The inline packed expf widens to 256-bit ymm ONLY when -OoVECT256 is requested
 # AND the fputype has an AVX2 unit: the 2^n exponent build (vpaddd + vpslld) is an

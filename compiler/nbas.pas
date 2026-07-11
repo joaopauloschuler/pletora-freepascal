@@ -480,6 +480,9 @@ interface
             single-precision transcendental f (exp/tanh/sigmoid), lowered to an
             inline SSE/AVX minimax polynomial. a=dest window, b=source window. }
           constructor create_transc(a,b : tnode; _func : ttranscfunc; _vecwidth : longint);
+          { softmax variant  a[i] := exp(b[i]-m): bias is the pre-broadcast [m,..]
+            slot, subtracted from the b[i] window before the packed expf. }
+          constructor create_transc_bias(a,b,bias : tnode; _func : ttranscfunc; _vecwidth : longint);
           { reduction (single/double-precision sum / dot product): a packed
             accumulator slot is initialised with the incoming scalar in lane 0,
             accumulated VL-wide across the loop, then horizontally summed back into
@@ -709,6 +712,20 @@ implementation
     constructor tvectoropnode.create_transc(a,b : tnode; _func : ttranscfunc; _vecwidth : longint);
       begin
         inherited create(vectoropn,a,b,nil);
+        op:=OP_NONE;
+        vecwidth:=_vecwidth;
+        kind:=vok_transc;
+        scalarleft:=false;
+        isdouble:=false;   { approximate transcendentals are single-precision only }
+        transfunc:=_func;
+      end;
+
+
+    constructor tvectoropnode.create_transc_bias(a,b,bias : tnode; _func : ttranscfunc; _vecwidth : longint);
+      begin
+        { softmax shape  a[i] := exp(b[i]-m):  the third operand is the pre-broadcast
+          [m,m,..] slot the body subtracts from b[i] before the packed expf. }
+        inherited create(vectoropn,a,b,bias);
         op:=OP_NONE;
         vecwidth:=_vecwidth;
         kind:=vok_transc;
