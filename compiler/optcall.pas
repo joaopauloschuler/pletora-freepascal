@@ -343,6 +343,7 @@ unit optcall;
         inlineblock,
         inlinecleanupblock : tblocknode;
         callnode: tcallnode;
+        inlinemeasured, inlinebudget : cardinal;
       begin
         result:=fen_false;
         { po_inline marks the ordinary inline routines; cnf_do_inline additionally
@@ -365,6 +366,15 @@ unit optcall;
                   Message2(cg_n_no_inline,
                     tprocdef(callnode.procdefinition).customprocname([pno_proctypeoption, pno_paranames,pno_ownername, pno_noclassmarker, pno_prettynames]),
                     ' ('+tprocdef(callnode.procdefinition).inlinenoreason+')')
+                { FPC Unleashed (Task F): when the routine is otherwise inlinable
+                  but its body exceeds the node-count size cap, spell out the
+                  measured node count and the effective budget so the user sees
+                  how far over budget it is rather than just "not inlined". }
+                else if callnode.inline_size_over_budget(inlinemeasured,inlinebudget) then
+                  Message2(cg_n_no_inline,
+                    tprocdef(callnode.procdefinition).customprocname([pno_proctypeoption, pno_paranames,pno_ownername, pno_noclassmarker, pno_prettynames]),
+                    ' (body node count '+tostr(inlinemeasured)+
+                    ' exceeds inlining budget '+tostr(inlinebudget)+')')
                 else
                   Message2(cg_n_no_inline,
                     tprocdef(callnode.procdefinition).customprocname([pno_proctypeoption, pno_paranames,pno_ownername, pno_noclassmarker, pno_prettynames]),

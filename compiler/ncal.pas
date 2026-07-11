@@ -122,6 +122,12 @@ interface
           function  optimize_funcret_assignment(inlineblock: tblocknode): tnode;
           procedure check_inlining;
           function doinlining: boolean;
+          { diagnostic: true when the ONLY thing keeping this (po_inline, has
+            inlininginfo) call out of line is the node-count size cap; returns
+            the measured body node count and the effective budget (both depend
+            on inlinelevel) so the call-site note can show how far over budget
+            the routine is. }
+          function inline_size_over_budget(out measured, budget: cardinal): boolean;
           procedure order_parameters;
        protected
           pushedparasize : longint;
@@ -5134,6 +5140,27 @@ implementation
           (procdefinition.typ=procdef) and
           ((pio_inline_not_possible in tprocdef(procdefinition).implprocoptions) or
            not(cnf_do_inline in callnodeflags)))
+      end;
+
+
+    function tcallnode.inline_size_over_budget(out measured, budget: cardinal): boolean;
+      var
+        limExcluding: cardinal;
+      begin
+        measured:=0;
+        budget:=0;
+        result:=false;
+        if (procdefinition.typ<>procdef) or
+           not tprocdef(procdefinition).has_inlininginfo or
+           not assigned(tprocdef(procdefinition).inlininginfo^.code) then
+          exit;
+        { same budget formula as heuristics_favors_inlining }
+        limExcluding:=round(exp((1.0/(inlinelevel/3.0+1))*ln(10000)));
+        budget:=limExcluding;
+        { count the WHOLE body (no early cap) so the note can show the real
+          overage rather than just the clamped budget value }
+        measured:=node_count(tprocdef(procdefinition).inlininginfo^.code);
+        result:=measured>=limExcluding;
       end;
 
 
