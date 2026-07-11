@@ -944,6 +944,12 @@ interface
           { block-scoped symtables for inline vars; only needed while
             compiling the current unit, so they are not persisted in ppu }
           blocklocalsymtables : tfpobjectlist;
+          { FPC Unleashed: when checknodeinlining refuses to keep inlining
+            info for a routine marked `inline`, the human-readable reason is
+            stashed here so the call-site "is not inlined" note (cg_n_no_inline)
+            can tell the user WHY. Transient: only meaningful for routines
+            defined in the currently-compiled unit, hence not persisted in ppu. }
+          inlinenoreason : ansistring;
           funcretsym : tsym;
           funcretsymderef : tderef;
           struct : tabstractrecorddef;

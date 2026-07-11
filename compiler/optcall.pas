@@ -59,6 +59,17 @@ unit optcall;
       end;
 
 
+    { FPC Unleashed: flag asm blocks in an inlined body copy so tcgasmnode
+      relabels their local asm labels for this call site }
+    function mark_inline_asm_copy(var n : tnode; arg : pointer) : foreachnoderesult;
+      begin
+        result:=fen_false;
+        if (n.nodetype=asmn) and
+           not(asmnf_get_asm_position in tasmnode(n).asmnodeflags) then
+          include(tasmnode(n).asmnodeflags,asmnf_inline_copy);
+      end;
+
+
     function setinlinelevel(var n:tnode; arg:pointer):foreachnoderesult;
       begin
         if n.nodetype=calln then
@@ -133,7 +144,18 @@ unit optcall;
         if not(callnode.doinlining) then
           begin
             if not(po_compilerproc in callnode.procdefinition.procoptions) then
-              Message1(cg_n_no_inline,tprocdef(callnode.procdefinition).customprocname([pno_proctypeoption, pno_paranames,pno_ownername, pno_noclassmarker, pno_prettynames]));
+              begin
+                { FPC Unleashed: append the refusal reason when it is known
+                  (routine defined in the current unit); see tprocdef.inlinenoreason }
+                if tprocdef(callnode.procdefinition).inlinenoreason<>'' then
+                  Message2(cg_n_no_inline,
+                    tprocdef(callnode.procdefinition).customprocname([pno_proctypeoption, pno_paranames,pno_ownername, pno_noclassmarker, pno_prettynames]),
+                    ' ('+tprocdef(callnode.procdefinition).inlinenoreason+')')
+                else
+                  Message2(cg_n_no_inline,
+                    tprocdef(callnode.procdefinition).customprocname([pno_proctypeoption, pno_paranames,pno_ownername, pno_noclassmarker, pno_prettynames]),
+                    '');
+              end;
             exit;
           end;
 
@@ -163,6 +185,11 @@ unit optcall;
 
         { create a copy of the body and replace parameter loads with the parameter values }
         body:=tprocdef(callnode.procdefinition).inlininginfo^.code.getcopy;
+        { FPC Unleashed: mark any asm blocks in the spliced copy so tcgasmnode
+          uniques their local labels at this call site (the enclosing routine is
+          not necessarily po_inline). checknodeinlining has already guaranteed
+          the blocks reference no local/parameter operands. }
+        foreachnodestatic(pm_postprocess,body,@mark_inline_asm_copy,nil);
         foreachnodestatic(pm_postprocess,body,@ removeusercodeflag,nil);
         foreachnodestatic(pm_postprocess,body,@importglobalsyms,nil);
         foreachnodestatic(pm_postprocess,body,@setinlinelevel,pointer(callnode.inlinelevel+1));

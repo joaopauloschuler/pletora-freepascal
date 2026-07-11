@@ -2960,10 +2960,11 @@ cg_e_function_not_support_by_selected_instruction_set=06056_E_The function used,
 cg_f_max_units_reached=06057_F_Maximum number of units ($1) reached for the current target
 % Depending of target architecture, the number of units is limited. This limit
 % has been reached. A unit counts only if it contains initialization or finalization count.
-cg_n_no_inline=06058_N_Call to subroutine "$1" marked as inline is not inlined
+cg_n_no_inline=06058_N_Call to subroutine "$1" marked as inline is not inlined$2
 % The directive inline is only a hint to the compiler. Sometimes the compiler ignores this hint, a subroutine
-% marked as inline is not inlined. In this case, this hint is given. Compiling with \var{-vd} might result in more information why
-% the directive inline is ignored.
+% marked as inline is not inlined. In this case, this hint is given. When the routine is defined in the unit
+% currently being compiled, the reason why it could not be inlined is appended in parentheses; otherwise
+% compiling with \var{-vd} might result in more information why the directive inline is ignored.
 cg_e_case_missing_value=06059_E_Case statement does not handle ordinal value "$1", and no else/otherwise statement is present.
 # The case statement does not handle the specified value and does not have an else/otherwise statement, and the compiler determined
 # that this value can be passed to the case statement. This is a compile-time error in ISO and Extended Pascal.

@@ -115,7 +115,13 @@ interface
        TAsmNodeFlag = (
          asmnf_get_asm_position,
          { Used registers in assembler block }
-         asmnf_has_registerlist
+         asmnf_has_registerlist,
+         { FPC Unleashed: this asm node is a copy spliced into a caller by the
+           inliner (see optcall.mark_inline_asm_copy). Forces tcgasmnode to take
+           the label-uniquing/copy path even though the enclosing routine is not
+           itself marked po_inline, so local asm labels stay unique across the
+           multiple call sites the inline body is expanded into. }
+         asmnf_inline_copy
        );
 
        TAsmNodeFlags = set of TAsmNodeFlag;

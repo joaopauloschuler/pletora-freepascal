@@ -200,11 +200,72 @@ implementation
        {$endif}
        ;
 
+    { FPC Unleashed helpers: decide whether the asm STATEMENT blocks in an
+      inline routine's body can be spliced into a caller.  An asm block is
+      "inline-safe" when none of its operands reference a local variable,
+      parameter or the function result -- those show up as top_local operands
+      (resolved through tabstractnormalvarsym.localloc at codegen) or, for the
+      TP-style INLINE() form, as ait_const entries whose symbol is still an
+      unresolved AB_NONE local placeholder.  Only registers, immediates and
+      global symbols survive verbatim relocation into another frame. }
+    { returns '' when the block is inline-safe, otherwise the reason it is not }
+    function inline_asm_block_reason(p_asm: TAsmList): string;
+      var
+        hp : tai;
+        i  : longint;
+      begin
+        result:='';
+        if not assigned(p_asm) then
+          exit;
+        hp:=tai(p_asm.first);
+        while assigned(hp) do
+          begin
+            case hp.typ of
+              ait_instruction :
+                for i:=0 to tai_cpu_abstract(hp).ops-1 do
+                  if tai_cpu_abstract(hp).oper[i]^.typ=top_local then
+                    exit('assembler block referencing a local variable, parameter or function result');
+              ait_const :
+                if assigned(tai_const(hp).sym) and
+                   (tai_const(hp).sym.bind=AB_NONE) then
+                  exit('assembler block referencing a local variable, parameter or function result');
+              ait_label :
+                { local asm labels are not yet uniqued per inline site }
+                if assigned(tai_label(hp).labsym) and (tai_label(hp).labsym.bind=AB_LOCAL) then
+                  exit('assembler block defining a label');
+              else
+                ;
+            end;
+            hp:=tai(hp.next);
+          end;
+      end;
+
+    function inline_asm_uses_local(var n: tnode; arg: pointer): foreachnoderesult;
+      var
+        reason : string;
+      begin
+        result:=fen_false;
+        if (n.nodetype=asmn) and
+           not(asmnf_get_asm_position in tasmnode(n).asmnodeflags) then
+          begin
+            reason:=inline_asm_block_reason(tasmnode(n).p_asm);
+            if reason<>'' then
+              begin
+                pshortstring(arg)^:=reason;
+                result:=fen_norecurse_true;
+              end;
+          end;
+      end;
+
+
     function checknodeinlining(procdef: tprocdef): boolean;
 
       procedure _no_inline(const reason: TMsgStr);
         begin
           include(procdef.implprocoptions,pio_inline_not_possible);
+          { stash the reason so the call-site cg_n_no_inline note can report it
+            (for same-unit callers); see tprocdef.inlinenoreason }
+          procdef.inlinenoreason:=reason;
           Message1(parser_n_not_supported_for_inline,reason);
           Message(parser_h_inlining_disabled);
         end;
@@ -212,6 +273,7 @@ implementation
       var
         i : integer;
         currpara : tparavarsym;
+        asmreason : shortstring;
       begin
         result := false;
         { this code will never be used (only specialisations can be inlined),
@@ -219,10 +281,40 @@ implementation
           ppu file }
         if df_generic in current_procinfo.procdef.defoptions then
           exit;
-        if pi_has_assembler_block in current_procinfo.flags then
+        { A pure `assembler;` routine gets its parameters, result and (for
+          get_pc_addr-style helpers) return address through the ABI calling
+          convention -- the asm body reads bare ABI registers / the return slot,
+          none of which exist once the routine is spliced without a call. Such
+          routines must NEVER be node-inlined, so keep the historical refusal. }
+        if pi_is_assembler in current_procinfo.flags then
           begin
-            _no_inline('assembler');
-            exit;
+            if pi_has_assembler_block in current_procinfo.flags then
+              begin
+                _no_inline('assembler');
+                exit;
+              end;
+          end
+        else if pi_has_assembler_block in current_procinfo.flags then
+          begin
+            { FPC Unleashed: inner `asm ... end` STATEMENT blocks used to block
+              inlining unconditionally. We now allow inlining as long as no asm
+              operand references a local variable, parameter or the function
+              result (top_local operands / TP-style INLINE ait_const refs):
+              such a block only touches registers, immediates and global symbols,
+              so it can be spliced verbatim into the caller (labels are made
+              unique at the inline site via asmnf_inline_copy). Operands that
+              reference locals/params would need those locals to be materialised
+              in the caller's frame before tcgasmnode.ResolveRef can bind them,
+              which is not yet implemented -- refuse those with a precise reason. }
+            asmreason:='';
+            if assigned(tcgprocinfo(current_procinfo).code) then
+              foreachnodestatic(tcgprocinfo(current_procinfo).code,
+                @inline_asm_uses_local,@asmreason);
+            if asmreason<>'' then
+              begin
+                _no_inline(asmreason);
+                exit;
+              end;
           end;
         if (pi_has_global_goto in current_procinfo.flags) or
            (pi_has_interproclabel in current_procinfo.flags) then
