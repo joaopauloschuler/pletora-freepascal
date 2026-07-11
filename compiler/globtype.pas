@@ -876,7 +876,25 @@ interface
            loop. The stronger pure/const bits stay authoritative where set.
            Opt-in (-OoMODREF); NOT part of the -O4 defaults -- a wrong summary is
            a miscompile }
-         cs_opt_modref
+         cs_opt_modref,
+         { vectorized APPROXIMATE transcendentals (-OoAPPROXTRANS): an element-wise
+           single-precision activation loop whose body is  a[i] := exp(b[i]) ,
+           a[i] := tanh(b[i])  or the sigmoid shape  a[i] := 1/(1+exp(-b[i]))  over
+           simple non-aliased dynamic arrays of single is recognized by the
+           OoVECTORIZE recognizer and lowered -- instead of a per-element opaque
+           libm/RTL scalar call the loop vectorizer cannot widen across -- to an
+           inlined 128-bit SSE/AVX minimax polynomial (a Cephes-style vectorized
+           expf: range-reduce n=round(x*log2e), a degree-5 polynomial on the
+           remainder, scale by 2^n via integer exponent-field insertion; tanh and
+           sigmoid are derived from that expf), so a whole register lane computes
+           at once.  This is an APPROXIMATE math transform -- the packed result is
+           NOT bit-identical to the scalar libm call (worst-case ~1e-6 abs/rel over
+           the practical range) and out-of-range/NaN inputs are clamped rather than
+           trapped -- so, exactly like -OoFASTMATH, it is a deliberate opt-in and
+           breaks strict-IEEE determinism.  Single precision only; the scalar
+           remainder tail keeps the exact RTL call (documented contract).  Opt-in
+           (-OoAPPROXTRANS); NOT part of the -O4 defaults }
+         cs_opt_approxtrans
        );
        toptimizerswitches = set of toptimizerswitch;
 
@@ -957,7 +975,8 @@ interface
          'SINK','STOREMOTION','VRP','REFELIDE','SWITCHTABLE','REE',
          'SHRINKWRAP','GVNPRE','PURE','PARTIALINLINE','STACKALLOC','SLP',
          'UNROLLDYN','PREFETCH','ICF','IPARA','FINALVALUE','SIBCALL',
-         'REPORT','DEVIRT','IPACP','VECT256','CONSTEVAL','MODREF'
+         'REPORT','DEVIRT','IPACP','VECT256','CONSTEVAL','MODREF',
+         'APPROXTRANS'
        );
        WPOptimizerSwitchStr : array [twpoptimizerswitch] of string[14] = (
          'DEVIRTCALLS','OPTVMTS','SYMBOLLIVENESS'

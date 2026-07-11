@@ -26,7 +26,8 @@ unit nx86inl;
 interface
 
     uses
-       node,nbas,ninl,ncginl;
+       node,nbas,ninl,ncginl,
+       aasmbase,aasmdata,cgbase,cgutils;
 
     type
        { x86 code generation for the autovectorizer body node: emit VL packed
@@ -34,6 +35,14 @@ interface
          AVX v-forms when the fputype has an AVX unit). }
        tx86vectoropnode = class(tvectoropnode)
           procedure pass_generate_code;override;
+        private
+          { -OoAPPROXTRANS helpers: materialize a broadcast packed-single constant
+            (the 32-bit pattern replicated across all vecwidth lanes) in rodata and
+            return a reference to it; emit the inline Cephes-style approximate expf
+            over a packed register (transforms xreg in place). }
+          function transc_splat_ref(bits : longint) : treference;
+          function transc_fsplat_ref(v : single) : treference;
+          procedure emit_vec_expf(list : TAsmList; xreg : tregister; avx : boolean; mmsz : tcgsize);
        end;
 
        tx86inlinenode = class(tcginlinenode)
@@ -100,20 +109,183 @@ implementation
       globtype,globals,
       verbose,compinnr,fmodule,
       defutil,
-      aasmbase,aasmdata,aasmcpu,
+      aasmtai,aasmcpu,
       symconst,symtype,symdef,symcpu,
       ncnv,
       htypechk,
-      cgbase,pass_1,pass_2,
+      pass_1,pass_2,
       cpuinfo,cpubase,nutils,
       ncal,ncgutil,nld,ncon,nadd,nmat,constexp,
       tgobj,
-      cga,cgutils,cgx86,cgobj,hlcgobj,cutils;
+      cga,cgx86,cgobj,hlcgobj,cutils;
 
 
 {*****************************************************************************
                              TX86VECTOROPNODE
 *****************************************************************************}
+
+    function tx86vectoropnode.transc_splat_ref(bits : longint) : treference;
+      { emit a 16-byte rodata block holding the 32-bit pattern `bits` replicated
+        across all vecwidth single lanes, and return a symbol reference to it.
+        Used to broadcast an -OoAPPROXTRANS polynomial/range-reduction constant so
+        a packed op applies the identical value in every lane. }
+      var
+        l : tasmlabel;
+        i : longint;
+      begin
+        current_asmdata.getdatalabel(l);
+        new_section(current_asmdata.asmlists[al_typedconsts],sec_rodata_norel,l.name,const_align(16));
+        current_asmdata.asmlists[al_typedconsts].concat(Tai_label.Create(l));
+        for i:=1 to vecwidth do
+          current_asmdata.asmlists[al_typedconsts].concat(tai_const.create_32bit(bits));
+        reference_reset_symbol(result,l,0,const_align(16),[]);
+      end;
+
+
+    function tx86vectoropnode.transc_fsplat_ref(v : single) : treference;
+      { same, for a single-precision float constant (reinterpreted to its 32-bit
+        IEEE-754 pattern) }
+      var
+        s : single;
+      begin
+        s:=v;
+        result:=transc_splat_ref(plongint(@s)^);
+      end;
+
+
+    procedure tx86vectoropnode.emit_vec_expf(list : TAsmList; xreg : tregister; avx : boolean; mmsz : tcgsize);
+      { Transform the packed-single register xreg in place from x to an
+        approximate exp(x), inlined as the classic Cephes single-precision expf
+        (the sse_mathfun.h form): clamp x to the finite range, range-reduce
+        n:=round(x*log2e) via cvtps2dq (round-to-nearest, no branch), evaluate a
+        degree-5 minimax polynomial on the remainder r=x-n*ln2 (ln2 split into a
+        hi+lo pair for accuracy), and scale by 2^n built by inserting n+127 into
+        the IEEE exponent field (paddd + pslld 23).  SSE2-only integer/convert
+        ops (with AVX VEX v-forms when available), so it runs at the x86_64
+        baseline fputype.  Worst-case error over [-87,88] is ~1 ulp / <1e-6
+        relative vs libm expf; inputs outside [exp_lo,exp_hi] (incl. +-Inf) are
+        clamped so the result saturates to ~0 / ~FLT_MAX and never traps; a NaN
+        lane yields an unspecified finite value (never a trap). }
+      const
+        LOG2EF =  1.44269504088896341;
+        { clamp so the reduced exponent n = round(x*log2e) stays within
+          [-126, 127] -- i.e. n+127 is always a VALID NORMAL IEEE-754 single
+          exponent field [1, 254].  This is deliberately a hair tighter than the
+          Cephes exp_lo (-88.376): with round-to-nearest (cvtps2dq) an input near
+          -88.37 rounds n to -128, whose +127 biased field (-1) would build a
+          bogus Inf/NaN 2^n and, since FPC leaves the SSE overflow exception
+          UNMASKED, raise EOverflow.  Clamping x to [-87.3365, 88.3762] keeps
+          2^n normal (min output ~1.18e-38, max ~2.6e38 < FLT_MAX), so inputs
+          outside the range (incl. +-Inf) saturate to ~0 / ~FLT_MAX and never
+          trap. }
+        EXP_HI =  88.3762626647949;
+        EXP_LO = -87.3365478515625;    { = -126/log2e, the smallest-normal edge }
+        C1     =  0.693359375;        { ln2 hi part }
+        C2     = -2.12194440e-4;      { ln2 lo part }
+        P0     =  1.9875691500E-4;
+        P1     =  1.3981999507E-3;
+        P2     =  8.3334519073E-3;
+        P3     =  4.1665795894E-2;
+        P4     =  1.6666665459E-1;
+        P5     =  5.0000001201E-1;
+      var
+        fx, y, z, tmp, ni : tregister;
+
+        procedure op2r(sseop,avxop : tasmop; src,dst : tregister);   { dst := dst OP src }
+        begin
+          if avx then
+            list.concat(taicpu.op_reg_reg_reg(avxop,S_NO,src,dst,dst))
+          else
+            list.concat(taicpu.op_reg_reg(sseop,S_NO,src,dst));
+        end;
+
+        procedure op2m(sseop,avxop : tasmop; const href : treference; dst : tregister);  { dst := dst OP [mem] }
+        begin
+          if avx then
+            list.concat(taicpu.op_ref_reg_reg(avxop,S_NO,href,dst,dst))
+          else
+            list.concat(taicpu.op_ref_reg(sseop,S_NO,href,dst));
+        end;
+
+        procedure movr(src,dst : tregister);   { dst := src }
+        begin
+          if avx then
+            list.concat(taicpu.op_reg_reg(A_VMOVAPS,S_NO,src,dst))
+          else
+            list.concat(taicpu.op_reg_reg(A_MOVAPS,S_NO,src,dst));
+        end;
+
+        procedure ldm(const href : treference; dst : tregister);   { dst := [mem] }
+        begin
+          if avx then
+            list.concat(taicpu.op_ref_reg(A_VMOVAPS,S_NO,href,dst))
+          else
+            list.concat(taicpu.op_ref_reg(A_MOVAPS,S_NO,href,dst));
+        end;
+
+        procedure cvt(sseop,avxop : tasmop; src,dst : tregister);   { 2-operand convert }
+        begin
+          if avx then
+            list.concat(taicpu.op_reg_reg(avxop,S_NO,src,dst))
+          else
+            list.concat(taicpu.op_reg_reg(sseop,S_NO,src,dst));
+        end;
+
+      begin
+        fx:=cg.getmmregister(list,mmsz);
+        y:=cg.getmmregister(list,mmsz);
+        z:=cg.getmmregister(list,mmsz);
+        tmp:=cg.getmmregister(list,mmsz);
+        ni:=cg.getmmregister(list,mmsz);
+
+        { clamp x into [EXP_LO, EXP_HI] so the exponent build cannot overflow the
+          IEEE field and +-Inf/large inputs saturate instead of producing Inf/NaN }
+        op2m(A_MINPS,A_VMINPS,transc_fsplat_ref(EXP_HI),xreg);
+        op2m(A_MAXPS,A_VMAXPS,transc_fsplat_ref(EXP_LO),xreg);
+
+        { fx := round(x * log2e)   (cvtps2dq uses the default round-to-nearest) }
+        movr(xreg,fx);
+        op2m(A_MULPS,A_VMULPS,transc_fsplat_ref(LOG2EF),fx);
+        cvt(A_CVTPS2DQ,A_VCVTPS2DQ,fx,ni);   { ni := (int) round(fx) }
+        cvt(A_CVTDQ2PS,A_VCVTDQ2PS,ni,fx);   { fx := (float) n }
+
+        { r := x - n*ln2   (ln2 = C1 + C2, subtracted in two steps for accuracy) }
+        movr(fx,tmp);
+        op2m(A_MULPS,A_VMULPS,transc_fsplat_ref(C1),tmp);
+        op2r(A_SUBPS,A_VSUBPS,tmp,xreg);     { x := x - fx*C1 }
+        movr(fx,tmp);
+        op2m(A_MULPS,A_VMULPS,transc_fsplat_ref(C2),tmp);
+        op2r(A_SUBPS,A_VSUBPS,tmp,xreg);     { x := x - fx*C2 ; xreg now holds r }
+
+        { z := r*r }
+        movr(xreg,z);
+        op2r(A_MULPS,A_VMULPS,z,z);
+
+        { y := (((((P0*r+P1)*r+P2)*r+P3)*r+P4)*r+P5) }
+        ldm(transc_fsplat_ref(P0),y);
+        op2r(A_MULPS,A_VMULPS,xreg,y); op2m(A_ADDPS,A_VADDPS,transc_fsplat_ref(P1),y);
+        op2r(A_MULPS,A_VMULPS,xreg,y); op2m(A_ADDPS,A_VADDPS,transc_fsplat_ref(P2),y);
+        op2r(A_MULPS,A_VMULPS,xreg,y); op2m(A_ADDPS,A_VADDPS,transc_fsplat_ref(P3),y);
+        op2r(A_MULPS,A_VMULPS,xreg,y); op2m(A_ADDPS,A_VADDPS,transc_fsplat_ref(P4),y);
+        op2r(A_MULPS,A_VMULPS,xreg,y); op2m(A_ADDPS,A_VADDPS,transc_fsplat_ref(P5),y);
+
+        { y := y*z + r + 1.0 }
+        op2r(A_MULPS,A_VMULPS,z,y);
+        op2r(A_ADDPS,A_VADDPS,xreg,y);
+        op2m(A_ADDPS,A_VADDPS,transc_fsplat_ref(1.0),y);
+
+        { pow2n := 2^n  (ni := (n + 127) << 23, reinterpreted as float) }
+        op2m(A_PADDD,A_VPADDD,transc_splat_ref(127),ni);
+        if avx then
+          list.concat(taicpu.op_const_reg_reg(A_VPSLLD,S_NO,23,ni,ni))
+        else
+          list.concat(taicpu.op_const_reg(A_PSLLD,S_NO,23,ni));
+
+        { result := y * 2^n, left in xreg for the caller to store }
+        op2r(A_MULPS,A_VMULPS,ni,y);
+        movr(y,xreg);
+      end;
+
 
     procedure tx86vectoropnode.pass_generate_code;
       { Emit one packed 128-bit single-precision element-wise step. The exact
@@ -400,6 +572,90 @@ implementation
             refsplat:=left.location.reference;
             tcgx86(cg).make_simple_ref(current_asmdata.CurrAsmList,refsplat);
             current_asmdata.CurrAsmList.concat(taicpu.op_reg_ref(movop,S_NO,regs,refsplat));
+            location_reset(location,LOC_VOID,OS_NO);
+            exit;
+          end;
+
+        { --- approximate transcendental: a[i..i+VL-1] := f(b[i..i+VL-1]) ---
+          exp is emitted inline (emit_vec_expf); sigmoid and tanh are built on it:
+            sigmoid(x) = 1/(1+exp(-x))
+            tanh(x)    = 2/(1+exp(-2x)) - 1  = 2*sigmoid(2x) - 1
+          so the source window is first scaled (by -1 for sigmoid, -2 for tanh) to
+          feed exp(-x) / exp(-2x), and the reciprocal is a packed divps (accurate,
+          not an rcpps approximation). Single precision, 128-bit only. }
+        if kind=vok_transc then
+          begin
+            { load b[i..i+VL-1] into regb }
+            secondpass(right);
+            if not (right.location.loc in [LOC_REFERENCE,LOC_CREFERENCE]) then
+              internalerror(2026071101);
+            refb:=right.location.reference;
+            tcgx86(cg).make_simple_ref(current_asmdata.CurrAsmList,refb);
+            regb:=cg.getmmregister(current_asmdata.CurrAsmList,mmsize);
+            current_asmdata.CurrAsmList.concat(taicpu.op_ref_reg(movop,S_NO,refb,regb));
+
+            case transfunc of
+              tf_exp:
+                begin
+                  emit_vec_expf(current_asmdata.CurrAsmList,regb,avx,mmsize);
+                  resreg:=regb;
+                end;
+              tf_sigmoid,tf_tanh:
+                begin
+                  { regb := scale*x   (scale = -1 for sigmoid, -2 for tanh) }
+                  if transfunc=tf_tanh then
+                    refc:=transc_fsplat_ref(-2.0)
+                  else
+                    refc:=transc_fsplat_ref(-1.0);
+                  if avx then
+                    current_asmdata.CurrAsmList.concat(taicpu.op_ref_reg_reg(A_VMULPS,S_NO,refc,regb,regb))
+                  else
+                    current_asmdata.CurrAsmList.concat(taicpu.op_ref_reg(A_MULPS,S_NO,refc,regb));
+                  { regb := exp(scale*x) }
+                  emit_vec_expf(current_asmdata.CurrAsmList,regb,avx,mmsize);
+                  { regb := 1 + regb  (denominator) }
+                  refc:=transc_fsplat_ref(1.0);
+                  if avx then
+                    current_asmdata.CurrAsmList.concat(taicpu.op_ref_reg_reg(A_VADDPS,S_NO,refc,regb,regb))
+                  else
+                    current_asmdata.CurrAsmList.concat(taicpu.op_ref_reg(A_ADDPS,S_NO,refc,regb));
+                  { regc := numerator (1 for sigmoid, 2 for tanh) }
+                  regc:=cg.getmmregister(current_asmdata.CurrAsmList,mmsize);
+                  if transfunc=tf_tanh then
+                    refc:=transc_fsplat_ref(2.0)
+                  else
+                    refc:=transc_fsplat_ref(1.0);
+                  if avx then
+                    current_asmdata.CurrAsmList.concat(taicpu.op_ref_reg(A_VMOVAPS,S_NO,refc,regc))
+                  else
+                    current_asmdata.CurrAsmList.concat(taicpu.op_ref_reg(A_MOVAPS,S_NO,refc,regc));
+                  { regc := regc / (1+e) }
+                  if avx then
+                    current_asmdata.CurrAsmList.concat(taicpu.op_reg_reg_reg(A_VDIVPS,S_NO,regb,regc,regc))
+                  else
+                    current_asmdata.CurrAsmList.concat(taicpu.op_reg_reg(A_DIVPS,S_NO,regb,regc));
+                  { tanh: regc := regc - 1 }
+                  if transfunc=tf_tanh then
+                    begin
+                      refc:=transc_fsplat_ref(1.0);
+                      if avx then
+                        current_asmdata.CurrAsmList.concat(taicpu.op_ref_reg_reg(A_VSUBPS,S_NO,refc,regc,regc))
+                      else
+                        current_asmdata.CurrAsmList.concat(taicpu.op_ref_reg(A_SUBPS,S_NO,refc,regc));
+                    end;
+                  resreg:=regc;
+                end;
+              else
+                internalerror(2026071102);
+            end;
+
+            { store resreg to a[i..i+VL-1] }
+            secondpass(left);
+            if not (left.location.loc in [LOC_REFERENCE,LOC_CREFERENCE]) then
+              internalerror(2026071103);
+            refa:=left.location.reference;
+            tcgx86(cg).make_simple_ref(current_asmdata.CurrAsmList,refa);
+            current_asmdata.CurrAsmList.concat(taicpu.op_reg_ref(movop,S_NO,resreg,refa));
             location_reset(location,LOC_VOID,OS_NO);
             exit;
           end;

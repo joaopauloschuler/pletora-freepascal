@@ -3453,6 +3453,8 @@ unit optloop;
         mmA_vec, mmB_vec : tvecnode;
         mmA_scalar, mmB_scalar : tnode;
         ismaxop : boolean;
+        { -OoAPPROXTRANS: which approximate transcendental the vok_transc body computes }
+        transfn : ttranscfunc;
         mminl : tinlinenode;
         splata, splatb : ttempcreatenode;
         windowa, windowb : tnode;
@@ -3466,6 +3468,162 @@ unit optloop;
           s:=rangeelim_skip_typeconv(x);
           red_is_acc:=assigned(s) and (s.nodetype=loadn) and
                       (tloadnode(s).symtableentry=tsym(accsym));
+        end;
+
+      { true if x, after peeling typeconv wrappers, is the floating-point
+        constant v (used to spot the 1.0 numerator/addend of a sigmoid shape) }
+      function fpconst_is(x : tnode; v : double) : boolean;
+        var s : tnode;
+        begin
+          s:=rangeelim_skip_typeconv(x);
+          fpconst_is:=assigned(s) and (s.nodetype=realconstn) and
+                      (trealconstnode(s).value_real=v);
+        end;
+
+      { -OoAPPROXTRANS: if n (a peeled RHS or sub-expression) is a call to the RTL
+        single-precision helper fpc_exp_real -- which the exp() inline node lowers
+        to in pass_1, BEFORE this loop pass runs -- return its argument value node
+        (peeled of typeconvs); otherwise nil.  This is how an exp() body is spotted
+        at the tree level the vectorizer sees. }
+      function exp_call_arg(n : tnode) : tnode;
+        var pn : tnode;
+        begin
+          exp_call_arg:=nil;
+          if not assigned(n) or (n.nodetype<>calln) then
+            exit;
+          if not assigned(tcallnode(n).procdefinition) or
+             not assigned(tprocdef(tcallnode(n).procdefinition).procsym) then
+            exit;
+          if upper(tprocdef(tcallnode(n).procdefinition).procsym.name)<>'FPC_EXP_REAL' then
+            exit;
+          pn:=tcallnode(n).left;
+          if not assigned(pn) or (pn.nodetype<>callparan) or
+             assigned(tcallparanode(pn).nextpara) then
+            exit;
+          exp_call_arg:=rangeelim_skip_typeconv(tcallparanode(pn).paravalue);
+        end;
+
+      { -OoAPPROXTRANS: if n is a one-argument call to the RTL math-unit routine
+        named rname (single->single overload), return its argument value node
+        (peeled of typeconvs); otherwise nil.  The owner-unit guard ('MATH')
+        avoids matching a user routine of the same name with other semantics.
+        Used for tanh(), which -- unlike exp() -- is an ordinary RTL function
+        call (no inline node) already present in the tree the vectorizer sees. }
+      function math_call_arg(n : tnode; const rname : string) : tnode;
+        var
+          pd : tprocdef;
+          pn : tnode;
+        begin
+          math_call_arg:=nil;
+          if not assigned(n) or (n.nodetype<>calln) then
+            exit;
+          pd:=tprocdef(tcallnode(n).procdefinition);
+          if not assigned(pd) or not assigned(pd.procsym) then
+            exit;
+          if upper(pd.procsym.name)<>rname then
+            exit;
+          if not assigned(pd.procsym.owner) or not assigned(pd.procsym.owner.name) or
+             (upper(pd.procsym.owner.name^)<>'MATH') then
+            exit;
+          if not assigned(pd.returndef) or not is_single(pd.returndef) then
+            exit;
+          pn:=tcallnode(n).left;
+          if not assigned(pn) or (pn.nodetype<>callparan) or
+             assigned(tcallparanode(pn).nextpara) then
+            exit;
+          math_call_arg:=rangeelim_skip_typeconv(tcallparanode(pn).paravalue);
+        end;
+
+      { -OoAPPROXTRANS: true if argn peels to  b[i]  (negate=false) or  -b[i]
+        (negate=true, accepting both a unary-minus and a 0-b[i] subtraction) where
+        b is a simple single-precision dynamic-array element of the loop counter;
+        on success bvec holds that element access. }
+      function elem_arg(argn : tnode; negate : boolean) : boolean;
+        var a : tnode;
+        begin
+          elem_arg:=false;
+          a:=rangeelim_skip_typeconv(argn);
+          if not assigned(a) then
+            exit;
+          if negate then
+            begin
+              if a.nodetype=unaryminusn then
+                a:=rangeelim_skip_typeconv(tunarynode(a).left)
+              else if (a.nodetype=subn) and fpconst_is(taddnode(a).left,0.0) then
+                a:=rangeelim_skip_typeconv(taddnode(a).right)
+              else
+                exit;
+            end;
+          if not assigned(a) or (vect_elem_reason(a,counter,bvec)<>'') then
+            exit;
+          if vect_elem_isdouble(bvec) then
+            exit;
+          elem_arg:=true;
+        end;
+
+      { -OoAPPROXTRANS: recognize an approximate single-precision transcendental
+        activation body and, on a full match, set vshape:=vok_transc, transfn and
+        bvec (the source array element) and return true.  Returns false (fall
+        through to the other RHS shapes) when the body is not one of these forms.
+        Recognized (exp() has already been lowered to an fpc_exp_real call):
+          exp:      a[i] := exp(b[i])
+          sigmoid:  a[i] := 1/(1+exp(-b[i])) }
+      function try_transc : boolean;
+        var
+          den, e1, e2, arg : tnode;
+        begin
+          try_transc:=false;
+          { approximate transcendentals are single-precision only }
+          if vecdouble or not assigned(rhs) then
+            exit;
+          { exp:  a[i] := exp(b[i]) }
+          arg:=exp_call_arg(rhs);
+          if assigned(arg) then
+            begin
+              if elem_arg(arg,false) then
+                begin
+                  transfn:=tf_exp;
+                  vshape:=vok_transc;
+                  try_transc:=true;
+                end;
+              exit;
+            end;
+          { tanh:  a[i] := tanh(b[i])  (RTL math-unit single overload) }
+          arg:=math_call_arg(rhs,'TANH');
+          if assigned(arg) then
+            begin
+              if elem_arg(arg,false) then
+                begin
+                  transfn:=tf_tanh;
+                  vshape:=vok_transc;
+                  try_transc:=true;
+                end;
+              exit;
+            end;
+          { sigmoid:  a[i] := 1/(1+exp(-b[i]))  ( slashn: 1.0 / (1.0 + exp(-b[i])) ) }
+          if rhs.nodetype=slashn then
+            begin
+              if not fpconst_is(taddnode(rhs).left,1.0) then
+                exit;
+              den:=rangeelim_skip_typeconv(taddnode(rhs).right);
+              if not assigned(den) or (den.nodetype<>addn) then
+                exit;
+              e1:=rangeelim_skip_typeconv(taddnode(den).left);
+              e2:=rangeelim_skip_typeconv(taddnode(den).right);
+              if fpconst_is(taddnode(den).left,1.0) then
+                arg:=exp_call_arg(e2)
+              else if fpconst_is(taddnode(den).right,1.0) then
+                arg:=exp_call_arg(e1)
+              else
+                exit;
+              if assigned(arg) and elem_arg(arg,true) then
+                begin
+                  transfn:=tf_sigmoid;
+                  vshape:=vok_transc;
+                  try_transc:=true;
+                end;
+              exit;
+            end;
         end;
 
       { Runs the full OptimizeVectorize recognizer over the current for-loop and
@@ -3527,6 +3685,7 @@ unit optloop;
           vecop:=OP_NONE;
           mmA_vec:=nil; mmB_vec:=nil; mmA_scalar:=nil; mmB_scalar:=nil;
           ismaxop:=false;
+          transfn:=tf_exp;
 
           { REDUCTION shape:  s := s + b[i]  (sum)  or  s := s + b[i]*c[i]  (dot
             product), recognized before the element-wise store shapes because its
@@ -3670,6 +3829,14 @@ unit optloop;
           { RHS: one of the recognized element-wise shapes. }
           rhs:=rangeelim_skip_typeconv(assign.right);
 
+          { -OoAPPROXTRANS:  a[i] := exp(b[i])  /  1/(1+exp(-b[i]))  over single
+            arrays, lowered to an inline vector polynomial. Tried first so an
+            exp/sigmoid body is taken before the generic arithmetic shapes see it. }
+          if (cs_opt_approxtrans in current_settings.optimizerswitches) and
+             try_transc then
+            begin
+              { vshape/transfn/bvec set by try_transc }
+            end
           { if-conversion shape (-OoIFCONVERT):  a[i] := max/min(u,v)  where FPC's
             -O2 if-conversion has already lowered a branch-predicated ReLU / one-
             sided clamp / element-wise max-min into a single-precision min/max
@@ -3677,7 +3844,7 @@ unit optloop;
             register); v = opB is the second, NaN-preferred parameter (the min/max
             node's parameter-list head).  Each operand is either an array element
             of the loop counter or a provably loop-invariant single scalar. }
-          if assigned(rhs) and (rhs.nodetype=inlinen) and
+          else if assigned(rhs) and (rhs.nodetype=inlinen) and
              (tinlinenode(rhs).inlinenumber in [in_min_single,in_max_single]) then
             begin
               if not(cs_opt_ifconvert in current_settings.optimizerswitches) then
@@ -3832,6 +3999,7 @@ unit optloop;
         mmA_scalar:=nil;
         mmB_scalar:=nil;
         ismaxop:=false;
+        transfn:=tf_exp;
         mminl:=nil;
         accsym:=nil;
         redlhs:=nil;
@@ -3871,6 +4039,13 @@ unit optloop;
           register width from vecwidth*element-size. }
         if vect_want_ymm then
           elewidth:=elewidth*2;
+        { -OoAPPROXTRANS is emitted as 128-bit (VL=4) only: the 2^n exponent build
+          uses packed 32-bit integer add/shift (paddd/pslld) which need AVX2 at
+          256-bit width, whereas the VECT256 gate only requires an AVX unit. Keep
+          the transcendental body at the SSE2-safe 128-bit width; an AVX2 ymm path
+          is a follow-up. }
+        if vshape=vok_transc then
+          elewidth:=4;
 
         { ---- build the replacement statement block ---- }
         block:=internalstatements(stat);
@@ -4045,6 +4220,8 @@ unit optloop;
             addstatement(vstat,cvectoropnode.create_copy(avec.getcopy,bvec.getcopy,elewidth,vecdouble));
           vok_minmax:
             addstatement(vstat,cvectoropnode.create_minmax(avec.getcopy,windowa,windowb,ismaxop,elewidth));
+          vok_transc:
+            addstatement(vstat,cvectoropnode.create_transc(avec.getcopy,bvec.getcopy,transfn,elewidth));
           else
             internalerror(2026070706);
         end;
@@ -4081,7 +4258,19 @@ unit optloop;
           addstatement(stat,ctempdeletenode.create(splatb));
 
         do_firstpass(block);
-        if vshape=vok_minmax then
+        if vshape=vok_transc then
+          begin
+            MessagePos1(forn.fileinfo,cg_n_loop_vectorized,tostr(elewidth));
+            case transfn of
+              tf_exp:
+                OptRemark(forn.fileinfo,'approxtrans','exp() activation loop vectorized to an inline approximate packed expf, VF='+tostr(elewidth)+', tail=scalar(exact RTL)');
+              tf_sigmoid:
+                OptRemark(forn.fileinfo,'approxtrans','sigmoid 1/(1+exp(-x)) activation loop vectorized to an inline approximate packed expf, VF='+tostr(elewidth)+', tail=scalar(exact RTL)');
+              tf_tanh:
+                OptRemark(forn.fileinfo,'approxtrans','tanh() activation loop vectorized to an inline approximate packed expf, VF='+tostr(elewidth)+', tail=scalar(exact RTL)');
+            end;
+          end
+        else if vshape=vok_minmax then
           begin
             MessagePos1(forn.fileinfo,cg_n_loop_ifconverted,tostr(elewidth));
             OptRemark(forn.fileinfo,'ifconvert','min/max loop if-converted to packed max/min, VF='+tostr(elewidth)+vect_widthtag);

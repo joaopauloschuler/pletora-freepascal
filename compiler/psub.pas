@@ -1729,7 +1729,7 @@ implementation
              free single-precision min/max activation (ReLU / one-sided clamp /
              element-wise max-min) is widened to a packed maxps/minps main loop,
              so the enabling gate is either switch. }
-           if (([cs_opt_vectorize,cs_opt_ifconvert]*current_settings.optimizerswitches)<>[])
+           if (([cs_opt_vectorize,cs_opt_ifconvert,cs_opt_approxtrans]*current_settings.optimizerswitches)<>[])
              and not(pi_has_label in flags) then
              RedoDFA:=OptimizeVectorize(code) or RedoDFA;
 

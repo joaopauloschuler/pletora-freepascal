@@ -428,7 +428,15 @@ interface
          streamed to a PPU: OptimizeVectorize refuses to run on inline-candidate
          procedures, so the node cannot leak into inline info. }
        tvectoropkind = (vok_arr_arr, vok_arr_scalar, vok_copy, vok_broadcast, vok_minmax,
-                        vok_reduce_init, vok_reduce_sum, vok_reduce_dot, vok_reduce_finish);
+                        vok_reduce_init, vok_reduce_sum, vok_reduce_dot, vok_reduce_finish,
+                        { vok_transc: a[i..i+VL-1] := f(b[i..i+VL-1]) where f is an
+                          inlined APPROXIMATE single-precision transcendental
+                          (-OoAPPROXTRANS).  transfunc selects which; left=dest
+                          window a[i], right=source window b[i]. }
+                        vok_transc);
+
+       { the approximate transcendental a vok_transc node evaluates per lane }
+       ttranscfunc = (tf_exp, tf_tanh, tf_sigmoid);
 
        { Shared, register-resident accumulator context for a single vectorized
          reduction (sum / dot product).  The three cooperating reduction nodes --
@@ -455,6 +463,7 @@ interface
           scalarleft : boolean; { vok_arr_scalar: true if s is the op's left operand (s op b[i]) }
           ismax : boolean;      { vok_minmax: true for maxps (a[i]:=max(u,v)), false for minps }
           isdouble : boolean;   { false: single (VL=4, ..ps); true: double (VL=2, ..pd) }
+          transfunc : ttranscfunc; { vok_transc: which approximate transcendental (exp/tanh/sigmoid) }
           redctx : pvecreducectx; { shared register-resident accumulator (reduction kinds only) }
           constructor create(a,b,c : tnode; _op : TOpCG; _vecwidth : longint; _isdouble : boolean);virtual;
           constructor create_scalar(a,b,splat : tnode; _op : TOpCG; _scalarleft : boolean; _vecwidth : longint; _isdouble : boolean);
@@ -467,6 +476,10 @@ interface
             (NaN returns opB), so every lane is bit-identical to the if-converted
             scalar min/max. }
           constructor create_minmax(a,opa,opb : tnode; _ismax : boolean; _vecwidth : longint);
+          { vok_transc: a[i..i+VL-1] := f(b[i..i+VL-1]) for an approximate
+            single-precision transcendental f (exp/tanh/sigmoid), lowered to an
+            inline SSE/AVX minimax polynomial. a=dest window, b=source window. }
+          constructor create_transc(a,b : tnode; _func : ttranscfunc; _vecwidth : longint);
           { reduction (single/double-precision sum / dot product): a packed
             accumulator slot is initialised with the incoming scalar in lane 0,
             accumulated VL-wide across the loop, then horizontally summed back into
@@ -693,6 +706,18 @@ implementation
       end;
 
 
+    constructor tvectoropnode.create_transc(a,b : tnode; _func : ttranscfunc; _vecwidth : longint);
+      begin
+        inherited create(vectoropn,a,b,nil);
+        op:=OP_NONE;
+        vecwidth:=_vecwidth;
+        kind:=vok_transc;
+        scalarleft:=false;
+        isdouble:=false;   { approximate transcendentals are single-precision only }
+        transfunc:=_func;
+      end;
+
+
     { reduction: the packed accumulator is register-resident (shared via redctx),
       so these nodes no longer carry a memory-slot operand.
         init:   left = incoming scalar seed s (kept in lane 0)
@@ -806,6 +831,7 @@ implementation
         n.scalarleft:=scalarleft;
         n.ismax:=ismax;
         n.isdouble:=isdouble;
+        n.transfunc:=transfunc;
         { share the same register-resident accumulator context with the copy so a
           whole-tree clone keeps init/body/finish agreeing on one xmm register }
         n.redctx:=nil;
@@ -822,7 +848,8 @@ implementation
                 (tvectoropnode(p).kind=kind) and
                 (tvectoropnode(p).scalarleft=scalarleft) and
                 (tvectoropnode(p).ismax=ismax) and
-                (tvectoropnode(p).isdouble=isdouble);
+                (tvectoropnode(p).isdouble=isdouble) and
+                (tvectoropnode(p).transfunc=transfunc);
       end;
 
 {*****************************************************************************
