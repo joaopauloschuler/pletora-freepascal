@@ -1250,8 +1250,10 @@ implementation
         updated,
         RedoDFA : boolean;
         loopfillsyms : tfplist;
+        guardsyms : tfplist;
       begin
        loopfillsyms:=tfplist.Create;
+       guardsyms:=tfplist.Create;
        { inlining is a heuristics, so we do this very early }
        do_optinline(code,updated);
 
@@ -1331,6 +1333,18 @@ implementation
              positive; skip it in the warning loop.  Diagnostic only -- liveness
              and noregvarinitneeded are untouched, so codegen is unaffected. }
            CollectLoopFillCoveredSyms(code,loopfillsyms);
+
+           { record local/parameter scalars that are read only under a
+             correlated if-guard that provably dominates them (see
+             CollectCorrelatedGuardSyms).  Their later DFA "does not seem to be
+             initialized" warning is a false positive; skip it in the warning
+             loop.  Only done for routines without labels/goto/exceptions
+             (guaranteed linear control flow within a statement list, so no edge
+             can enter the second guard without the first).  Diagnostic only --
+             liveness and noregvarinitneeded are untouched, so codegen is
+             unaffected. }
+           if (flags*[pi_has_assembler_block,pi_is_assembler,pi_uses_exceptions,pi_has_label])=[] then
+             CollectCorrelatedGuardSyms(code,guardsyms);
 
            if cs_opt_constant_propagate in current_settings.optimizerswitches then
              begin
@@ -1722,7 +1736,10 @@ implementation
                        ((tparavarsym(tloadnode(dfabuilder.nodemap[i]).symtableentry).varoptions*[vo_is_high_para,vo_is_parentfp,vo_is_result,vo_is_self])<>[]))) and
                        { skip matched loop-fill false positives (see above) }
                        not((tnode(dfabuilder.nodemap[i]).nodetype=loadn) and
-                           (loopfillsyms.IndexOf(tloadnode(dfabuilder.nodemap[i]).symtableentry)>=0)) then
+                           (loopfillsyms.IndexOf(tloadnode(dfabuilder.nodemap[i]).symtableentry)>=0)) and
+                       { skip correlated if-guard false positives (see above) }
+                       not((tnode(dfabuilder.nodemap[i]).nodetype=loadn) and
+                           (guardsyms.IndexOf(tloadnode(dfabuilder.nodemap[i]).symtableentry)>=0)) then
                        CheckAndWarn(UserCode,tnode(dfabuilder.nodemap[i]));
                    end
                  else
@@ -1797,6 +1814,7 @@ implementation
          do_consttovar(code);
 
        loopfillsyms.Free;
+       guardsyms.Free;
       end;
 
 

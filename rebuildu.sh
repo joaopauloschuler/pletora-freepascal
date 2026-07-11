@@ -69,17 +69,35 @@
 #      unleashed/tests/testfiles/loopfill_dfa/loopfill_dfa_01.pp (%OPT="-O4 -Sew")
 #      and unleashed/tests/loopfill_dfa_check.sh (over-suppression guards).
 #
-#   3. OPEN (tasklist self-host blocker #3): with #2 fixed, plain OPT="-O4" now
-#      gets PAST optfinalvalue.pas but aborts stage-2 (ppc2) on
-#      compiler/pstatmnt.pas:5352 with a spurious "Local variable remaining_sym
-#      does not seem to be initialized" warning-as-error.  DISTINCT root cause: a
-#      scalar assigned inside `if cond then ...` and read inside another `if cond`
-#      guarded by the SAME boolean (correlated if-guards the DFA cannot relate);
-#      NOT a loop-fill.  Warning-only, present in upstream FPC 3.2.2 too.
-#      Reduced reproducer: unleashed/tests/known_miscompiles/
-#      o4_correlated_guard_uninit_01.pp.
+#   3. FIXED (fork commit on branch a3, optdfa.pas CollectCorrelatedGuardSyms
+#      + psub.pas wiring): the spurious -O4 "Local variable remaining_sym does
+#      not seem to be initialized" at compiler/pstatmnt.pas:5352 is gone.  Root
+#      cause: a scalar assigned inside `if cond then ...` and read inside another
+#      `if cond` guarded by the SAME boolean (correlated if-guards the DFA cannot
+#      relate); NOT a loop-fill.  Warning-only, present in upstream FPC 3.2.2 too.
+#      The fix suppresses the diagnostic ONLY for the provably-safe correlated-
+#      guard shape (same simple non-address-taken guard on two sibling ifs, var
+#      unconditionally defined in the first then-branch and read in the second,
+#      guard unwritten between, every read covered), never touching liveness /
+#      noregvarinitneeded -- so codegen is unaffected and genuine uninitialised
+#      reads (different guard, guard reassigned, uncovered read) still warn.
+#      Reproducer + regression: unleashed/tests/testfiles/guardcorr_dfa/
+#      guardcorr_dfa_01.pp (%OPT="-O4 -Sew") and
+#      unleashed/tests/guardcorr_dfa_check.sh (over-suppression guards).
 #
-#   So plain -O4 self-host is BLOCKED pending #3.  Once green, adopt the winning
+#   4. OPEN (tasklist self-host blocker #4): with #3 fixed, plain OPT="-O4" now
+#      gets PAST pstatmnt.pas but aborts stage-2 (ppc2) on
+#      compiler/x86/aoptx86.pas:19282 with spurious "Local variable anchors of a
+#      managed type / acount does not seem to be initialized" (and :19555
+#      anchor) warnings-as-error.  DISTINCT root cause: a local assigned ONLY
+#      inside a NESTED procedure/function (CollectAnchors/FindAnchor) that the
+#      enclosing routine (DoCrossJump) calls before reading it -- the -O3/-O4 DFA
+#      does not model a nested-proc call as a definition of the captured parent
+#      local; NOT a loop-fill or correlated guard.  Warning-only, CLEAN at -O2,
+#      fires at -O3/-O4, present in upstream FPC 3.2.2 too.  Reduced reproducer:
+#      unleashed/tests/known_miscompiles/o4_nestedproc_def_uninit_01.pp.
+#
+#   So plain -O4 self-host is BLOCKED pending #4.  Once green, adopt the winning
 #   flag set here as the documented default gate and (optionally) fold in the
 #   opt-in -Oo* passes one at a time via OPTFORK.
 set -e

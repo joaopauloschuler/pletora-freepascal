@@ -59,6 +59,13 @@ unit optdfa;
       "uninitialized" warning is a false positive for these variables. }
     procedure CollectLoopFillCoveredSyms(code : tnode;syms : tfplist);
 
+    { Collect into syms every local/parameter scalar that is read only under a
+      correlated if-guard that provably dominates it (see the block comment at
+      the implementation of CollectCorrelatedGuardSyms).  Must be called on the
+      still-structured tree.  The DFA "uninitialized" warning is a false
+      positive for these variables; suppression is diagnostic-only. }
+    procedure CollectCorrelatedGuardSyms(code : tnode;syms : tfplist);
+
   implementation
 
     uses
@@ -1209,6 +1216,353 @@ unit optdfa;
         finally
           forns.Free;
           candrec.list.Free;
+        end;
+      end;
+
+
+    { ----------------------------------------------------------------------
+      Correlated if-guard false-positive suppression.
+
+      A scalar local/parameter is often assigned under  if COND then ...  and
+      later read under a second  if COND then ...  guarded by the SAME boolean,
+      with COND unchanged in between (the multi-lock timed-wait lowering in
+      pstatmnt.pas is the canonical example: remaining_sym).  The DFA cannot
+      correlate the two guards, so it assumes the read is reachable without the
+      assignment and emits "does not seem to be initialized".  It is a false
+      positive: whenever the second guard's body runs, COND was true, so the
+      first guard's body ran and defined the variable; when COND is false the
+      variable is never read.  Codegen is correct (the value is live at entry
+      to the second guard because COND still selects the same arm); this is
+      warning-only and present in upstream FPC 3.2.2 too.
+
+      CollectCorrelatedGuardSyms recognises exactly this provably-safe shape and
+      suppresses the WARNING only -- it never touches liveness /
+      noregvarinitneeded, so it cannot cause a miscompile.  It is sound-precise
+      rather than a blanket suppression.  A variable S is whitelisted only when:
+
+        * S is a scalar local/static/value-parameter that is not address-taken;
+        * there is a matched guard pair  if C then <defines S>  ...  if C then
+          <reads S>  where both if-statements are SIBLINGS in one statement
+          list, C is a simple load of the same non-address-taken local/value-
+          parameter/static symbol in both, S is UNCONDITIONALLY assigned at the
+          top level of the first then-branch and read in the second then-branch,
+          and C's symbol is not written by any statement strictly between the
+          two ifs; and
+        * EVERY read of S in the whole routine lies inside such a matched second
+          then-branch.
+
+      This procedure must run before goto/label/exception-bearing routines reach
+      it (psub gates on pi_has_label / pi_uses_exceptions clear), so within a
+      statement list control flows linearly and no edge can enter the second if
+      without the first.  Genuine uninitialised reads still warn: a guard on a
+      DIFFERENT variable, a guard reassigned between the ifs, or a read of S not
+      covered by a matched guard all fail one of the conditions above. }
+
+    type
+      tcgmarkrec = record
+        sym : tsym;
+        list : tfplist;    { collected matching load nodes / write markers }
+      end;
+      pcgmarkrec = ^tcgmarkrec;
+
+    function cg_strip(n : tnode) : tnode;
+      begin
+        while assigned(n) and (n.nodetype=typeconvn) do
+          n:=ttypeconvnode(n).left;
+        result:=n;
+      end;
+
+    { returns the guard symbol if cond is a plain load of a non-address-taken
+      scalar local / value-parameter / static symbol, else nil }
+    function cg_guard_sym(cond : tnode) : tsym;
+      var
+        s : tsym;
+      begin
+        result:=nil;
+        cond:=cg_strip(cond);
+        if not(assigned(cond) and (cond.nodetype=loadn)) then
+          exit;
+        s:=tloadnode(cond).symtableentry;
+        if not assigned(s) then
+          exit;
+        case s.typ of
+          localvarsym,staticvarsym:
+            if not tabstractnormalvarsym(s).addr_taken then
+              result:=s;
+          paravarsym:
+            if (tparavarsym(s).varspez=vs_value) and
+               not tabstractnormalvarsym(s).addr_taken then
+              result:=s;
+          else
+            ;
+        end;
+      end;
+
+    { may S be flagged uninitialised and correlation-suppressed? }
+    function cg_candidate_sym(s : tsym) : boolean;
+      begin
+        result:=assigned(s) and (s.typ in [localvarsym,staticvarsym,paravarsym]) and
+                not tabstractnormalvarsym(s).addr_taken;
+      end;
+
+    { collect read loads (nf_write clear) of pcgmarkrec.sym into its list }
+    function cg_collect_reads(var n : tnode; arg : pointer) : foreachnoderesult;
+      begin
+        result:=fen_false;
+        if (n.nodetype=loadn) and (tloadnode(n).symtableentry=pcgmarkrec(arg)^.sym) and
+           not(nf_write in n.flags) then
+          pcgmarkrec(arg)^.list.Add(n);
+      end;
+
+    { record any write to pcgmarkrec.sym (as a non-empty list marker) }
+    function cg_collect_writes(var n : tnode; arg : pointer) : foreachnoderesult;
+      begin
+        result:=fen_false;
+        if (n.nodetype=loadn) and (tloadnode(n).symtableentry=pcgmarkrec(arg)^.sym) and
+           (nf_write in n.flags) then
+          pcgmarkrec(arg)^.list.Add(n);
+      end;
+
+    { distinct candidate symbols read (nf_write clear) inside a subtree }
+    function cg_collect_readsyms(var n : tnode; arg : pointer) : foreachnoderesult;
+      var
+        s : tsym;
+      begin
+        result:=fen_false;
+        if (n.nodetype=loadn) and not(nf_write in n.flags) then
+          begin
+            s:=tloadnode(n).symtableentry;
+            if cg_candidate_sym(s) and (tfplist(arg).IndexOf(s)<0) then
+              tfplist(arg).Add(s);
+          end;
+      end;
+
+    { true if S is unconditionally assigned at the TOP statement level of the
+      then-branch n (a direct assignment, or one somewhere in n's top-level
+      statement chain -- but not nested inside a further if / loop / case) }
+    function cg_defines_top(n : tnode;sym : tsym) : boolean;
+      var
+        l,stmt : tnode;
+      begin
+        result:=false;
+        if not assigned(n) then
+          exit;
+        case n.nodetype of
+          assignn:
+            begin
+              l:=cg_strip(tassignmentnode(n).left);
+              result:=assigned(l) and (l.nodetype=loadn) and
+                      (tloadnode(l).symtableentry=sym) and (nf_write in l.flags);
+            end;
+          statementn:
+            begin
+              stmt:=n;
+              while assigned(stmt) and (stmt.nodetype=statementn) do
+                begin
+                  if cg_defines_top(tstatementnode(stmt).statement,sym) then
+                    exit(true);
+                  stmt:=tstatementnode(stmt).right;
+                end;
+            end;
+          blockn:
+            result:=cg_defines_top(tblocknode(n).left,sym);
+          else
+            ;
+        end;
+      end;
+
+    { is stmt a top-level assignment  sym := ...  ? }
+    function cg_stmt_defines(stmt : tnode;sym : tsym) : boolean;
+      var
+        l : tnode;
+      begin
+        result:=false;
+        if assigned(stmt) and (stmt.nodetype=assignn) then
+          begin
+            l:=cg_strip(tassignmentnode(stmt).left);
+            result:=assigned(l) and (l.nodetype=loadn) and
+                    (tloadnode(l).symtableentry=sym) and (nf_write in l.flags);
+          end;
+      end;
+
+    { add, as covered regions for sym, every top-level statement of the first
+      then-branch athen that follows the top-level define of sym: those reads
+      are straight-line dominated by the define, so they are equally safe and
+      must not defeat the "every read covered" whitelist test. }
+    procedure cg_add_athen_tail(athen : tnode;sym : tsym;regionsyms,regions : tfplist);
+      var
+        chain,stmt : tnode;
+        seendef : boolean;
+      begin
+        if not assigned(athen) then
+          exit;
+        if athen.nodetype=blockn then
+          chain:=tblocknode(athen).left
+        else
+          chain:=athen;
+        seendef:=false;
+        while assigned(chain) and (chain.nodetype=statementn) do
+          begin
+            stmt:=tstatementnode(chain).statement;
+            if seendef then
+              begin
+                regionsyms.Add(sym);
+                regions.Add(stmt);
+              end
+            else if cg_stmt_defines(stmt,sym) then
+              seendef:=true;
+            chain:=tstatementnode(chain).right;
+          end;
+      end;
+
+    { does any statement strictly between the two ifs (the slice guardstart..
+      guardstop of the sibling list) write guardsym? }
+    function cg_guard_written_between(stmts : tfplist;afrom,ato : longint;guardsym : tsym) : boolean;
+      var
+        rec : tcgmarkrec;
+        tmp : tnode;
+        k : longint;
+      begin
+        rec.sym:=guardsym;
+        rec.list:=tfplist.Create;
+        try
+          for k:=afrom to ato do
+            begin
+              tmp:=tnode(stmts[k]);
+              foreachnodestatic(tmp,@cg_collect_writes,@rec);
+            end;
+          result:=rec.list.Count>0;
+        finally
+          rec.list.Free;
+        end;
+      end;
+
+    function cg_collect_blocks(var n : tnode; arg : pointer) : foreachnoderesult;
+      begin
+        if n.nodetype=blockn then
+          tfplist(arg).Add(n);
+        result:=fen_false;
+      end;
+
+    procedure CollectCorrelatedGuardSyms(code : tnode;syms : tfplist);
+      var
+        blocks : tfplist;      { every blocknode }
+        stmts : tfplist;       { sibling statements of the current block }
+        readsyms : tfplist;    { candidate syms read in a then-branch }
+        regionsyms : tfplist;  { parallel: sym covered by regions[k] }
+        regions : tfplist;     { parallel: covered second-then-branch node }
+        cands : tfplist;       { distinct candidate syms }
+        allreads,covered : tcgmarkrec;
+        bi,a,b,si,k : longint;
+        bn,stmt,na,nb : tnode;
+        ga,gb,s : tsym;
+        ok : boolean;
+      begin
+        if not assigned(code) then
+          exit;
+        blocks:=tfplist.Create;
+        stmts:=tfplist.Create;
+        readsyms:=tfplist.Create;
+        regionsyms:=tfplist.Create;
+        regions:=tfplist.Create;
+        cands:=tfplist.Create;
+        try
+          foreachnodestatic(code,@cg_collect_blocks,blocks);
+          { pass 1: find matched guard pairs, record (sym, second-then) regions }
+          for bi:=0 to blocks.Count-1 do
+            begin
+              bn:=tnode(blocks[bi]);
+              stmts.Clear;
+              stmt:=tblocknode(bn).left;
+              while assigned(stmt) and (stmt.nodetype=statementn) do
+                begin
+                  stmts.Add(tstatementnode(stmt).statement);
+                  stmt:=tstatementnode(stmt).right;
+                end;
+              for a:=0 to stmts.Count-1 do
+                begin
+                  na:=tnode(stmts[a]);
+                  if not(assigned(na) and (na.nodetype=ifn)) then
+                    continue;
+                  ga:=cg_guard_sym(tifnode(na).left);
+                  if not assigned(ga) then
+                    continue;
+                  for b:=a+1 to stmts.Count-1 do
+                    begin
+                      nb:=tnode(stmts[b]);
+                      if not(assigned(nb) and (nb.nodetype=ifn)) then
+                        continue;
+                      gb:=cg_guard_sym(tifnode(nb).left);
+                      if gb<>ga then
+                        continue;
+                      { guard must be unchanged between the two ifs }
+                      if (b>a+1) and cg_guard_written_between(stmts,a+1,b-1,ga) then
+                        continue;
+                      { every candidate sym read in the second then-branch and
+                        unconditionally defined in the first then-branch is a
+                        correlated-guard covered region }
+                      readsyms.Clear;
+                      foreachnodestatic(tifnode(nb).right,@cg_collect_readsyms,readsyms);
+                      for si:=0 to readsyms.Count-1 do
+                        begin
+                          s:=tsym(readsyms[si]);
+                          if s=ga then
+                            continue;
+                          if cg_defines_top(tifnode(na).right,s) then
+                            begin
+                              regionsyms.Add(s);
+                              regions.Add(tifnode(nb).right);
+                              { reads dominated by the define in the first
+                                then-branch are equally safe }
+                              cg_add_athen_tail(tifnode(na).right,s,regionsyms,regions);
+                              if cands.IndexOf(s)<0 then
+                                cands.Add(s);
+                            end;
+                        end;
+                    end;
+                end;
+            end;
+
+          { pass 2: whitelist a candidate only if EVERY read of it in the whole
+            routine lies inside one of its covered regions }
+          allreads.list:=tfplist.Create;
+          covered.list:=tfplist.Create;
+          try
+            for k:=0 to cands.Count-1 do
+              begin
+                s:=tsym(cands[k]);
+                allreads.sym:=s;
+                allreads.list.Clear;
+                foreachnodestatic(code,@cg_collect_reads,@allreads);
+                covered.sym:=s;
+                covered.list.Clear;
+                for bi:=0 to regions.Count-1 do
+                  if tsym(regionsyms[bi])=s then
+                    begin
+                      nb:=tnode(regions[bi]);
+                      foreachnodestatic(nb,@cg_collect_reads,@covered);
+                    end;
+                ok:=allreads.list.Count>0;
+                for bi:=0 to allreads.list.Count-1 do
+                  if covered.list.IndexOf(allreads.list[bi])<0 then
+                    begin
+                      ok:=false;
+                      break;
+                    end;
+                if ok and (syms.IndexOf(s)<0) then
+                  syms.Add(s);
+              end;
+          finally
+            allreads.list.Free;
+            covered.list.Free;
+          end;
+        finally
+          blocks.Free;
+          stmts.Free;
+          readsyms.Free;
+          regionsyms.Free;
+          regions.Free;
+          cands.Free;
         end;
       end;
 
