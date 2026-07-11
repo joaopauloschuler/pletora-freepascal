@@ -913,7 +913,30 @@ interface
            Rectangular nest only (inner bounds independent of the outer counter),
            both counters dead outside the nest, unit ascending step, no range/
            overflow checking.  Opt-in; NOT part of the -O4 defaults in this landing }
-         cs_opt_loopinterchange
+         cs_opt_loopinterchange,
+         { loop tiling / cache blocking (-OoLOOPTILE): block a perfect three-deep
+           counted for-nest of the matmul/conv reduction shape
+             for i: for j: for k: C[wi] := C[wi] + T
+           (wi affine in i,j only; T only READS arrays other than C, e.g.
+           a[i*K+k]*b[k*N+j]) into cache-sized tiles over the two output loops i
+           and j, with the point loops emitted in i/k/j order (the original j and k
+           interchanged) so the innermost loop strides the contiguous dimension and
+           a reused operand panel stays cache-resident across the inner iterations
+           instead of being re-streamed.  The named gcc -floop-block / polyhedral
+           tiling transform ported to FPC's tree optimizer, COMPOSING tiling with
+           loop interchange.  Sound because the write index is invariant of the
+           reduction counter k and the j<->k interchange leaves each output cell
+           touched once per k in increasing-k order (per-cell reduction order is
+           preserved -- bit-identical per output cell); only the (i,j) cell VISIT
+           order is blocked, which is bit-exact for distinct cells (injective wi --
+           the matmul norm) and, for the colliding non-injective case, exact for an
+           integer accumulator and permitted for a float accumulator only under
+           -OoFASTMATH.  A reuse cost
+           model fires the transform only when an operand is invariant of i AND one
+           of j (real reuse across both tiled loops).  Rectangular nest, all
+           counters dead outside, unit ascending step, no range/overflow checking.
+           Opt-in; NOT part of the -O4 defaults in this landing }
+         cs_opt_looptile
        );
        toptimizerswitches = set of toptimizerswitch;
 
@@ -995,7 +1018,7 @@ interface
          'SHRINKWRAP','GVNPRE','PURE','PARTIALINLINE','STACKALLOC','SLP',
          'UNROLLDYN','PREFETCH','ICF','IPARA','FINALVALUE','SIBCALL',
          'REPORT','DEVIRT','IPACP','VECT256','CONSTEVAL','MODREF',
-         'APPROXTRANS','LOOPINTERCHANGE'
+         'APPROXTRANS','LOOPINTERCHANGE','LOOPTILE'
        );
        WPOptimizerSwitchStr : array [twpoptimizerswitch] of string[14] = (
          'DEVIRTCALLS','OPTVMTS','SYMBOLLIVENESS'

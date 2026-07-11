@@ -2615,7 +2615,8 @@ const
          'cs_opt_consteval',
          'cs_opt_modref',
          'cs_opt_approxtrans',
-         'cs_opt_loopinterchange'
+         'cs_opt_loopinterchange',
+         'cs_opt_looptile'
        );
     var
          globalswitch  : tglobalswitch;

@@ -50,6 +50,7 @@ unit optloop;
     function OptimizeReassoc(node : tnode) : boolean;
     function OptimizeUnrollJam(node : tnode) : boolean;
     function OptimizeLoopInterchange(node : tnode) : boolean;
+    function OptimizeLoopTile(node : tnode) : boolean;
     function OptimizePredCom(node : tnode) : boolean;
     function OptimizeCodeSink(node : tnode) : boolean;
     function OptimizeStoreMotion(node : tnode) : boolean;
@@ -8020,6 +8021,9 @@ unit optloop;
         accum     : tsym;            { subset S: the reduction accumulator; nil for R }
         idxproto  : tnode;           { subset R: the required index of every subscript }
         subset_r  : boolean;
+        subset_m  : boolean;         { subset M (tiling): array-element reduction addend --
+                                       forbid reading the accumulator array wsym, but the read
+                                       indices may differ from the write (matmul a[]/b[]) }
         bad       : boolean;
         badreason : string;
         idxs      : array of tnode;   { every array-subscript index, for the cost model }
@@ -8066,6 +8070,8 @@ unit optloop;
                     ic_appears_in_mul(tbinarynode(n).right,c);
           unaryminusn,notn:
             result:=ic_appears_in_mul(tunarynode(n).left,c);
+          else
+            ; { any other node: the counter does not appear scaled here }
         end;
       end;
 
@@ -8083,6 +8089,8 @@ unit optloop;
                     ic_has_bare_term(tbinarynode(n).right,c);
           loadn:
             result:=(tloadnode(n).symtableentry=c);
+          else
+            ; { any other node: no bare (+/-1 stride) occurrence of the counter }
         end;
       end;
 
@@ -8150,6 +8158,19 @@ unit optloop;
                     begin
                       sc.bad:=true;
                       sc.badreason:='a read subscript uses a different index than the write (unproven dependence)';
+                      exit;
+                    end;
+                end;
+              if sc.subset_m then
+                begin
+                  { the reduction addend must not read the accumulator array
+                    (that would be a real loop-carried dependence beyond the
+                    single-cell reduction); the read index is free to differ from
+                    the write index -- the matmul a[i*K+k]/b[k*N+j] shape }
+                  if bsym=sc.wsym then
+                    begin
+                      sc.bad:=true;
+                      sc.badreason:='the accumulator array is read in the reduction addend (loop-carried dependence)';
                       exit;
                     end;
                 end;
@@ -8457,6 +8478,415 @@ unit optloop;
         { postorder so a nested inner loop is visited (and declines) before the
           2-level nest that encloses it }
         foreachnodestatic(pm_postprocess,node,@interchange_processloop_cb,@ctx);
+        Result:=ctx.changed;
+      end;
+
+
+{****************************************************************************
+                        Loop tiling / cache blocking
+ ****************************************************************************}
+
+    { -OoLOOPTILE blocks a perfect three-deep counted for-nest of the classic
+      matmul/conv reduction shape
+
+        for i:=0 to M-1 do
+          for j:=0 to N-1 do
+            for k:=0 to K-1 do
+              C[wi] := C[wi] + T;        (* wi affine in i,j only; T only READS
+                                          arrays other than C, e.g. a[i*K+k]*b[k*N+j] *)
+
+      into cache-sized tiles over the OUTPUT loops i and j, with the point loops
+      emitted in i / k / j order (the original j and k interchanged) so the
+      innermost loop strides the CONTIGUOUS dimension:
+
+        for it:=0 to M-1 step B do
+          for jt:=0 to N-1 step B do
+            for i:=it to min(it+B-1,M-1) do
+              for k:=0 to K-1 do
+                for j:=jt to min(jt+B-1,N-1) do
+                  C[i*N+j] := C[i*N+j] + a[i*K+k]*b[k*N+j];
+
+      so a reused operand panel -- a K*B slice of B (invariant of i), plus the
+      B-block of C -- stays cache-resident across the inner iterations of a tile
+      instead of being re-streamed from memory on every pass, AND every inner-loop
+      access is unit-stride (b[k*N+j] and C[i*N+j] over j).  The named gcc
+      -floop-block / polyhedral tiling transform, ported to FPC's tree optimizer;
+      it COMPOSES tiling with loop interchange (moving the contiguous j loop
+      innermost) -- without that the inner loop would stride b by N and blocking
+      could not help.
+
+      SOUNDNESS.  The write index C[i*N+j] is invariant of the reduction counter k
+      (required), and interchanging the j and k loops leaves each output cell
+      C[i*N+j] touched exactly once per k in increasing-k order (k is now the
+      middle loop, j the inner), so the per-cell reduction order is UNCHANGED --
+      bit-identical per cell.  The only reordering across cells is the blocked
+      visit order of the (i,j) cells.  When wi is injective over the (i,j)
+      rectangle -- the matmul norm, since i's coefficient is the row stride >= the
+      j trip count -- distinct (i,j) never share a cell, so the transform is
+      bit-exact for ANY element type.  The only way two (i,j) can collide is a
+      non-injective index, whose two complete per-cell sums are then reordered:
+      exact for an integer accumulator (integer + is associative), and for a FLOAT
+      accumulator permitted only under -OoFASTMATH (which allows FP reassociation)
+      -- we require that conservatively rather than proving injectivity here.
+      Reuse cost model: fire only when at least one read operand is invariant of i
+      AND at least one is invariant of j (genuine reuse across both tiled loops --
+      the matmul a[]/b[] signature), which declines a no-reuse element-wise nest
+      where tiling would only add loop overhead.
+
+      Legality reuses the interchange machinery: perfect counted nest, rectangular
+      (each loop's bounds independent of the inner counters), unit ascending step,
+      no -Cr/-Co, all three counters dead on exit, body free of calls / pointer
+      derefs / a read of the accumulator array.  The psub call site additionally
+      skips procedures with labels. }
+
+    const
+      tile_block = 64;   { iterations per tile edge; measured sweet spot on the
+                           bandwidth-bound matmul kernel (see the tasklist note) }
+
+    var
+      looptile_seq : longint;
+
+    function tile_make_min(a, b : tnode; d : tdef) : tnode;
+      { min(a,b) as an inline node of the counter's integer type d.  Both operands
+        are forced to exactly d: an add such as  it+63  promotes to int64 under
+        FPC's longint+longint rule, which would otherwise mismatch the chosen
+        in_min_longint inline (operand int64 vs a 32-bit min) and crash codegen.
+        The operands are provably within d's range (it,hi are d-typed loop values
+        and it+B-1 is capped by the min against hi), so the narrowing is exact. }
+      var
+        innr : tinlinenumber;
+      begin
+        if d.size>=8 then
+          innr:=in_min_int64
+        else
+          innr:=in_min_longint;
+        result:=cinlinenode.create(innr,false,
+          ccallparanode.create(ctypeconvnode.create_internal(a,d),
+            ccallparanode.create(ctypeconvnode.create_internal(b,d),nil)));
+      end;
+
+    type
+      ttilecontext = object
+        root : tnode;
+        changed : boolean;
+        procedure processloop(var n : tnode);
+      end;
+
+    procedure ttilecontext.processloop(var n : tnode);
+      var
+        outerfor, midfor, innerfor : tfornode;
+        iout, jmid, kin : tabstractvarsym;
+        sc : tic_scan;
+        body, lhs, rhs, taddend, base, wi, la, ra : tnode;
+        accdef : tdef;
+        recognized_nest : boolean;
+        reuse_i, reuse_j : boolean;
+        hascheck : boolean;
+        itsym, jtsym, ihsym, jhsym : tlocalvarsym;
+        newk, pointj, pointi, tilej, tilei, tilejbody, tileibody : tnode;
+        stmt : tstatementnode;
+        oldnest : tnode;
+        reason : string;
+
+      function tile_reason : string;
+        var
+          a : longint;
+        begin
+          result:='';
+          { --- outer loop i --- }
+          if lnf_backward in outerfor.loopflags then
+            exit('outer loop is descending (downto)');
+          if assigned(outerfor.loopstep) then
+            exit('outer loop has a non-unit step');
+          iout:=rangeelim_simple_var(outerfor.left);
+          if not assigned(iout) then
+            exit('outer counter is not a simple non-aliased variable');
+          if not assigned(outerfor.left.resultdef) or (outerfor.left.resultdef.typ<>orddef) or
+             not is_signed(outerfor.left.resultdef) or not(outerfor.left.resultdef.size in [4,8]) then
+            exit('outer counter is not a signed 32/64-bit integer');
+          if ([cs_check_range,cs_check_overflow]*current_settings.localswitches)<>[] then
+            exit('range/overflow checking is enabled (-Cr/-Co)');
+          if not fuse_bound_pure(outerfor.right) or not fuse_bound_pure(outerfor.t1) then
+            exit('outer loop bounds are not side-effect free');
+
+          { --- middle loop j (perfect nest) --- }
+          body:=ic_single_stmt(outerfor.t2);
+          if not assigned(body) or (body.nodetype<>forn) then
+            exit('outer body is not a single perfectly-nested counted loop');
+          midfor:=tfornode(body);
+          if lnf_backward in midfor.loopflags then
+            exit('middle loop is descending (downto)');
+          if assigned(midfor.loopstep) then
+            exit('middle loop has a non-unit step');
+          jmid:=rangeelim_simple_var(midfor.left);
+          if not assigned(jmid) then
+            exit('middle counter is not a simple non-aliased variable');
+          if jmid=iout then
+            exit('outer and middle loops share one counter');
+          if not assigned(midfor.left.resultdef) or (midfor.left.resultdef.typ<>orddef) or
+             not is_signed(midfor.left.resultdef) or not(midfor.left.resultdef.size in [4,8]) then
+            exit('middle counter is not a signed 32/64-bit integer');
+          if not fuse_bound_pure(midfor.right) or not fuse_bound_pure(midfor.t1) then
+            exit('middle loop bounds are not side-effect free');
+          { rectangular: middle bounds independent of the outer counter }
+          if (ujam_count_refs(midfor.right,tsym(iout))<>0) or
+             (ujam_count_refs(midfor.t1,tsym(iout))<>0) then
+            exit('middle loop bounds depend on the outer counter (non-rectangular nest)');
+          if (ujam_count_refs(outerfor.right,tsym(jmid))<>0) or
+             (ujam_count_refs(outerfor.t1,tsym(jmid))<>0) then
+            exit('outer loop bounds reference the middle counter');
+
+          { --- inner loop k (perfect nest, the reduction loop) --- }
+          body:=ic_single_stmt(midfor.t2);
+          if not assigned(body) or (body.nodetype<>forn) then
+            exit('middle body is not a single perfectly-nested counted loop');
+          innerfor:=tfornode(body);
+          if lnf_backward in innerfor.loopflags then
+            exit('inner loop is descending (downto)');
+          if assigned(innerfor.loopstep) then
+            exit('inner loop has a non-unit step');
+          kin:=rangeelim_simple_var(innerfor.left);
+          if not assigned(kin) then
+            exit('inner counter is not a simple non-aliased variable');
+          if (kin=iout) or (kin=jmid) then
+            exit('two loops share one counter');
+          if not assigned(innerfor.left.resultdef) or (innerfor.left.resultdef.typ<>orddef) or
+             not is_signed(innerfor.left.resultdef) or not(innerfor.left.resultdef.size in [4,8]) then
+            exit('inner counter is not a signed 32/64-bit integer');
+          if not fuse_bound_pure(innerfor.right) or not fuse_bound_pure(innerfor.t1) then
+            exit('inner loop bounds are not side-effect free');
+          { rectangular: inner bounds independent of the two outer counters }
+          if (ujam_count_refs(innerfor.right,tsym(iout))<>0) or (ujam_count_refs(innerfor.t1,tsym(iout))<>0) or
+             (ujam_count_refs(innerfor.right,tsym(jmid))<>0) or (ujam_count_refs(innerfor.t1,tsym(jmid))<>0) then
+            exit('inner loop bounds depend on an outer counter (non-rectangular nest)');
+          if (ujam_count_refs(outerfor.right,tsym(kin))<>0) or (ujam_count_refs(outerfor.t1,tsym(kin))<>0) or
+             (ujam_count_refs(midfor.right,tsym(kin))<>0) or (ujam_count_refs(midfor.t1,tsym(kin))<>0) then
+            exit('an outer loop bound references the inner counter');
+
+          { decline any per-region R+/Q+ inside the nest }
+          hascheck:=false;
+          if foreachnodestatic(outerfor.t2,@vect_check_cb,@hascheck) then
+            exit('nest body has per-region range/overflow checking');
+
+          { all three counters dead on exit: tiling only changes a counter's
+            post-loop value in the zero-trip corner cases; requiring the
+            DFA-computed lnf_dont_mind_loopvar_on_exit makes that unobservable }
+          if not(lnf_dont_mind_loopvar_on_exit in outerfor.loopflags) then
+            exit('outer counter may be read after the nest (live on loop exit)');
+          if not(lnf_dont_mind_loopvar_on_exit in midfor.loopflags) then
+            exit('middle counter may be read after the nest (live on loop exit)');
+          if not(lnf_dont_mind_loopvar_on_exit in innerfor.loopflags) then
+            exit('inner counter may be read after the nest (live on loop exit)');
+
+          { --- inner body: a single array-element reduction  C[wi]:=C[wi]+T --- }
+          body:=ic_single_stmt(innerfor.t2);
+          if not assigned(body) or (body.nodetype<>assignn) then
+            exit('inner loop body is not a single assignment');
+          lhs:=tassignmentnode(body).left;
+          rhs:=tassignmentnode(body).right;
+          if lhs.nodetype<>vecn then
+            exit('inner body does not write an array element (not a C[..]:=... reduction)');
+          base:=rangeelim_skip_typeconv(tvecnode(lhs).left);
+          if not assigned(base) or (base.nodetype<>loadn) or not assigned(rangeelim_simple_var(base)) then
+            exit('the accumulator array is not a simple single-dimension array variable');
+          if not ic_elem_ok(lhs.resultdef) then
+            exit('the accumulated element is not an unmanaged scalar');
+          if rhs.nodetype<>addn then
+            exit('inner body is not a recognized  C[idx] := C[idx] + <addend>  reduction');
+          la:=taddnode(rhs).left;
+          ra:=taddnode(rhs).right;
+          taddend:=nil;
+          if la.isequal(lhs) then
+            taddend:=ra
+          else if ra.isequal(lhs) then
+            taddend:=la;
+          if not assigned(taddend) then
+            exit('inner body is not a recognized  C[idx] := C[idx] + <addend>  reduction');
+
+          wi:=tvecnode(lhs).right;
+          { the reduction cell must be invariant of the innermost (reduction)
+            counter, and vary with BOTH tiled counters (a genuine 2-D output) }
+          if ujam_count_refs(wi,tsym(kin))<>0 then
+            exit('the write index varies with the innermost loop (not a k-reduction)');
+          if (ujam_count_refs(wi,tsym(iout))=0) or (ujam_count_refs(wi,tsym(jmid))=0) then
+            exit('the write index does not depend on both tiled counters');
+
+          recognized_nest:=true;
+
+          { scan the addend (subset M): read-only, no accumulator-array read, no
+            call/deref, collect the read indices for the reuse cost model }
+          sc.iout:=iout;
+          sc.iin:=jmid;
+          sc.wsym:=tloadnode(base).symtableentry;
+          sc.accum:=nil;
+          sc.idxproto:=nil;
+          sc.subset_r:=false;
+          sc.subset_m:=true;
+          sc.bad:=false;
+          sc.badreason:='';
+          setlength(sc.idxs,0);
+          sc.nidx:=0;
+          ic_check_expr(sc,taddend);
+          if sc.bad then
+            exit(sc.badreason);
+
+          { float accumulator needs fast-math (cross-cell reassociation gate) }
+          accdef:=lhs.resultdef;
+          if (is_single(accdef) or is_double(accdef)) and
+             not(cs_opt_fastmath in current_settings.optimizerswitches) then
+            exit('floating-point reduction tiling needs fast-math (-OoFASTMATH)');
+
+          { reuse cost model: some operand invariant of i AND some invariant of j }
+          reuse_i:=false;
+          reuse_j:=false;
+          for a:=0 to sc.nidx-1 do
+            begin
+              if ujam_count_refs(sc.idxs[a],tsym(iout))=0 then
+                reuse_i:=true;
+              if ujam_count_refs(sc.idxs[a],tsym(jmid))=0 then
+                reuse_j:=true;
+            end;
+          if not(reuse_i and reuse_j) then
+            exit('no operand is reused across both tiled loops (tiling would not improve locality)');
+        end;
+
+      begin
+        if n.nodetype<>forn then
+          exit;
+        outerfor:=tfornode(n);
+        recognized_nest:=false;
+        reason:=tile_reason;
+        if reason<>'' then
+          begin
+            if recognized_nest and (cs_opt_report in current_settings.optimizerswitches) then
+              OptRemark(outerfor.fileinfo,'looptile','not tiled: '+reason);
+            exit;
+          end;
+
+        { --- build the tiled nest.  it/jt are fresh tile counters and ih/jh fresh
+          per-tile upper-bound temps (of the outer / middle counter type); the
+          original i,j,k counters are re-driven by the point loops and the
+          unchanged inner k-loop.  The tile-end bound  min(it+B-1, hi)  is
+          snapshotted into ih/jh once per tile (like a hand-written blocked loop)
+          rather than used inline as the point loop's `to` expression, which keeps
+          the point loop a clean constant-bounded counted loop for the downstream
+          induction/RMW passes. --- }
+        inc(looptile_seq);
+        itsym:=clocalvarsym.create('$tile_i$'+tostr(looptile_seq),vs_value,outerfor.left.resultdef,[]);
+        itsym.register_sym;
+        current_procinfo.procdef.localst.insertsym(itsym);
+        ihsym:=clocalvarsym.create('$tile_ih$'+tostr(looptile_seq),vs_value,outerfor.left.resultdef,[]);
+        ihsym.register_sym;
+        current_procinfo.procdef.localst.insertsym(ihsym);
+        jtsym:=clocalvarsym.create('$tile_j$'+tostr(looptile_seq),vs_value,midfor.left.resultdef,[]);
+        jtsym.register_sym;
+        current_procinfo.procdef.localst.insertsym(jtsym);
+        jhsym:=clocalvarsym.create('$tile_jh$'+tostr(looptile_seq),vs_value,midfor.left.resultdef,[]);
+        jhsym.register_sym;
+        current_procinfo.procdef.localst.insertsym(jhsym);
+
+        { The point loops are emitted in i / k / j order (the original j and k
+          interchanged), so the innermost loop is j -- the CONTIGUOUS dimension of
+          both the write c[i*N+j] and the read b[k*N+j].  Interchanging the j and k
+          loops is bit-exact: c[i*N+j] is still touched exactly once per k, in
+          increasing k order (k is now the middle loop, j the inner), so the
+          per-cell reduction order is unchanged.  This is the composition of loop
+          tiling with loop interchange the tasklist asks for; without it the inner
+          loop would stride b by N and blocking could not improve locality. }
+
+        { point-j (innermost, contiguous):  for j := jt to jh do <body> }
+        pointj:=cfornode.create(
+          midfor.left.getcopy,
+          cloadnode.create(jtsym,jtsym.owner),
+          cloadnode.create(jhsym,jhsym.owner),
+          innerfor.t2.getcopy,false);
+
+        { point-k (middle, the full-range reduction):  for k := k0 to k1 do <point-j> }
+        newk:=cfornode.create(
+          innerfor.left.getcopy,
+          innerfor.right.getcopy,innerfor.t1.getcopy,
+          pointj,false);
+
+        { point-i (outer):  for i := it to ih do <point-k> }
+        pointi:=cfornode.create(
+          outerfor.left.getcopy,
+          cloadnode.create(itsym,itsym.owner),
+          cloadnode.create(ihsym,ihsym.owner),
+          newk,false);
+
+        { tile-j body:  jh := min(jt+B-1, N-1);  <point-i> }
+        tilejbody:=internalstatements(stmt);
+        addstatement(stmt,cassignmentnode.create(
+          cloadnode.create(jhsym,jhsym.owner),
+          tile_make_min(
+            caddnode.create(addn,cloadnode.create(jtsym,jtsym.owner),
+              cordconstnode.create(tile_block-1,midfor.left.resultdef,false)),
+            midfor.t1.getcopy,midfor.left.resultdef)));
+        addstatement(stmt,pointi);
+
+        { tile-j:  for jt := <j-from> to <j-to> step B do <tile-j body> }
+        tilej:=cfornode.create(
+          cloadnode.create(jtsym,jtsym.owner),
+          midfor.right.getcopy,midfor.t1.getcopy,tilejbody,false);
+        tfornode(tilej).loopstep:=cordconstnode.create(tile_block,midfor.left.resultdef,false);
+
+        { tile-i body:  ih := min(it+B-1, M-1);  <tile-j> }
+        tileibody:=internalstatements(stmt);
+        addstatement(stmt,cassignmentnode.create(
+          cloadnode.create(ihsym,ihsym.owner),
+          tile_make_min(
+            caddnode.create(addn,cloadnode.create(itsym,itsym.owner),
+              cordconstnode.create(tile_block-1,outerfor.left.resultdef,false)),
+            outerfor.t1.getcopy,outerfor.left.resultdef)));
+        addstatement(stmt,tilej);
+
+        { tile-i:  for it := <i-from> to <i-to> step B do <tile-i body> }
+        tilei:=cfornode.create(
+          cloadnode.create(itsym,itsym.owner),
+          outerfor.right.getcopy,outerfor.t1.getcopy,tileibody,false);
+        tfornode(tilei).loopstep:=cordconstnode.create(tile_block,outerfor.left.resultdef,false);
+
+        if cs_opt_report in current_settings.optimizerswitches then
+          OptRemark(outerfor.fileinfo,'looptile',
+            'perfect 3-deep matmul-shaped nest cache-blocked into '+tostr(tile_block)+
+            'x'+tostr(tile_block)+' tiles (point loops reordered i/k/j so the inner loop strides the contiguous dimension)');
+
+        oldnest:=n;
+        n:=tilei;
+        do_firstpass(n);
+        oldnest.free;
+        changed:=true;
+      end;
+
+    function tile_processloop_cb(var n : tnode; arg : pointer) : foreachnoderesult;
+      var
+        before : boolean;
+      begin
+        result:=fen_false;
+        if n.nodetype=forn then
+          begin
+            before:=ttilecontext(arg^).changed;
+            ttilecontext(arg^).processloop(n);
+            { recurse into a DECLINED node's children (so a nest wrapped in an
+              outer repeat-count loop is still reached); stop only after an actual
+              transform, when n is a freshly built replacement }
+            if ttilecontext(arg^).changed<>before then
+              result:=fen_norecurse_false;
+          end;
+      end;
+
+    function OptimizeLoopTile(node : tnode) : boolean;
+      var
+        ctx : ttilecontext;
+      begin
+        Result:=false;
+        if (cs_opt_size in current_settings.optimizerswitches) then
+          exit;
+        if not(pi_dfaavailable in current_procinfo.flags) then
+          exit;
+        ctx.root:=node;
+        ctx.changed:=false;
+        foreachnodestatic(pm_postprocess,node,@tile_processloop_cb,@ctx);
         Result:=ctx.changed;
       end;
 

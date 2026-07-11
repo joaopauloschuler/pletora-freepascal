@@ -1664,6 +1664,27 @@ implementation
                RedoDFA:=false;
              end;
 
+           { loop tiling / cache blocking: block a perfect three-level counted
+             matmul-shaped reduction nest  for i: for j: for k: C[wi]:=C[wi]+T
+             into cache-sized tiles over the two output loops i and j, emitting the
+             point loops in i/k/j order (j and k interchanged) so a reused operand
+             panel (b[k*N+j]) stays cache-resident and the inner j-loop strides the
+             contiguous dimension.  Run right after interchange and before the
+             vectorizer: the reordered unit-stride inner loop is left intact for it.
+             Needs valid DFA (it counts counter references to prove the counters
+             are dead outside the nest and rectangular); skips procedures with
+             labels like the loop passes below so control cannot enter a tiled body
+             mid-stream. }
+           if (cs_opt_looptile in current_settings.optimizerswitches)
+             and not(pi_has_label in flags) then
+             RedoDFA:=OptimizeLoopTile(code) or RedoDFA;
+
+           if RedoDFA then
+             begin
+               dfabuilder.redodfainfo(code);
+               RedoDFA:=false;
+             end;
+
            { unroll-and-jam: unroll the outer loop of a perfect two-level counted
              nest by a small factor and fuse (jam) the duplicated inner-loop
              bodies into one inner loop, so a value the inner body loads once
