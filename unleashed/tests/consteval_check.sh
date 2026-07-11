@@ -165,8 +165,64 @@ fail=0
 [ "$r_folded" -ge 3 ]                 || { echo "  X missing -OoREPORT folded remarks"; fail=1; }
 [ "$r_refuse" -ge 1 ]                 || { echo "  X missing -OoREPORT refusal remark"; fail=1; }
 
+# --- (9) float bit-exactness: a single/double proven-const routine folds and
+#         the folded literal is bit-for-bit identical to the SAME routine called
+#         at run time (mutable-global args of identical value -> a real call the
+#         folder must leave alone). Proves the evaluator rounds every step to the
+#         node precision exactly as SSE codegen does (incl. per-step single
+#         rounding and the compiler's auto x*x -> sqr). ---
+cat > fbit.pas <<'EOF'
+program fbit;
+{$mode objfpc}{$H+}{$Q-}{$R-}
+function schain(a, b: single): single;
+var t: single;
+begin
+  t := a * b + a - b;
+  t := t * t - a;          { auto-rewritten to sqr(t): must fold bit-exactly }
+  schain := t;
+end;
+function dchain(a, b: double): double;
+var i: longint; s: double;
+begin
+  s := 0.0;
+  for i := 1 to 7 do s := s + a * i - b;
+  dchain := s;
+end;
+var ga: single = 1.1; gb: single = 2.2;
+    gda: double = 3.3; gdb: double = 0.7;
+    fs, us: single; fd, ud: double;
+begin
+  fs := schain(1.1, 2.2);        { folded to a literal }
+  us := schain(ga, gb);          { runtime call (mutable globals) }
+  fd := dchain(3.3, 0.7);        { folded to a literal }
+  ud := dchain(gda, gdb);        { runtime call }
+  { emit raw IEEE bit patterns: folded==runtime iff bit-exact }
+  Writeln(PLongWord(@fs)^, ' ', PLongWord(@us)^, ' ',
+          PQWord(@fd)^, ' ', PQWord(@ud)^);
+end.
+EOF
+"$CC" $FLAGS -a -OoREPORT fbit.pas -ofbit >fbit.log 2>&1
+fbit_link=$?
+# schain/dchain each fold once (the const-arg site) and keep one runtime call
+n_fold_schain=$(grep -ciE 'consteval: call to schain folded' fbit.log)
+n_fold_dchain=$(grep -ciE 'consteval: call to dchain folded' fbit.log)
+n_call_schain=$(grep -ciE 'call[^A-Za-z0-9_]+.*SCHAIN' fbit.s)
+n_call_dchain=$(grep -ciE 'call[^A-Za-z0-9_]+.*DCHAIN' fbit.s)
+read -r bf_fs bf_us bf_fd bf_ud < <( ( ulimit -v 3000000; timeout 60 ./fbit ) 2>/dev/null )
+
+echo "(9) float bit-exact: single folded=$n_fold_schain runtime-calls=$n_call_schain  folded-bits=$bf_fs runtime-bits=$bf_us"
+echo "                     double folded=$n_fold_dchain runtime-calls=$n_call_dchain  folded-bits=$bf_fd runtime-bits=$bf_ud"
+
+[ "$fbit_link" -eq 0 ]                || { echo "  X float bit-exact program failed to link"; cat fbit.log; fail=1; }
+[ "$n_fold_schain" -ge 1 ]           || { echo "  X single const call not folded"; fail=1; }
+[ "$n_fold_dchain" -ge 1 ]           || { echo "  X double const call not folded"; fail=1; }
+[ "$n_call_schain" -eq 1 ]           || { echo "  X single: expected exactly the one runtime call to survive"; fail=1; }
+[ "$n_call_dchain" -eq 1 ]           || { echo "  X double: expected exactly the one runtime call to survive"; fail=1; }
+[ -n "$bf_fs" ] && [ "$bf_fs" = "$bf_us" ] || { echo "  X single folded literal not bit-identical to runtime"; fail=1; }
+[ -n "$bf_fd" ] && [ "$bf_fd" = "$bf_ud" ] || { echo "  X double folded literal not bit-identical to runtime"; fail=1; }
+
 if [ "$fail" -eq 0 ]; then
-  echo "PASS: -OoCONSTEVAL folds const calls (scalar, recursive, cross-unit) to literals; refuses over-budget/non-const/non-constant; sound and byte-identical to baseline"
+  echo "PASS: -OoCONSTEVAL folds const calls (scalar, recursive, cross-unit, counted-for, single/double float) to literals bit-exactly; refuses over-budget/non-const/non-constant; sound and byte-identical to baseline"
   exit 0
 else
   echo "FAIL: -OoCONSTEVAL"

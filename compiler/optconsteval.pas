@@ -35,16 +35,24 @@
         / exit and nested calls to OTHER proven-const routines (under a
         recursion cap) are interpreted; a hard step budget makes a long-running
         body degrade to "not folded" instead of hanging compilation.
-      * arithmetic is evaluated with the exact two's-complement semantics of the
-        generated code -- every intermediate is truncated to the node's own
-        (type-checked) result type, so the fold is bit-identical to what codegen
-        would have produced.
-      * FIRST CUT: deliberately ordinal/enum/boolean/char only.  Any float
-        (single/double/currency), set, array, record, string, pointer, taking an
-        address, div/mod (a proven-const routine never contains one -- optpure
-        treats division as trapping), shift, or any node the evaluator does not
-        model makes the site refuse to fold (it stays a runtime call).  Refusing
-        is always sound; only an optimisation is missed.
+      * ordinal arithmetic is evaluated with the exact two's-complement
+        semantics of the generated code -- every intermediate is truncated to
+        the node's own (type-checked) result type, so the fold is bit-identical
+        to what codegen would have produced.
+      * single/double float arithmetic (add/sub/mul, unary minus, comparison,
+        sqr, abs, int->float and single<->double conversion) is evaluated in a
+        double and ROUNDED to the node's own precision at every step -- a single
+        op rounds to single per step -- reproducing the per-operation rounding
+        SSE codegen performs, so a float fold is bit-for-bit identical too
+        (add/sub/mul of two singles are exact in a double, hence double-then-
+        round is the correctly-rounded single result). extended/comp/currency
+        are NOT modelled and make the site refuse.
+      * still out of scope (the site refuses -- always sound, only an
+        optimisation missed): set, array, record, string, pointer, taking an
+        address, div/mod and float division (a proven-const routine never
+        contains integer div/mod -- optpure treats it as trapping -- and float
+        division is excluded to avoid single double-rounding), sqrt/pi, or any
+        node the evaluator does not model.
 
     Distinct from -OoIPACP (clones a specialized body but still emits a call
     that runs at run time) and from GVN-PRE (reuses a run-time-computed value,
@@ -142,17 +150,33 @@ implementation
 
     { ---- structural eligibility -------------------------------------------- }
 
-    { a scalar type the first cut can hold in the value environment: any
-      ordinal (integer/enum/boolean/char).  Floats/pointers are excluded here. }
+    { a scalar type the value environment can hold as an ordinal: any ordinal
+      (integer/enum/boolean/char). }
     function ordinal_scalar(def : tdef) : boolean;
       begin
         result:=assigned(def) and is_ordinal(def);
       end;
 
+    { a float type the evaluator can model: single or double ONLY.  extended /
+      comp / currency are excluded (their codegen precision/semantics -- 80-bit
+      x87 vs SSE, fixed-point currency -- are not what this double-based
+      evaluator reproduces bit-for-bit). }
+    function foldable_float(def : tdef) : boolean;
+      begin
+        result:=assigned(def) and (is_single(def) or is_double(def));
+      end;
+
+    { a scalar the value environment can hold: an ordinal or a foldable float }
+    function foldable_scalar(def : tdef) : boolean;
+      begin
+        result:=ordinal_scalar(def) or foldable_float(def);
+      end;
+
     { does PD's signature make it a plausible const-eval target at all?  A
-      standalone (non-method, non-nested) routine with an ordinal result whose
-      visible parameters are by-value/const ordinals.  This is only a cheap
-      screen; the authoritative const verdict comes from optpure at use time. }
+      standalone (non-method, non-nested) routine with an ordinal/single/double
+      result whose visible parameters are by-value/const ordinals or floats.
+      This is only a cheap screen; the authoritative const verdict comes from
+      optpure at use time. }
     function proc_sig_eligible(pd : tprocdef) : boolean;
       var
         i : longint;
@@ -171,7 +195,7 @@ implementation
           exit;
         if ([po_external,po_assembler,po_interrupt,po_varargs]*pd.procoptions)<>[] then
           exit;
-        if not ordinal_scalar(pd.returndef) then
+        if not foldable_scalar(pd.returndef) then
           exit;
         for i:=0 to pd.paras.count-1 do
           begin
@@ -180,7 +204,7 @@ implementation
               exit;
             if not(pv.varspez in [vs_value,vs_const]) then
               exit;
-            if not ordinal_scalar(pv.vardef) then
+            if not foldable_scalar(pv.vardef) then
               exit;
           end;
         result:=true;
@@ -264,10 +288,24 @@ implementation
 
       tflow = (fl_normal, fl_break, fl_continue, fl_exit);
 
+      { a scalar value in the evaluator: either an ordinal (exact two's-complement
+        tconstexprint) or an IEEE float held in a double.  A float value is ALWAYS
+        kept already rounded to the precision of the node/def it came from -- a
+        single-typed value is a single-representable number stored in the double
+        -- so that every step is bit-identical to codegen (which rounds each SSE
+        single/double op to the operand type).  Only single/double are modelled;
+        extended/currency/comp make the site refuse. }
+      tcevalkind = (cev_ord, cev_flt);
+      tceval = record
+        kind : tcevalkind;
+        ord  : tconstexprint;   { valid when kind=cev_ord }
+        flt  : double;          { valid when kind=cev_flt (single values pre-rounded) }
+      end;
+
       { one call frame: a value environment plus the accumulating result }
       tenvpair = record
         sym : tsym;
-        val : tconstexprint;
+        val : tceval;
       end;
 
       pframe = ^tframe;
@@ -277,7 +315,7 @@ implementation
         envcount  : longint;
         depth     : longint;
         hasresult : boolean;
-        resultval : tconstexprint;
+        resultval : tceval;
         resultdef : tdef;
       end;
 
@@ -324,7 +362,81 @@ implementation
           end;
       end;
 
-    function env_lookup(f : pframe; sym : tsym; out v : tconstexprint) : boolean;
+    { ---- tceval helpers (float folding) ------------------------------------ }
+
+    { round D to the exact IEEE precision of DEF, reproducing the per-step
+      rounding SSE codegen performs: a single-typed result is rounded to single
+      (round-to-nearest), a double-typed result is already at target precision. }
+    function round_flt(d : double; def : tdef) : double;
+      begin
+        if is_single(def) then
+          result:=double(single(d))
+        else
+          result:=d;
+      end;
+
+    function mk_ord(const v : tconstexprint) : tceval;
+      begin
+        result.kind:=cev_ord;
+        result.ord:=v;
+        result.flt:=0.0;
+      end;
+
+    function mk_flt(d : double) : tceval;
+      begin
+        result.kind:=cev_flt;
+        result.ord:=make_cei(0,false);
+        result.flt:=d;
+      end;
+
+    { convert an already-evaluated value to what a store into DEF-typed storage
+      would hold: ordinal -> two's-complement truncation; float -> IEEE rounding;
+      an integer source feeding a float DEF is an int->float conversion, rounded
+      directly at the target precision (so a large int64 -> single is single-
+      rounded once, matching cvtsi2ss rather than double-rounding). Returns false
+      (site refuses) for a float source feeding an ordinal DEF. }
+    function coerce_to(f : pframe; const v : tceval; def : tdef; out r : tceval) : boolean;
+      begin
+        result:=true;
+        if foldable_float(def) then
+          begin
+            if v.kind=cev_flt then
+              r:=mk_flt(round_flt(v.flt,def))
+            else
+              begin
+                { int -> float }
+                if is_single(def) then
+                  begin
+                    if v.ord.signed then
+                      r:=mk_flt(double(single(v.ord.svalue)))
+                    else
+                      r:=mk_flt(double(single(v.ord.uvalue)));
+                  end
+                else
+                  begin
+                    if v.ord.signed then
+                      r:=mk_flt(double(v.ord.svalue))
+                    else
+                      r:=mk_flt(double(v.ord.uvalue));
+                  end;
+              end;
+          end
+        else if is_ordinal(def) then
+          begin
+            if v.kind=cev_ord then
+              r:=mk_ord(trunc_to(v.ord,def))
+            else
+              begin
+                fail(f,'float-to-ordinal conversion'); result:=false;
+              end;
+          end
+        else
+          begin
+            fail(f,'unsupported destination type'); result:=false;
+          end;
+      end;
+
+    function env_lookup(f : pframe; sym : tsym; out v : tceval) : boolean;
       var
         i : longint;
       begin
@@ -337,7 +449,7 @@ implementation
             end;
       end;
 
-    procedure env_store(f : pframe; sym : tsym; const v : tconstexprint);
+    procedure env_store(f : pframe; sym : tsym; const v : tceval);
       var
         i : longint;
       begin
@@ -360,17 +472,19 @@ implementation
                 (vo_is_funcret in tabstractvarsym(sym).varoptions);
       end;
 
-    function eval_expr(f : pframe; n : tnode; out v : tconstexprint) : boolean; forward;
+    function eval_expr(f : pframe; n : tnode; out v : tceval) : boolean; forward;
     function exec_stmt(f : pframe; n : tnode) : tflow; forward;
-    function eval_const_call(f : pframe; call : tcallnode; out v : tconstexprint) : boolean; forward;
+    function eval_const_call(f : pframe; call : tcallnode; out v : tceval) : boolean; forward;
 
-    { evaluate an ordinal expression; false (and f.failed set) on anything the
-      first cut does not model or cannot fold soundly }
-    function eval_expr(f : pframe; n : tnode; out v : tconstexprint) : boolean;
+    { evaluate an ordinal- or float-valued expression; false (and f.failed set)
+      on anything the evaluator does not model or cannot fold soundly }
+    function eval_expr(f : pframe; n : tnode; out v : tceval) : boolean;
       var
-        lv,rv : tconstexprint;
+        lv,rv : tceval;
+        ov : tconstexprint;
         sym : tsym;
         b : boolean;
+        fres : double;
       begin
         result:=false;
         if f^.shared^.failed then
@@ -384,16 +498,27 @@ implementation
           begin
             fail(f,'step budget exceeded'); exit;
           end;
-        { the first cut is ordinal-only: any float-typed sub-expression is out }
-        if assigned(n.resultdef) and not is_ordinal(n.resultdef) then
+        { the evaluator models ordinals and single/double floats; anything else
+          (extended/comp/currency, set, string, pointer, ...) makes the site
+          refuse }
+        if assigned(n.resultdef) and
+           not(is_ordinal(n.resultdef) or foldable_float(n.resultdef)) then
           begin
-            fail(f,'non-ordinal value'); exit;
+            fail(f,'unsupported value type'); exit;
           end;
         case n.nodetype of
           ordconstn:
             begin
-              v:=tordconstnode(n).value;
-              v:=trunc_to(v,n.resultdef);
+              v:=mk_ord(trunc_to(tordconstnode(n).value,n.resultdef));
+              result:=true;
+            end;
+          realconstn:
+            begin
+              if not foldable_float(n.resultdef) then
+                begin fail(f,'unsupported float constant'); exit; end;
+              { value_real is bestreal (widest); round once to the literal's own
+                precision, matching the single/double constant codegen emits }
+              v:=mk_flt(round_flt(trealconstnode(n).value_real,n.resultdef));
               result:=true;
             end;
           loadn:
@@ -423,90 +548,141 @@ implementation
             begin
               if not eval_expr(f,ttypeconvnode(n).left,lv) then
                 exit;
-              v:=trunc_to(lv,n.resultdef);
-              result:=true;
+              { ordinal wraparound, int->float rounding, single<->double
+                rounding; a float->ordinal cast makes the site refuse }
+              result:=coerce_to(f,lv,n.resultdef,v);
             end;
           addn,subn,muln:
             begin
-              if ([cs_check_overflow,cs_check_range]*n.localswitches)<>[] then
-                begin
-                  fail(f,'checked arithmetic'); exit;
-                end;
               if not eval_expr(f,tbinarynode(n).left,lv) then exit;
               if not eval_expr(f,tbinarynode(n).right,rv) then exit;
-              case n.nodetype of
-                addn: v:=lv+rv;
-                subn: v:=lv-rv;
-                muln: v:=lv*rv;
-                else
-                  ; { unreachable: outer case matched add/sub/mul }
-              end;
-              v:=trunc_to(v,n.resultdef);
+              if foldable_float(n.resultdef) then
+                begin
+                  { round every intermediate to the node's own precision so a
+                    single op rounds to single per step (add/sub/mul of two
+                    single values are exact in double, so double-then-round is
+                    the correctly-rounded single result -- bit-identical to the
+                    addss/subss/mulss codegen would emit) }
+                  if (lv.kind<>cev_flt) or (rv.kind<>cev_flt) then
+                    begin fail(f,'non-float arithmetic operand'); exit; end;
+                  case n.nodetype of
+                    addn: fres:=lv.flt+rv.flt;
+                    subn: fres:=lv.flt-rv.flt;
+                    muln: fres:=lv.flt*rv.flt;
+                    else
+                      fres:=0.0; { unreachable }
+                  end;
+                  v:=mk_flt(round_flt(fres,n.resultdef));
+                end
+              else
+                begin
+                  if ([cs_check_overflow,cs_check_range]*n.localswitches)<>[] then
+                    begin fail(f,'checked arithmetic'); exit; end;
+                  if (lv.kind<>cev_ord) or (rv.kind<>cev_ord) then
+                    begin fail(f,'non-ordinal arithmetic operand'); exit; end;
+                  case n.nodetype of
+                    addn: ov:=lv.ord+rv.ord;
+                    subn: ov:=lv.ord-rv.ord;
+                    muln: ov:=lv.ord*rv.ord;
+                    else
+                      ov:=make_cei(0,false); { unreachable }
+                  end;
+                  v:=mk_ord(trunc_to(ov,n.resultdef));
+                end;
               result:=true;
             end;
           unaryminusn:
             begin
-              if ([cs_check_overflow,cs_check_range]*n.localswitches)<>[] then
-                begin
-                  fail(f,'checked arithmetic'); exit;
-                end;
               if not eval_expr(f,tunarynode(n).left,lv) then exit;
-              v:=trunc_to(-lv,n.resultdef);
+              if foldable_float(n.resultdef) then
+                begin
+                  if lv.kind<>cev_flt then
+                    begin fail(f,'non-float negation'); exit; end;
+                  v:=mk_flt(round_flt(-lv.flt,n.resultdef));
+                end
+              else
+                begin
+                  if ([cs_check_overflow,cs_check_range]*n.localswitches)<>[] then
+                    begin fail(f,'checked arithmetic'); exit; end;
+                  if lv.kind<>cev_ord then
+                    begin fail(f,'non-ordinal negation'); exit; end;
+                  v:=mk_ord(trunc_to(-lv.ord,n.resultdef));
+                end;
               result:=true;
             end;
           equaln,unequaln,ltn,lten,gtn,gten:
             begin
               if not eval_expr(f,tbinarynode(n).left,lv) then exit;
               if not eval_expr(f,tbinarynode(n).right,rv) then exit;
-              case n.nodetype of
-                equaln:   b:=lv=rv;
-                unequaln: b:=lv<>rv;
-                ltn:      b:=lv<rv;
-                lten:     b:=lv<=rv;
-                gtn:      b:=lv>rv;
-                gten:     b:=lv>=rv;
-                else
-                  begin b:=false; { unreachable: outer case matched a relop } end;
-              end;
-              v:=make_cei(ord(b),false);
+              if (lv.kind=cev_flt) or (rv.kind=cev_flt) then
+                begin
+                  if (lv.kind<>cev_flt) or (rv.kind<>cev_flt) then
+                    begin fail(f,'mixed float comparison'); exit; end;
+                  case n.nodetype of
+                    equaln:   b:=lv.flt=rv.flt;
+                    unequaln: b:=lv.flt<>rv.flt;
+                    ltn:      b:=lv.flt<rv.flt;
+                    lten:     b:=lv.flt<=rv.flt;
+                    gtn:      b:=lv.flt>rv.flt;
+                    gten:     b:=lv.flt>=rv.flt;
+                    else
+                      begin b:=false; { unreachable } end;
+                  end;
+                end
+              else
+                case n.nodetype of
+                  equaln:   b:=lv.ord=rv.ord;
+                  unequaln: b:=lv.ord<>rv.ord;
+                  ltn:      b:=lv.ord<rv.ord;
+                  lten:     b:=lv.ord<=rv.ord;
+                  gtn:      b:=lv.ord>rv.ord;
+                  gten:     b:=lv.ord>=rv.ord;
+                  else
+                    begin b:=false; { unreachable } end;
+                end;
+              v:=mk_ord(make_cei(ord(b),false));
               result:=true;
             end;
           andn,orn,xorn:
             begin
               if not eval_expr(f,tbinarynode(n).left,lv) then exit;
               if not eval_expr(f,tbinarynode(n).right,rv) then exit;
+              if (lv.kind<>cev_ord) or (rv.kind<>cev_ord) then
+                begin fail(f,'non-ordinal bitwise operand'); exit; end;
               if is_boolean(n.resultdef) then
                 begin
                   { logical: operands are 0/1 }
                   case n.nodetype of
-                    andn: b:=(lv.uvalue<>0) and (rv.uvalue<>0);
-                    orn:  b:=(lv.uvalue<>0) or (rv.uvalue<>0);
-                    xorn: b:=(lv.uvalue<>0) xor (rv.uvalue<>0);
+                    andn: b:=(lv.ord.uvalue<>0) and (rv.ord.uvalue<>0);
+                    orn:  b:=(lv.ord.uvalue<>0) or (rv.ord.uvalue<>0);
+                    xorn: b:=(lv.ord.uvalue<>0) xor (rv.ord.uvalue<>0);
                     else
-                      begin b:=false; { unreachable: outer case matched and/or/xor } end;
+                      begin b:=false; { unreachable } end;
                   end;
-                  v:=make_cei(ord(b),false);
+                  v:=mk_ord(make_cei(ord(b),false));
                 end
               else
                 begin
                   case n.nodetype of
-                    andn: v:=lv and rv;
-                    orn:  v:=lv or rv;
-                    xorn: v:=lv xor rv;
+                    andn: ov:=lv.ord and rv.ord;
+                    orn:  ov:=lv.ord or rv.ord;
+                    xorn: ov:=lv.ord xor rv.ord;
                     else
-                      ; { unreachable: outer case matched and/or/xor }
+                      ov:=make_cei(0,false); { unreachable }
                   end;
-                  v:=trunc_to(v,n.resultdef);
+                  v:=mk_ord(trunc_to(ov,n.resultdef));
                 end;
               result:=true;
             end;
           notn:
             begin
               if not eval_expr(f,tunarynode(n).left,lv) then exit;
+              if lv.kind<>cev_ord then
+                begin fail(f,'non-ordinal not'); exit; end;
               if is_boolean(n.resultdef) then
-                v:=make_cei(ord(lv.uvalue=0),false)
+                v:=mk_ord(make_cei(ord(lv.ord.uvalue=0),false))
               else
-                v:=trunc_to(make_cei(not lv.uvalue,false),n.resultdef);
+                v:=mk_ord(trunc_to(make_cei(not lv.ord.uvalue,false),n.resultdef));
               result:=true;
             end;
           inlinen:
@@ -514,15 +690,41 @@ implementation
               in_ord_x,in_chr_byte:
                 begin
                   if not eval_expr(f,tinlinenode(n).left,lv) then exit;
-                  v:=trunc_to(lv,n.resultdef);
+                  if lv.kind<>cev_ord then
+                    begin fail(f,'non-ordinal intrinsic operand'); exit; end;
+                  v:=mk_ord(trunc_to(lv.ord,n.resultdef));
                   result:=true;
                 end;
               in_abs_long:
                 begin
                   if not eval_expr(f,tinlinenode(n).left,lv) then exit;
-                  if lv.is_negative then
-                    lv:=-lv;
-                  v:=trunc_to(lv,n.resultdef);
+                  if lv.kind<>cev_ord then
+                    begin fail(f,'non-ordinal abs operand'); exit; end;
+                  ov:=lv.ord;
+                  if ov.is_negative then
+                    ov:=-ov;
+                  v:=mk_ord(trunc_to(ov,n.resultdef));
+                  result:=true;
+                end;
+              in_sqr_real:
+                { the compiler auto-rewrites  x*x  to sqr(x); codegen emits a
+                  single mulss/mulsd, so x*x rounded to the node precision is
+                  bit-identical (exact in double for single operands, native
+                  double mul for double) }
+                begin
+                  if not eval_expr(f,tinlinenode(n).left,lv) then exit;
+                  if (lv.kind<>cev_flt) or not foldable_float(n.resultdef) then
+                    begin fail(f,'non-float sqr'); exit; end;
+                  v:=mk_flt(round_flt(lv.flt*lv.flt,n.resultdef));
+                  result:=true;
+                end;
+              in_abs_real:
+                { |x| just clears the sign bit -- exact, rounding is a no-op }
+                begin
+                  if not eval_expr(f,tinlinenode(n).left,lv) then exit;
+                  if (lv.kind<>cev_flt) or not foldable_float(n.resultdef) then
+                    begin fail(f,'non-float abs'); exit; end;
+                  v:=mk_flt(round_flt(abs(lv.flt),n.resultdef));
                   result:=true;
                 end;
               else
@@ -561,7 +763,8 @@ implementation
     function exec_stmt(f : pframe; n : tnode) : tflow;
       var
         cur : tnode;
-        cv,fromv,tov,stepv : tconstexprint;
+        cv : tceval;
+        fromv,tov,ctr,ordv : tconstexprint;
         sym : tsym;
         target : tnode;
         seldef : tdef;
@@ -606,7 +809,8 @@ implementation
                 end;
               if not eval_expr(f,tassignmentnode(n).right,cv) then
                 exit;
-              cv:=trunc_to(cv,target.resultdef);
+              if not coerce_to(f,cv,target.resultdef,cv) then
+                exit;
               sym:=tloadnode(target).symtableentry;
               if is_funcret_sym(sym) then
                 begin
@@ -622,7 +826,7 @@ implementation
             begin
               if not eval_expr(f,tifnode(n).left,cv) then
                 exit;
-              if cv.uvalue<>0 then
+              if cv.ord.uvalue<>0 then
                 result:=exec_stmt(f,tifnode(n).right)
               else if assigned(tifnode(n).t1) then
                 result:=exec_stmt(f,tifnode(n).t1);
@@ -638,8 +842,8 @@ implementation
                     begin
                       if not eval_expr(f,tloopnode(n).left,cv) then exit;
                       if lnf_checknegate in tloopnode(n).loopflags then
-                        cv:=make_cei(ord(cv.uvalue=0),false);
-                      if cv.uvalue=0 then
+                        cv:=mk_ord(make_cei(ord(cv.ord.uvalue=0),false));
+                      if cv.ord.uvalue=0 then
                         break;
                     end;
                   result:=exec_stmt(f,tloopnode(n).right);
@@ -652,8 +856,8 @@ implementation
                     begin
                       if not eval_expr(f,tloopnode(n).left,cv) then exit;
                       if lnf_checknegate in tloopnode(n).loopflags then
-                        cv:=make_cei(ord(cv.uvalue=0),false);
-                      if cv.uvalue=0 then
+                        cv:=mk_ord(make_cei(ord(cv.ord.uvalue=0),false));
+                      if cv.ord.uvalue=0 then
                         break;
                     end;
                 end;
@@ -666,14 +870,18 @@ implementation
               sym:=tloadnode(target).symtableentry;
               if not((sym is tlocalvarsym) or (sym is tparavarsym)) then
                 begin fail(f,'for-loop counter not a local'); exit; end;
-              if not eval_expr(f,tfornode(n).right,fromv) then exit;
-              if not eval_expr(f,tfornode(n).t1,tov) then exit;
+              if not eval_expr(f,tfornode(n).right,cv) then exit;
+              if cv.kind<>cev_ord then
+                begin fail(f,'non-ordinal for-loop bound'); exit; end;
+              fromv:=trunc_to(cv.ord,target.resultdef);
+              if not eval_expr(f,tfornode(n).t1,cv) then exit;
+              if cv.kind<>cev_ord then
+                begin fail(f,'non-ordinal for-loop bound'); exit; end;
+              tov:=trunc_to(cv.ord,target.resultdef);
               backward:=lnf_backward in tfornode(n).loopflags;
-              fromv:=trunc_to(fromv,target.resultdef);
-              tov:=trunc_to(tov,target.resultdef);
-              cv:=fromv;
+              ctr:=fromv;
               { empty-range check up front (Pascal evaluates bounds once) }
-              if (not backward and (cv>tov)) or (backward and (cv<tov)) then
+              if (not backward and (ctr>tov)) or (backward and (ctr<tov)) then
                 { loop body never executes }
               else
                 while not f^.shared^.failed do
@@ -681,7 +889,7 @@ implementation
                     dec(f^.shared^.steps);
                     if f^.shared^.steps<=0 then
                       begin fail(f,'step budget exceeded'); exit; end;
-                    env_store(f,sym,cv);
+                    env_store(f,sym,mk_ord(ctr));
                     result:=exec_stmt(f,tfornode(n).t2);
                     if result=fl_break then
                       begin result:=fl_normal; break; end;
@@ -689,12 +897,12 @@ implementation
                       exit;
                     result:=fl_normal;
                     { stop at the boundary to avoid overflow past high/low }
-                    if cv=tov then
+                    if ctr=tov then
                       break;
                     if backward then
-                      cv:=trunc_to(cv-make_cei(1,true),target.resultdef)
+                      ctr:=trunc_to(ctr-make_cei(1,true),target.resultdef)
                     else
-                      cv:=trunc_to(cv+make_cei(1,true),target.resultdef);
+                      ctr:=trunc_to(ctr+make_cei(1,true),target.resultdef);
                   end;
             end;
           casen:
@@ -702,9 +910,11 @@ implementation
               casen_node:=tcasenode(n);
               seldef:=casen_node.left.resultdef;
               if not eval_expr(f,casen_node.left,cv) then exit;
+              if cv.kind<>cev_ord then
+                begin fail(f,'non-ordinal case selector'); exit; end;
               sgn:=is_signed(seldef);
-              cv:=make_cei(cv.uvalue,sgn);
-              blk:=case_find_block(casen_node.labels,cv,sgn);
+              ordv:=make_cei(cv.ord.uvalue,sgn);
+              blk:=case_find_block(casen_node.labels,ordv,sgn);
               if blk=-2 then
                 begin fail(f,'non-ordinal case'); exit; end;
               if blk>=0 then
@@ -720,7 +930,7 @@ implementation
               if assigned(texitnode(n).resultexpr) then
                 begin
                   if not eval_expr(f,texitnode(n).resultexpr,cv) then exit;
-                  f^.resultval:=trunc_to(cv,f^.resultdef);
+                  if not coerce_to(f,cv,f^.resultdef,f^.resultval) then exit;
                   f^.hasresult:=true;
                 end;
               result:=fl_exit;
@@ -741,13 +951,13 @@ implementation
 
     { seed a fresh frame from a call's actual constant arguments and interpret
       the callee body; STEP/DEPTH state is shared with the enclosing frame }
-    function eval_const_call(f : pframe; call : tcallnode; out v : tconstexprint) : boolean;
+    function eval_const_call(f : pframe; call : tcallnode; out v : tceval) : boolean;
       var
         callee : tprocdef;
         body : tnode;
         pn : tcallparanode;
         sub : tframe;
-        av : tconstexprint;
+        av,seeded : tceval;
       begin
         result:=false;
         if assigned(call.methodpointer) then
@@ -758,8 +968,8 @@ implementation
         callee:=tprocdef(call.procdefinition);
         if not proc_is_const(callee) then
           begin fail(f,'callee not proven const'); exit; end;
-        if not ordinal_scalar(callee.returndef) then
-          begin fail(f,'callee result not ordinal'); exit; end;
+        if not foldable_scalar(callee.returndef) then
+          begin fail(f,'callee result not a foldable scalar'); exit; end;
         if f^.depth+1>consteval_depth_cap then
           begin fail(f,'recursion cap exceeded'); exit; end;
         body:=get_callee_body(callee);
@@ -782,11 +992,13 @@ implementation
                (pn.parasym is tparavarsym) and
                not(vo_is_hidden_para in tparavarsym(pn.parasym).varoptions) then
               begin
-                if not ordinal_scalar(tparavarsym(pn.parasym).vardef) then
-                  begin fail(f,'non-ordinal argument'); exit; end;
+                if not foldable_scalar(tparavarsym(pn.parasym).vardef) then
+                  begin fail(f,'non-foldable argument'); exit; end;
                 if not eval_expr(f,pn.left,av) then
                   exit;
-                env_store(@sub,tsym(pn.parasym),trunc_to(av,tparavarsym(pn.parasym).vardef));
+                if not coerce_to(f,av,tparavarsym(pn.parasym).vardef,seeded) then
+                  exit;
+                env_store(@sub,tsym(pn.parasym),seeded);
               end;
             pn:=tcallparanode(pn.right);
           end;
@@ -797,8 +1009,7 @@ implementation
           exit;
         if not sub.hasresult then
           begin fail(f,'callee never assigned its result'); exit; end;
-        v:=trunc_to(sub.resultval,callee.returndef);
-        result:=true;
+        result:=coerce_to(f,sub.resultval,callee.returndef,v);
       end;
 
     { ---- top-level call-site folding --------------------------------------- }
@@ -812,7 +1023,7 @@ implementation
         pn : tcallparanode;
         shared : tceshared;
         top : tframe;
-        av : tconstexprint;
+        av,seeded : tceval;
         argcount : longint;
       begin
         result:=nil;
@@ -825,10 +1036,11 @@ implementation
         callee:=tprocdef(call.procdefinition);
         if not proc_is_const(callee) then
           begin reason:='not proven const'; exit; end;
-        if not ordinal_scalar(callee.returndef) then
-          begin reason:='result not ordinal (first cut)'; exit; end;
+        if not foldable_scalar(callee.returndef) then
+          begin reason:='result not a foldable scalar'; exit; end;
 
-        { every actual must be a compile-time ordinal constant }
+        { every actual must be a compile-time constant of a foldable scalar type:
+          an ordinal constant, or a single/double real constant }
         argcount:=0;
         pn:=tcallparanode(call.left);
         while assigned(pn) do
@@ -837,10 +1049,11 @@ implementation
                not(vo_is_hidden_para in tparavarsym(pn.parasym).varoptions) then
               begin
                 inc(argcount);
-                if not assigned(pn.left) or (pn.left.nodetype<>ordconstn) then
+                if not assigned(pn.left) or
+                   not(pn.left.nodetype in [ordconstn,realconstn]) then
                   begin reason:='non-constant argument'; exit; end;
-                if not ordinal_scalar(pn.left.resultdef) then
-                  begin reason:='non-ordinal argument'; exit; end;
+                if not foldable_scalar(pn.left.resultdef) then
+                  begin reason:='non-foldable argument'; exit; end;
               end;
             pn:=tcallparanode(pn.right);
           end;
@@ -867,8 +1080,12 @@ implementation
                (pn.parasym is tparavarsym) and
                not(vo_is_hidden_para in tparavarsym(pn.parasym).varoptions) then
               begin
-                av:=tordconstnode(pn.left).value;
-                env_store(@top,tsym(pn.parasym),trunc_to(av,tparavarsym(pn.parasym).vardef));
+                { evaluate the (constant) actual and coerce to the parameter type }
+                if not eval_expr(@top,pn.left,av) then
+                  begin reason:=shared.reason; exit; end;
+                if not coerce_to(@top,av,tparavarsym(pn.parasym).vardef,seeded) then
+                  begin reason:=shared.reason; exit; end;
+                env_store(@top,tsym(pn.parasym),seeded);
               end;
             pn:=tcallparanode(pn.right);
           end;
@@ -880,8 +1097,13 @@ implementation
         if not top.hasresult then
           begin reason:='result never assigned'; exit; end;
 
-        result:=cordconstnode.create(trunc_to(top.resultval,callee.returndef),
-          callee.returndef,false);
+        { emit the computed literal: an ordinal const for an ordinal result, a
+          real const (already rounded to the result precision) for a float one }
+        if top.resultval.kind=cev_flt then
+          result:=crealconstnode.create(top.resultval.flt,callee.returndef)
+        else
+          result:=cordconstnode.create(trunc_to(top.resultval.ord,callee.returndef),
+            callee.returndef,false);
         typecheckpass(result);
       end;
 
