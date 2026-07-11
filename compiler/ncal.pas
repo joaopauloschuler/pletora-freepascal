@@ -351,7 +351,7 @@ implementation
     uses
       systems,
       verbose,globals,fmodule,ppu,
-      aasmbase,aasmdata,
+      aasmbase,aasmtai,aasmdata,
       symconst,defutil,defcmp,
       htypechk,pass_1,
       ncnv,nflw,nld,ninl,nadd,ncon,nmem,nset,nobjc,
@@ -5043,10 +5043,41 @@ implementation
       end;
 
 
+    { FPC Unleashed (Task B): true when the inline body contains an asm block
+      with a top_local operand (a param/local/result reference). Such blocks can
+      only be spliced into a SAME-UNIT caller: the caller-frame materialisation
+      (optcall.expand_inline_asm_operands) relies on matching the operand's
+      resolved localsym against the call's parasyms, which a body loaded from
+      another unit's ppu does not line up soundly. }
+    function asm_block_references_local(var n: tnode; arg: pointer): foreachnoderesult;
+      var
+        hp : tai;
+        i  : longint;
+      begin
+        result:=fen_false;
+        if (n.nodetype=asmn) and assigned(tasmnode(n).p_asm) then
+          begin
+            hp:=tai(tasmnode(n).p_asm.first);
+            while assigned(hp) do
+              begin
+                if hp.typ=ait_instruction then
+                  for i:=0 to tai_cpu_abstract(hp).ops-1 do
+                    if tai_cpu_abstract(hp).oper[i]^.typ=top_local then
+                      begin
+                        pboolean(arg)^:=true;
+                        exit(fen_norecurse_true);
+                      end;
+                hp:=tai(hp.next);
+              end;
+          end;
+      end;
+
+
     procedure tcallnode.check_inlining;
       var
         st   : tsymtable;
         para : tcallparanode;
+        asmlocal : boolean;
       begin
         { Can we inline the procedure? }
         if (po_inline in procdefinition.procoptions) and
@@ -5055,6 +5086,19 @@ implementation
            heuristics_favors_inlining then
           begin
             include(callnodeflags,cnf_do_inline);
+            { asm blocks referencing a local/param/result can only be spliced
+              into a same-unit caller (see asm_block_references_local) }
+            if not procdefinition.in_currentunit and
+               (pi_has_assembler_block in tprocdef(procdefinition).inlininginfo^.flags) then
+              begin
+                asmlocal:=false;
+                foreachnodestatic(tprocdef(procdefinition).inlininginfo^.code,@asm_block_references_local,@asmlocal);
+                if asmlocal then
+                  begin
+                    Comment(V_lineinfo+V_Debug,'Not inlining "'+tprocdef(procdefinition).procsym.realname+'", asm block references a local/parameter/result across units');
+                    exclude(callnodeflags,cnf_do_inline);
+                  end;
+              end;
             { Check if we can inline the procedure when it references proc/var that
               are not in the globally available }
             st:=procdefinition.owner;

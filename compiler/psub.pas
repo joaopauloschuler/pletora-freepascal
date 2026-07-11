@@ -208,13 +208,49 @@ implementation
        ;
 
     { FPC Unleashed helpers: decide whether the asm STATEMENT blocks in an
-      inline routine's body can be spliced into a caller.  An asm block is
-      "inline-safe" when none of its operands reference a local variable,
-      parameter or the function result -- those show up as top_local operands
-      (resolved through tabstractnormalvarsym.localloc at codegen) or, for the
-      TP-style INLINE() form, as ait_const entries whose symbol is still an
-      unresolved AB_NONE local placeholder.  Only registers, immediates and
-      global symbols survive verbatim relocation into another frame. }
+      inline routine's body can be spliced into a caller.  Operands referencing
+      a local variable, parameter or the function result show up as top_local
+      operands (resolved through tabstractnormalvarsym.localloc at codegen) or,
+      for the TP-style INLINE() form, as ait_const entries whose symbol is still
+      an unresolved AB_NONE local placeholder.
+
+      Registers/immediates/GLOBAL symbols survive verbatim relocation into
+      another frame.  A top_local operand is ALSO handleable (Task B) when it
+      references a value parameter, a plain local or the ordinal/pointer function
+      result: optcall.expand_inline_asm_operands materialises each such callee
+      sym as a REAL localvarsym in the caller frame, prepends the argument init
+      and rebinds the operand.  We stay conservative and still refuse the cases
+      that path cannot serve soundly: by-reference/var/out/const-ref parameters
+      and managed or aggregate (non-ordinal, non-pointer) operands, and the
+      TP-style INLINE() AB_NONE placeholders. }
+
+    { true when a top_local asm operand referencing callee sym `p` can be
+      materialised in the caller frame by expand_inline_asm_operands }
+    function inline_asm_local_operand_ok(p: pointer): boolean;
+      var
+        vs : tabstractnormalvarsym;
+      begin
+        result:=false;
+        if not assigned(p) then
+          exit;
+        vs:=tabstractnormalvarsym(p);
+        if not(vs.typ in [paravarsym,localvarsym]) then
+          exit;
+        { by-reference / var / out / const-ref params carry a pointer, not a
+          plain value -- the caller-local rebinding would copy the pointer }
+        if (vs.typ=paravarsym) and (tparavarsym(vs).varspez<>vs_value) then
+          exit;
+        if not assigned(vs.vardef) then
+          exit;
+        { managed types need refcount/init-final traffic the asm splice omits;
+          aggregates (records/arrays/sets) are not covered by the value copy }
+        if is_managed_type(vs.vardef) then
+          exit;
+        if not(is_ordinal(vs.vardef) or is_pointer(vs.vardef)) then
+          exit;
+        result:=true;
+      end;
+
     { returns '' when the block is inline-safe, otherwise the reason it is not }
     function inline_asm_block_reason(p_asm: TAsmList): string;
       var
@@ -230,12 +266,13 @@ implementation
             case hp.typ of
               ait_instruction :
                 for i:=0 to tai_cpu_abstract(hp).ops-1 do
-                  if tai_cpu_abstract(hp).oper[i]^.typ=top_local then
-                    exit('assembler block referencing a local variable, parameter or function result');
+                  if (tai_cpu_abstract(hp).oper[i]^.typ=top_local) and
+                     not inline_asm_local_operand_ok(tai_cpu_abstract(hp).oper[i]^.localoper^.localsym) then
+                    exit('assembler block referencing a by-reference parameter, managed or aggregate operand');
               ait_const :
                 if assigned(tai_const(hp).sym) and
                    (tai_const(hp).sym.bind=AB_NONE) then
-                  exit('assembler block referencing a local variable, parameter or function result');
+                  exit('assembler block referencing a TP-style INLINE() local placeholder');
               { AB_LOCAL asm labels are made unique per inline site by
                 optcall.unique_inline_asm_labels, so they no longer block inlining }
               else
