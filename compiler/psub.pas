@@ -139,6 +139,11 @@ interface
       generate_code_tree, with the module static symtable on the symtablestack. }
     procedure ipacp_process_main_body(mainpi:tcgprocinfo);
 
+    { -OoCONSTEVAL: fold const-routine calls with all-constant arguments in the
+      main program body into literals.  Must be called after MAINPI.parse_body
+      and before its generate_code_tree. }
+    procedure consteval_process_main_body(mainpi:tcgprocinfo);
+
     procedure import_external_proc(pd:tprocdef);
 
 
@@ -184,6 +189,7 @@ implementation
        optpure,
        optpartialinline,
        optipacp,
+       optconsteval,
        optipara,
        opticf,
        optsra,
@@ -1923,8 +1929,10 @@ implementation
          summary is available to every routine compiled after it in the unit;
          mutually-recursive SCCs are resolved by the on-demand fixpoint in
          optpure. Opt-in via -OoPURE; the flags default to "impure" for routines
-         we never analysed (e.g. loaded from other units). }
-       if cs_opt_pure in current_settings.optimizerswitches then
+         we never analysed (e.g. loaded from other units). -OoCONSTEVAL consumes
+         the "const" verdict (and streams it cross-unit via optsum_pure), so it
+         implies running this analysis as well. }
+       if ([cs_opt_pure,cs_opt_consteval]*current_settings.optimizerswitches)<>[] then
          AnalyzeProcPurity(procdef,code);
 
        { global value numbering + full-redundancy elimination: number
@@ -2662,6 +2670,18 @@ implementation
         if (cs_opt_ipacp in current_settings.optimizerswitches) and
            not(procdef.has_inlininginfo) and not(has_nestedprocs) and
            ipacp_crossunit_retain_candidate(procdef,code,flags,has_nestedprocs) then
+          CreateInlineInfo;   { deliberately WITHOUT include(procoptions,po_inline) }
+
+        { -OoCONSTEVAL cross-unit: retain the body of a const-eligible routine
+          reachable from another unit (an interface routine, or one already
+          inline) as inlininginfo so its tree is streamed into this unit's PPU.
+          A caller in a USED unit interprets that tree at compile time to fold a
+          call with all-constant arguments into a literal.  Retained WITHOUT
+          po_inline (ordinary call/inlining behaviour is unchanged; only
+          optconsteval consumes the tree). }
+        if (cs_opt_consteval in current_settings.optimizerswitches) and
+           not(procdef.has_inlininginfo) and not(has_nestedprocs) and
+           consteval_crossunit_retain_candidate(procdef,code,flags,has_nestedprocs) then
           CreateInlineInfo;   { deliberately WITHOUT include(procoptions,po_inline) }
 
         templist:=TAsmList.create;
@@ -3773,6 +3793,28 @@ implementation
       end;
 
 
+    procedure consteval_process_main_body(mainpi:tcgprocinfo);
+      var
+        cecode : tnode;
+      begin
+        if not (cs_opt_consteval in current_settings.optimizerswitches) then
+          exit;
+        if not assigned(mainpi) or not assigned(mainpi.procdef) or
+           not assigned(mainpi.code) then
+          exit;
+        if mainpi.procdef.proctypeoption<>potype_proginit then
+          exit;
+        cecode:=mainpi.code;
+        { the caller's symtables must be reachable while the folded-in literals
+          are typechecked; for the main proc the localst IS the module static
+          symtable (already on the stack) but keep add/remove for symmetry }
+        mainpi.add_to_symtablestack;
+        consteval_process_calls(mainpi.procdef,cecode);
+        mainpi.remove_from_symtablestack;
+        mainpi.code:=cecode;
+      end;
+
+
     procedure read_proc_body(old_current_procinfo:tprocinfo;pd:tprocdef);
       {
         Parses the procedure directives, then parses the procedure body, then
@@ -3869,6 +3911,25 @@ implementation
             ipacp_code:=tcgprocinfo(current_procinfo).code;
             tcgprocinfo(current_procinfo).add_to_symtablestack;
             ipacp_process_calls(pd,ipacp_code,ipacp_pending);
+            tcgprocinfo(current_procinfo).remove_from_symtablestack;
+            tcgprocinfo(current_procinfo).code:=ipacp_code;
+          end;
+
+        { -OoCONSTEVAL: stash this routine's pre-codegen body as a template for
+          later callers, then scan its own body for direct calls to an
+          already-compiled proven-const routine whose arguments are all
+          compile-time constants and replace each with the computed literal
+          (the callee's const verdict, computed during its own generate_code_tree
+          above, is already available).  Runs pre-firstpass so the replacement
+          literal feeds the caller's normal folding cascade. }
+        if (cs_opt_consteval in current_settings.optimizerswitches) and
+           (not isnestedproc) and
+           (not(df_generic in pd.defoptions)) then
+          begin
+            consteval_stash_candidate(pd,tcgprocinfo(current_procinfo).code);
+            ipacp_code:=tcgprocinfo(current_procinfo).code;
+            tcgprocinfo(current_procinfo).add_to_symtablestack;
+            consteval_process_calls(pd,ipacp_code);
             tcgprocinfo(current_procinfo).remove_from_symtablestack;
             tcgprocinfo(current_procinfo).code:=ipacp_code;
           end;

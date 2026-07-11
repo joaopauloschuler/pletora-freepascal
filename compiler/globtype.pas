@@ -835,7 +835,24 @@ interface
            (-Cfavx / -Cfavx2 / ...); otherwise the existing 128-bit path is
            kept. The scalar remainder tail (now up to 7/3 iterations) is
            unchanged in shape. NOT part of the -O4 defaults }
-         cs_opt_vect256
+         cs_opt_vect256,
+         { compile-time evaluation of a call to a proven-CONST routine (see
+           -OoPURE) whose actual arguments are all compile-time constants: the
+           callee's stashed pre-firstpass body is interpreted by a small bounded
+           evaluator (locals as a value environment; assignment, if/case/for/
+           while/repeat, nested calls to other proven-const routines under a
+           recursion cap, and a hard step budget) with the exact two's-complement
+           / IEEE semantics of the generated code, and the whole call node is
+           replaced by the computed literal (the effect gcc gets from inlining +
+           IPA-CP/ccp folding, or D/C++ CTFE/constexpr). Any potentially-trapping
+           shape (-Co/-Cr active, div/mod by a zero divisor the evaluator sees)
+           refuses to fold. First cut scalar-only: ordinal/enum/boolean/float
+           params, result and locals; sets/arrays/records/strings/address-taking
+           anywhere in the body make the callee ineligible. Distinct from -OoIPACP
+           (clones a specialized body but still emits a runtime call) and from
+           GVN-PRE (reuses a runtime value, never a literal). Opt-in; NOT part of
+           the -O4 defaults -- a wrong fold is a miscompile }
+         cs_opt_consteval
        );
        toptimizerswitches = set of toptimizerswitch;
 
@@ -916,7 +933,7 @@ interface
          'SINK','STOREMOTION','VRP','REFELIDE','SWITCHTABLE','REE',
          'SHRINKWRAP','GVNPRE','PURE','PARTIALINLINE','STACKALLOC','SLP',
          'UNROLLDYN','PREFETCH','ICF','IPARA','FINALVALUE','SIBCALL',
-         'REPORT','DEVIRT','IPACP','VECT256'
+         'REPORT','DEVIRT','IPACP','VECT256','CONSTEVAL'
        );
        WPOptimizerSwitchStr : array [twpoptimizerswitch] of string[14] = (
          'DEVIRTCALLS','OPTVMTS','SYMBOLLIVENESS'

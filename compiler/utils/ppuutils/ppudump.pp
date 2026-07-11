@@ -2611,7 +2611,8 @@ const
          'cs_opt_report',
          'cs_opt_devirt',
          'cs_opt_ipacp',
-         'cs_opt_vect256'
+         'cs_opt_vect256',
+         'cs_opt_consteval'
        );
     var
          globalswitch  : tglobalswitch;

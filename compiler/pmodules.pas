@@ -2909,6 +2909,11 @@ type
         if Errorcount=0 then
           ipacp_process_main_body(main_procinfo);
 
+        { -OoCONSTEVAL: fold calls in the main program body that target a
+          proven-const routine with all-constant arguments into literals. }
+        if Errorcount=0 then
+          consteval_process_main_body(main_procinfo);
+
         { Generate specializations of objectdefs methods }
         if Errorcount=0 then
           generate_specialization_procs;
