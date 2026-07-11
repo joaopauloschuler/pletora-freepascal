@@ -1092,12 +1092,27 @@ interface
                                 fields below are meaningful.
               modref_reads / modref_writes : the read / write class (0/1/2 above)
               modref_can_trap : the routine may raise or trap (a consumer that
-                                reorders/duplicates/hoists the call must decline) }
+                                reorders/duplicates/hoists the call must decline)
+              modref_reads_pmask / modref_writes_pmask : when the corresponding
+                                direction is mr_byref, a per-formal bitmap of
+                                WHICH by-reference parameters the routine reads /
+                                writes through (bit N = the N-th entry of paras).
+                                A refinement of the coarse "some by-ref param":
+                                a consumer maps only the flagged parameters'
+                                actuals instead of every by-ref actual.
+              modref_pmask_exact : the two masks are complete (every by-ref
+                                access was attributable to an in-range formal).
+                                When false the masks are ignored and mr_byref is
+                                read as "all by-ref actuals" (the coarse
+                                behaviour), so precision never becomes unsound. }
           modref_analyzed : boolean;
           modref_ppu_valid : boolean;
           modref_reads : byte;
           modref_writes : byte;
           modref_can_trap : boolean;
+          modref_pmask_exact : boolean;
+          modref_reads_pmask : dword;
+          modref_writes_pmask : dword;
           constructor create(level:byte;doregister:boolean);virtual;
           constructor ppuload(ppufile:tcompilerppufile);
           destructor  destroy;override;
@@ -7124,6 +7139,9 @@ implementation
          modref_reads:=0;
          modref_writes:=0;
          modref_can_trap:=false;
+         modref_pmask_exact:=false;
+         modref_reads_pmask:=0;
+         modref_writes_pmask:=0;
       end;
 
 
@@ -7143,6 +7161,9 @@ implementation
          modref_reads:=0;
          modref_writes:=0;
          modref_can_trap:=false;
+         modref_pmask_exact:=false;
+         modref_reads_pmask:=0;
+         modref_writes_pmask:=0;
 {$ifdef symansistr}
          if po_has_mangledname in procoptions then
            _mangledname:=ppufile.getansistring
@@ -7522,18 +7543,23 @@ implementation
           end;
 
         { -OoMODREF: persist the interprocedural mod/ref memory-access summary as
-          a single flag byte (reads in bits 0..1, writes in bits 2..3, can_trap
-          in bit 4). Only emitted when this routine was actually analysed in this
-          unit (=> -OoMODREF was on). No target/ABI guard is needed: the summary
-          is expressed in terms of source-level parameters/globals, not physical
-          registers, so it is valid for any target. }
+          a flag byte (reads in bits 0..1, writes in bits 2..3, can_trap in bit
+          4, per-formal-mask-exact in bit 5) followed by the two by-reference
+          per-formal bitmaps (reads then writes, one dword each). Only emitted
+          when this routine was actually analysed in this unit (=> -OoMODREF was
+          on). No target/ABI guard is needed: the summary is expressed in terms
+          of source-level parameters/globals, not physical registers, so it is
+          valid for any target. }
         if modref_analyzed then
           begin
             ppufile.putbyte(optsum_modref);
-            ppufile.putword(1);
+            ppufile.putword(1+2*sizeof(dword));
             ppufile.putbyte((modref_reads and 3) or
                             ((modref_writes and 3) shl 2) or
-                            (ord(modref_can_trap) shl 4));
+                            (ord(modref_can_trap) shl 4) or
+                            (ord(modref_pmask_exact) shl 5));
+            ppufile.putdword(modref_reads_pmask);
+            ppufile.putdword(modref_writes_pmask);
           end;
 
         { terminator }
@@ -7561,6 +7587,9 @@ implementation
         modref_reads:=0;
         modref_writes:=0;
         modref_can_trap:=false;
+        modref_pmask_exact:=false;
+        modref_reads_pmask:=0;
+        modref_writes_pmask:=0;
         repeat
           tag:=ppufile.getbyte;
           if tag=optsum_end then
@@ -7583,6 +7612,9 @@ implementation
                 modref_reads:=pureflags and 3;
                 modref_writes:=(pureflags shr 2) and 3;
                 modref_can_trap:=(pureflags and 16)<>0;
+                modref_pmask_exact:=(pureflags and 32)<>0;
+                modref_reads_pmask:=ppufile.getdword;
+                modref_writes_pmask:=ppufile.getdword;
               end;
             optsum_ipara:
               begin

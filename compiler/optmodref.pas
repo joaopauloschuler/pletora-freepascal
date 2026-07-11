@@ -81,6 +81,7 @@ interface
 implementation
 
     uses
+      cutils,
       globtype,globals,
       symconst,symtype,symsym,
       defutil,
@@ -119,9 +120,12 @@ implementation
       memory, in the CURRENT routine's frame, does it denote? (mr_none for a
       non-escaping local / by-value parameter, mr_byref for something reached
       through a by-reference parameter, mr_unknown for a static/global, a pointer
-      dereference or anything not recognised) }
-    function classify_lvalue_base(t : tnode) : byte;
+      dereference or anything not recognised).  BASESYM is the by-reference
+      parameter symbol the result mr_byref was reached through (nil otherwise),
+      so a caller can attribute the access to a specific formal-parameter index. }
+    function classify_lvalue_base_ex(t : tnode; out basesym : tsym) : byte;
       begin
+        basesym:=nil;
         result:=mr_unknown;
         while assigned(t) do
           case t.nodetype of
@@ -150,9 +154,38 @@ implementation
             derefn:
               exit(mr_unknown);
             loadn:
-              exit(classify_sym(tloadnode(t).symtableentry));
+              begin
+                result:=classify_sym(tloadnode(t).symtableentry);
+                if result=mr_byref then
+                  basesym:=tloadnode(t).symtableentry;
+                exit;
+              end;
             else
               exit(mr_unknown);
+          end;
+      end;
+
+    function classify_lvalue_base(t : tnode) : byte;
+      var
+        dummy : tsym;
+      begin
+        result:=classify_lvalue_base_ex(t,dummy);
+      end;
+
+    { index of a by-reference formal parameter SYM in its owning routine's
+      ordered parameter list (paras), or -1 when SYM is not a parameter of PD or
+      the index does not fit the 32-bit per-formal mask. Both the summary
+      producer and every consumer derive the index the same deterministic way
+      (paras is reconstructed identically from a ppu), so a mask bit means the
+      same formal cross-unit without serialising any symbol identity. }
+    function pd_para_index(pd : tprocdef; sym : tsym) : longint;
+      begin
+        result:=-1;
+        if assigned(pd) and assigned(pd.paras) and (sym is tparavarsym) then
+          begin
+            result:=pd.paras.indexof(sym);
+            if result>31 then
+              result:=-1;
           end;
       end;
 
@@ -177,13 +210,19 @@ implementation
     type
       pmodrefscan = ^tmodrefscan;
       tmodrefscan = record
+        pd : tprocdef;      { the routine being analysed (for formal indexing) }
         reads : byte;
         writes : byte;
+        reads_pmask : dword;
+        writes_pmask : dword;
+        pmask_exact : boolean;
         can_trap : boolean;
       end;
 
     { fold a callee's summary, mapped through the call's actual arguments, into
-      the caller's accumulating summary }
+      the caller's accumulating summary. Coarse map: the max base classification
+      over EVERY by-reference actual (the fallback used when a callee's per-formal
+      mask is not exact). }
     function map_byref_actuals(cn : tcallnode; forwrite : boolean) : byte;
       var
         para : tcallparanode;
@@ -206,6 +245,48 @@ implementation
                     c:=classify_lvalue_base(para.paravalue);
                     if c>result then
                       result:=c;
+                  end;
+              end;
+            para:=tcallparanode(para.nextpara);
+          end;
+      end;
+
+
+    { precise map: the max base classification over ONLY the by-reference actuals
+      whose callee formal index is flagged in MASK (used when the callee's
+      per-formal mask is exact). CALLEEPD is the resolved target. When a flagged
+      actual is itself reached through one of the CALLER's own by-reference
+      formals, that formal's index is OR-ed into CARRY (so the caller's summary
+      can record which of ITS parameters the effect propagates through); if any
+      such actual cannot be indexed within the mask, CARRYEXACT is cleared. }
+    function map_byref_actuals_masked(cn : tcallnode; calleepd : tprocdef;
+        mask : dword; callerpd : tprocdef; var carry : dword; var carryexact : boolean) : byte;
+      var
+        para : tcallparanode;
+        c : byte;
+        basesym : tsym;
+        fidx,cidx : longint;
+      begin
+        result:=mr_none;
+        para:=tcallparanode(cn.left);
+        while assigned(para) do
+          begin
+            if assigned(para.parasym) and assigned(para.paravalue) then
+              begin
+                fidx:=pd_para_index(calleepd,para.parasym);
+                if (fidx>=0) and ((mask and (dword(1) shl fidx))<>0) then
+                  begin
+                    c:=classify_lvalue_base_ex(para.paravalue,basesym);
+                    if c>result then
+                      result:=c;
+                    if c=mr_byref then
+                      begin
+                        cidx:=pd_para_index(callerpd,basesym);
+                        if cidx>=0 then
+                          carry:=carry or (dword(1) shl cidx)
+                        else
+                          carryexact:=false;
+                      end;
                   end;
               end;
             para:=tcallparanode(para.nextpara);
@@ -238,10 +319,60 @@ implementation
       end;
 
 
+    { record a direct by-reference access through parameter SYM into CTX's
+      per-formal mask; a parameter that does not fit the mask drops CTX to
+      inexact (the coarse mr_byref meaning) so precision never turns unsound. }
+    procedure record_byref(ctx : pmodrefscan; sym : tsym; iswrite : boolean);
+      var
+        idx : longint;
+      begin
+        idx:=pd_para_index(ctx^.pd,sym);
+        if idx<0 then
+          ctx^.pmask_exact:=false
+        else if iswrite then
+          ctx^.writes_pmask:=ctx^.writes_pmask or (dword(1) shl idx)
+        else
+          ctx^.reads_pmask:=ctx^.reads_pmask or (dword(1) shl idx);
+      end;
+
+
+    { fold one direction of a resolved callee's by-ref summary into CTX, mapping
+      its per-formal mask (or, when inexact, every by-ref actual) through the
+      call. }
+    procedure fold_byref_dir(ctx : pmodrefscan; cn : tcallnode; calleepd : tprocdef;
+        calleemask : dword; calleeexact : boolean; forwrite : boolean);
+      var
+        c : byte;
+      begin
+        if calleeexact then
+          begin
+            if forwrite then
+              c:=map_byref_actuals_masked(cn,calleepd,calleemask,ctx^.pd,ctx^.writes_pmask,ctx^.pmask_exact)
+            else
+              c:=map_byref_actuals_masked(cn,calleepd,calleemask,ctx^.pd,ctx^.reads_pmask,ctx^.pmask_exact);
+          end
+        else
+          begin
+            { the callee did not attribute its by-ref accesses to specific
+              formals: fall back to every by-ref actual and, if that reaches
+              caller storage through a by-ref parameter, drop to inexact (we
+              cannot say WHICH caller formal) }
+            c:=map_byref_actuals(cn,forwrite);
+            if c=mr_byref then
+              ctx^.pmask_exact:=false;
+          end;
+        if forwrite then
+          begin
+            if c>ctx^.writes then ctx^.writes:=c;
+          end
+        else if c>ctx^.reads then
+          ctx^.reads:=c;
+      end;
+
+
     procedure fold_call(ctx : pmodrefscan; cn : tcallnode);
       var
         pd : tprocdef;
-        c : byte;
       begin
         if call_target_opaque(cn) then
           begin
@@ -267,20 +398,14 @@ implementation
             case pd.modref_writes of
               mr_none: ;
               mr_byref:
-                begin
-                  c:=map_byref_actuals(cn,true);
-                  if c>ctx^.writes then ctx^.writes:=c;
-                end;
+                fold_byref_dir(ctx,cn,pd,pd.modref_writes_pmask,pd.modref_pmask_exact,true);
               else
                 ctx^.writes:=mr_unknown;
             end;
             case pd.modref_reads of
               mr_none: ;
               mr_byref:
-                begin
-                  c:=map_byref_actuals(cn,false);
-                  if c>ctx^.reads then ctx^.reads:=c;
-                end;
+                fold_byref_dir(ctx,cn,pd,pd.modref_reads_pmask,pd.modref_pmask_exact,false);
               else
                 ctx^.reads:=mr_unknown;
             end;
@@ -301,6 +426,7 @@ implementation
         ctx : pmodrefscan;
         c : byte;
         iswrite : boolean;
+        basesym : tsym;
       begin
         result:=fen_true;
         ctx:=pmodrefscan(arg);
@@ -362,8 +488,10 @@ implementation
             end;
           assignn:
             begin
-              c:=classify_lvalue_base(tassignmentnode(n).left);
+              c:=classify_lvalue_base_ex(tassignmentnode(n).left,basesym);
               if c>ctx^.writes then ctx^.writes:=c;
+              if c=mr_byref then
+                record_byref(ctx,basesym,true);
             end;
           inlinen:
             if not pure_inline(tinlinenode(n).inlinenumber) then
@@ -378,9 +506,15 @@ implementation
               if iswrite then
                 begin
                   if c>ctx^.writes then ctx^.writes:=c;
+                  if c=mr_byref then
+                    record_byref(ctx,tloadnode(n).symtableentry,true);
                 end
-              else if c>ctx^.reads then
-                ctx^.reads:=c;
+              else
+                begin
+                  if c>ctx^.reads then ctx^.reads:=c;
+                  if c=mr_byref then
+                    record_byref(ctx,tloadnode(n).symtableentry,false);
+                end;
             end;
           calln:
             fold_call(ctx,tcallnode(n));
@@ -408,6 +542,32 @@ implementation
           if b then traptext:='may trap/raise' else traptext:='cannot trap';
         end;
 
+      { the by-ref per-formal mask, rendered as a formal-index list, so a
+        consumer/-OoREPORT reader can see WHICH parameters a by-ref direction
+        touches (empty list => none in range; '~' => the mask is not exact and
+        every by-ref actual must be assumed touched) }
+      function pmasktext(cls : byte; mask : dword) : string;
+        var
+          i : longint;
+        begin
+          pmasktext:='';
+          if cls<>mr_byref then
+            exit;
+          if not ctx.pmask_exact then
+            begin
+              pmasktext:=' [params ~all]';
+              exit;
+            end;
+          for i:=0 to 31 do
+            if (mask and (dword(1) shl i))<>0 then
+              begin
+                if pmasktext='' then pmasktext:=' [params '+tostr(i)
+                else pmasktext:=pmasktext+','+tostr(i);
+              end;
+          if pmasktext='' then pmasktext:=' [params none]'
+          else pmasktext:=pmasktext+']';
+        end;
+
       begin
         if not assigned(pd) or not assigned(code) then
           exit;
@@ -422,22 +582,41 @@ implementation
             pd.modref_reads:=mr_unknown;
             pd.modref_writes:=mr_unknown;
             pd.modref_can_trap:=true;
+            pd.modref_pmask_exact:=false;
+            pd.modref_reads_pmask:=0;
+            pd.modref_writes_pmask:=0;
             pd.modref_analyzed:=true;
             exit;
           end;
+        ctx.pd:=pd;
         ctx.reads:=mr_none;
         ctx.writes:=mr_none;
+        ctx.reads_pmask:=0;
+        ctx.writes_pmask:=0;
+        ctx.pmask_exact:=true;
         ctx.can_trap:=false;
         foreachnodestatic(pm_postprocess,code,@modrefscan_node,@ctx);
         pd.modref_reads:=ctx.reads;
         pd.modref_writes:=ctx.writes;
         pd.modref_can_trap:=ctx.can_trap;
+        { the per-formal masks are only meaningful for the by-ref class; keep
+          them zero (and exact irrelevant) in the none/unknown cases so the ppu
+          image is deterministic }
+        pd.modref_pmask_exact:=ctx.pmask_exact;
+        if ctx.reads=mr_byref then
+          pd.modref_reads_pmask:=ctx.reads_pmask
+        else
+          pd.modref_reads_pmask:=0;
+        if ctx.writes=mr_byref then
+          pd.modref_writes_pmask:=ctx.writes_pmask
+        else
+          pd.modref_writes_pmask:=0;
         pd.modref_analyzed:=true;
         { -OoREPORT: the discovered summary, once, where it first becomes
           available (never per call site) }
         OptRemark(pd.fileinfo,'modref',pd.fullprocname(false)+
-          ' mod/ref summary: reads '+classname(ctx.reads)+
-          ', writes '+classname(ctx.writes)+
+          ' mod/ref summary: reads '+classname(ctx.reads)+pmasktext(ctx.reads,ctx.reads_pmask)+
+          ', writes '+classname(ctx.writes)+pmasktext(ctx.writes,ctx.writes_pmask)+
           ', '+traptext(ctx.can_trap));
       end;
 
@@ -457,6 +636,27 @@ implementation
         else
           { unknown routine: assume it can trap }
           result:=true;
+      end;
+
+
+    { does the callee's by-ref access in direction FORWRITE reach any
+      globally-reachable location at this call site? Uses the per-formal mask
+      (only the actuals the callee actually touches) when the summary is exact,
+      otherwise every by-ref actual (the coarse fallback). }
+    function byref_reaches_global(cn : tcallnode; pd : tprocdef; mask : dword;
+        exact, forwrite : boolean) : boolean;
+      var
+        carry : dword;
+        carryexact : boolean;
+      begin
+        if exact then
+          begin
+            carry:=0;
+            carryexact:=true;
+            result:=map_byref_actuals_masked(cn,pd,mask,nil,carry,carryexact)<>mr_none;
+          end
+        else
+          result:=map_byref_actuals(cn,forwrite)<>mr_none;
       end;
 
 
@@ -489,12 +689,12 @@ implementation
           begin
             case pd.modref_writes of
               mr_none: writes_global:=false;
-              mr_byref: writes_global:=map_byref_actuals(cn,true)<>mr_none;
+              mr_byref: writes_global:=byref_reaches_global(cn,pd,pd.modref_writes_pmask,pd.modref_pmask_exact,true);
               else writes_global:=true;
             end;
             case pd.modref_reads of
               mr_none: reads_global:=false;
-              mr_byref: reads_global:=map_byref_actuals(cn,false)<>mr_none;
+              mr_byref: reads_global:=byref_reaches_global(cn,pd,pd.modref_reads_pmask,pd.modref_pmask_exact,false);
               else reads_global:=true;
             end;
             exit(true);

@@ -50,7 +50,7 @@ const
     (it's a cardinal) }
   { bumped to 33: per-procdef cross-unit optimizer summary blob added to the
     ibprocdef entry (shared -OoPURE / -OoIPARA summary serialization) }
-  CurrentPPULongVersion = 34;
+  CurrentPPULongVersion = 35;
 
   { Tags for the per-procdef optimizer-summary blob streamed inside the
     ibprocdef entry (see tprocdef.ppuwrite/ppuload). The blob is a self-

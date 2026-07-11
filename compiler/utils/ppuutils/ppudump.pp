@@ -4636,7 +4636,8 @@ begin
                  optsum_modref:
                    begin
                      b:=ppufile.getbyte;
-                     writeln([space,' Optimizer summary : MODREF  reads=',b and 3,' writes=',(b shr 2) and 3,' can_trap=',ord((b and 16)<>0),' (0=none 1=byref-params 2=unknown-global)']);
+                     write([space,' Optimizer summary : MODREF  reads=',b and 3,' writes=',(b shr 2) and 3,' can_trap=',ord((b and 16)<>0),' pmask_exact=',ord((b and 32)<>0)]);
+                     writeln(['  reads_pmask=$',hexstr(ppufile.getdword,8),' writes_pmask=$',hexstr(ppufile.getdword,8),' (0=none 1=byref-params 2=unknown-global; pmask bit N=paras[N])']);
                    end;
                  optsum_ipara:
                    begin
