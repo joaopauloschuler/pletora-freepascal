@@ -134,27 +134,108 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# Part D: a DYNAMIC array actual STAYS out of line (note) and runs correctly.
+# Part D: a DYNAMIC array actual now INLINES (no call) and runs bit-identically
+# to the out-of-line reference.  The dynarray->openarray boundary (deref to the
+# data pointer + runtime high=length-1) is rebuilt inside the splice.  Includes
+# empty/nil dynarray actuals (high = -1) which must sum to 0.
 # ---------------------------------------------------------------------------
 cat > "$tmp/d.pp" <<'EOF'
-{$mode objfpc}
+{$mode objfpc}{$ifdef NOINL}{$inline off}{$endif}
 program d;
 function DSum(const x: array of longint): longint; inline;
 var i: longint;
 begin DSum := 0; for i := low(x) to high(x) do DSum := DSum + x[i]; end;
-var dyn: array of longint;
+var dyn, empt: array of longint;
 begin
   setlength(dyn, 4);
   dyn[0] := 1; dyn[1] := 2; dyn[2] := 3; dyn[3] := 4;
-  writeln(DSum(dyn));       { 10 }
+  writeln(DSum(dyn), ' ', DSum(empt));    { 10 0  (empt is nil -> high=-1) }
 end.
 EOF
-noteD="$(run "$CC" -Fu"$RTL" -vd -O3 -al -FE"$tmp" "$tmp/d.pp" 2>&1)"
-echo "$noteD" | grep -Eq 'Not inlining "DSum", open-array parameter has a dynamic-array actual' \
-  || fail "Part D: dynamic-array refusal note missing"
-[ "$(ncalls DSUM "$tmp/d.s")" -ge 1 ] || fail "Part D: DSum unexpectedly inlined (no call)"
-out="$(run "$tmp/d" 2>&1)"
-[ "$out" = "10" ] || fail "Part D: wrong output [$out] (expected 10)"
+# out-of-line reference (inlining disabled)
+if run "$CC" -Fu"$RTL" -dNOINL -O3 -FE"$tmp" "$tmp/d.pp" >/dev/null 2>&1; then
+  cp "$tmp/d" "$tmp/d_ref"
+  refD="$(run "$tmp/d_ref" 2>&1)"
+else
+  fail "Part D: reference (no-inline) compile failed"; refD="?"
+fi
+if run "$CC" -Fu"$RTL" -O3 -al -FE"$tmp" "$tmp/d.pp" >/dev/null 2>&1; then
+  [ "$(ncalls DSUM "$tmp/d.s")" = 0 ] || fail "Part D: DSum with dynamic-array actual NOT inlined (call present)"
+  out="$(run "$tmp/d" 2>&1)"
+  [ "$out" = "10 0" ] || fail "Part D: wrong output [$out] (expected '10 0')"
+  [ "$out" = "$refD" ] || fail "Part D: inlined output [$out] != out-of-line reference [$refD]"
+else
+  fail "Part D: compile failed"
+fi
+
+# ---------------------------------------------------------------------------
+# Part D2: MANAGED base (const array of ansistring, and a record containing an
+# ansistring) with a dynamic-array actual inlines and matches the reference.
+# ---------------------------------------------------------------------------
+cat > "$tmp/d2.pp" <<'EOF'
+{$mode objfpc}{$H+}{$ifdef NOINL}{$inline off}{$endif}
+program d2;
+type TR = record s: ansistring; n: longint; end;
+function Cat(const a: array of ansistring): ansistring; inline;
+var i: longint;
+begin Cat := ''; for i := 0 to high(a) do Cat := Cat + a[i]; end;
+function SumN(const a: array of TR): longint; inline;
+var i: longint;
+begin SumN := 0; for i := 0 to high(a) do SumN := SumN + a[i].n + length(a[i].s); end;
+var ds: array of ansistring; dr: array of TR;
+begin
+  setlength(ds, 3); ds[0]:='foo'; ds[1]:='bar'; ds[2]:='baz';
+  setlength(dr, 2); dr[0].s:='ab'; dr[0].n:=10; dr[1].s:='cde'; dr[1].n:=20;
+  writeln(Cat(ds), ' ', SumN(dr));        { foobarbaz 35 }
+end.
+EOF
+if run "$CC" -Fu"$RTL" -dNOINL -O3 -FE"$tmp" "$tmp/d2.pp" >/dev/null 2>&1; then
+  cp "$tmp/d2" "$tmp/d2_ref"; refD2="$(run "$tmp/d2_ref" 2>&1)"
+else fail "Part D2: reference compile failed"; refD2="?"; fi
+if run "$CC" -Fu"$RTL" -O3 -al -FE"$tmp" "$tmp/d2.pp" >/dev/null 2>&1; then
+  [ "$(ncalls CAT "$tmp/d2.s")" = 0 ]  || fail "Part D2: Cat (managed base) NOT inlined"
+  [ "$(ncalls SUMN "$tmp/d2.s")" = 0 ] || fail "Part D2: SumN (record-with-managed base) NOT inlined"
+  out="$(run "$tmp/d2" 2>&1)"
+  [ "$out" = "foobarbaz 35" ] || fail "Part D2: wrong output [$out] (expected 'foobarbaz 35')"
+  [ "$out" = "$refD2" ] || fail "Part D2: inlined output [$out] != reference [$refD2]"
+else
+  fail "Part D2: compile failed"
+fi
+
+# ---------------------------------------------------------------------------
+# Part D3: a BY-VALUE open array of a managed base keeps copy-on-write correct.
+# The inline copy-temp machinery cannot size an open array (tarraydef.size
+# internalerror 99080501), so a by-value open-array parameter stays out of line;
+# its callee-local copy must be mutated without disturbing the caller's array.
+# ---------------------------------------------------------------------------
+cat > "$tmp/d3.pp" <<'EOF'
+{$mode objfpc}{$H+}
+program d3;
+function Wrap(a: array of ansistring): ansistring; inline;   { by-value, mutated }
+var i: longint;
+begin
+  for i := 0 to high(a) do a[i] := '<'+a[i]+'>';
+  Wrap := '';
+  for i := 0 to high(a) do Wrap := Wrap + a[i];
+end;
+var d: array of ansistring;
+begin
+  setlength(d, 3); d[0]:='foo'; d[1]:='bar'; d[2]:='baz';
+  writeln(Wrap(d));               { <foo><bar><baz> }
+  writeln(d[0], d[1], d[2]);      { foobarbaz -- originals untouched (COW) }
+end.
+EOF
+noteD3="$(run "$CC" -Fu"$RTL" -vd -O3 -al -FE"$tmp" "$tmp/d3.pp" 2>&1)"
+if [ -f "$tmp/d3.s" ]; then
+  echo "$noteD3" | grep -Eq 'by-value open array' \
+    || fail "Part D3: by-value open-array refusal note missing"
+  [ "$(ncalls WRAP "$tmp/d3.s")" -ge 1 ] || fail "Part D3: Wrap unexpectedly inlined"
+  out="$(run "$tmp/d3" 2>&1)"
+  [ "$out" = "$(printf '<foo><bar><baz>\nfoobarbaz')" ] \
+    || fail "Part D3: wrong output / COW violated [$out]"
+else
+  fail "Part D3: compile failed"
+fi
 
 # ---------------------------------------------------------------------------
 # Part E: var open array (write-back) with a static actual inlines correctly.
@@ -180,6 +261,6 @@ else
 fi
 
 if [ "$rc" -eq 0 ]; then
-  echo "PASS: open-array/array-of-const params inline at -O3 (static any-base re-based, constructor/slice/open-string/pass-through/var all correct, array of const inlines); dynamic-array actuals stay out of line and run correctly"
+  echo "PASS: open-array/array-of-const params inline at -O3 (static any-base re-based, constructor/slice/open-string/pass-through/var all correct, array of const inlines); dynamic-array actuals (incl. managed base and empty/nil) now inline and match the out-of-line reference; by-value open arrays stay out of line with copy-on-write intact"
 fi
 exit "$rc"

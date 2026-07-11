@@ -449,17 +449,39 @@ implementation
           now re-applies the call-boundary conversion (wraps a non-zero-based
           static-array actual in a typeconv to the open-array parameter type) so
           the spliced accesses keep the callee's 0-based view; a dynamic-array
-          actual is kept out of line at the call site (ncal.check_inlining).
-          `array of const` actuals are always `[...]` constructors (0-based), so
-          those inline unconditionally.  `array of variant` is NOT covered by the
-          open-array re-basing path (is_open_array is false for it) and can take a
-          differently-based static actual, so it keeps the refusal. }
+          actual has the dynarray->openarray boundary rebuilt in the splice
+          (ncal.replaceparaload).  `array of const` actuals are always `[...]`
+          constructors (0-based), so those inline unconditionally.
+
+          Two shapes still keep a refusal:
+            - `array of variant` is NOT covered by the open-array re-basing path
+              (is_open_array is false for it) and can take a differently-based
+              static actual;
+            - a BY-VALUE (vs_value) open array / array of const needs a private
+              copy of the array inside the callee, but the inline copy-temp
+              machinery (tcallnode.maybecreateinlineparatemp) creates that temp
+              from the parameter's own vardef and asks for its .size -- which an
+              open array does not have (tarraydef.size internalerrors 99080501).
+              Out-of-line these are copied by copy_value_by_ref_para with a
+              runtime-sized heap block; reproducing that in the splice is not done,
+              so keep them out of line (this also keeps copy-on-write of a managed
+              base trivially correct).  const/var/out open arrays are passed by
+              reference and need no such copy, so they inline. }
         for i:=0 to procdef.paras.count-1 do
-          if is_variant_array(tparavarsym(procdef.paras[i]).vardef) then
-            begin
-              _no_inline('array of variant');
-              exit;
-            end;
+          begin
+            if is_variant_array(tparavarsym(procdef.paras[i]).vardef) then
+              begin
+                _no_inline('array of variant');
+                exit;
+              end;
+            if (tparavarsym(procdef.paras[i]).varspez=vs_value) and
+               (is_open_array(tparavarsym(procdef.paras[i]).vardef) or
+                is_array_of_const(tparavarsym(procdef.paras[i]).vardef)) then
+              begin
+                _no_inline('by-value open array / array of const parameter');
+                exit;
+              end;
+          end;
         result:=true;
       end;
 

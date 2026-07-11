@@ -5122,25 +5122,6 @@ implementation
             para:=tcallparanode(parameters);
             while assigned(para) do
               begin
-                { FPC Unleashed (checknodeinlining refusal d): open-array value
-                  params are inlinable (replaceparaload re-bases a non-zero-based
-                  static array actual by re-applying the boundary typeconv), and
-                  static arrays, array constructors, slices, open strings and
-                  passed-through open arrays all splice correctly.  A DYNAMIC
-                  array actual, however, is itself a pointer to its data, and the
-                  spliced open-array access derefs the param location once more
-                  (one indirection too many -> wild pointer).  Reconstructing the
-                  dynarray->openarray boundary (deref + runtime high) inside the
-                  splice is not yet done, so keep those calls out of line. }
-                if assigned(para.parasym) and
-                   is_open_array(para.parasym.vardef) and
-                   assigned(para.left) and assigned(para.left.resultdef) and
-                   is_dynamic_array(para.left.resultdef) then
-                  begin
-                    Comment(V_lineinfo+V_Debug,'Not inlining "'+tprocdef(procdefinition).procsym.realname+'", open-array parameter has a dynamic-array actual');
-                    exclude(callnodeflags,cnf_do_inline);
-                    break;
-                  end;
                 if not para.can_be_inlined then
                   begin
                     Comment(V_lineinfo+V_Debug,'Not inlining "'+tprocdef(procdefinition).procsym.realname+
@@ -5498,10 +5479,9 @@ implementation
                         boundary performs -- wrap the actual in a typeconv to the
                         open-array parameter type -- so the spliced accesses index
                         the same 0-based view the callee was compiled against.
-                        Only non-zero-based static arrays need it; dynamic arrays,
-                        other open arrays and array constructors are already
-                        0-based and must NOT be wrapped (a dynarray->openarray
-                        reference conversion would be wrong / crash). }
+                        Only non-zero-based static arrays need it; other open
+                        arrays and array constructors are already 0-based and must
+                        NOT be wrapped. }
                       if is_open_array(paras.parasym.vardef) and
                          assigned(n.resultdef) and
                          (n.resultdef.typ=arraydef) and
@@ -5511,6 +5491,36 @@ implementation
                          (tarraydef(n.resultdef).lowrange<>0) then
                         begin
                           n:=ctypeconvnode.create_internal(n,paras.parasym.vardef);
+                          typecheckpass(n);
+                        end
+                      { FPC Unleashed (checknodeinlining refusal d, dynamic-array
+                        actual): a dynamic array passed to an open-array parameter
+                        already had the dynarray->openarray boundary applied to the
+                        actual by insert_typeconv (a deref to the data), but that
+                        node's resultdef was masked back to the dynamic-array type
+                        so gen_high_tree could take high()/length() of it.  The
+                        spliced node's LOCATION is therefore the open-array data
+                        while its type still says "dynamic array"; left untouched
+                        the surrounding open-array access re-typechecks against the
+                        dynamic-array def and dereferences the location once more (a
+                        wild pointer -> the data's first element used as an address).
+                        Re-view the SAME location as the open array: take its address
+                        (the data pointer the boundary produced) and deref it through
+                        the open-array pointer type.  This adds no extra indirection
+                        -- addr(deref-based lvalue) folds back to that data pointer --
+                        it merely restores the open-array resultdef the callee was
+                        compiled against.  The runtime high (length-1, or -1 for a
+                        nil/empty dynarray) is carried by the hidden high parameter,
+                        which is substituted like any other parameter load. }
+                      else if is_open_array(paras.parasym.vardef) and
+                              assigned(n.resultdef) and
+                              is_dynamic_array(n.resultdef) then
+                        begin
+                          n:=cderefnode.create(
+                               ctypeconvnode.create_internal(
+                                 caddrnode.create_internal(n),
+                                 cpointerdef.getreusable(paras.parasym.vardef)));
+                          include(tderefnode(n).derefnodeflags,drnf_no_checkpointer);
                           typecheckpass(n);
                         end;
                       result := fen_true;
