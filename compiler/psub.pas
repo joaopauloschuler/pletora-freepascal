@@ -385,13 +385,25 @@ implementation
             _no_inline('called C-style varargs functions');
             exit;
           end;
-        { the compiler cannot handle inherited in inlined subroutines because
-          it tries to search for self in the symtable, however, the symtable
-          is not available }
+        { FPC Unleashed: an `inherited` call in the body used to block inlining
+          unconditionally (the historical worry was that self would be searched
+          in an unavailable symtable). For a CLASS method self is a plain
+          instance pointer passed as an ordinary hidden value parameter, so the
+          node inliner's replaceparaload rebinds the inherited call's self load
+          to the call site's self actual exactly like any other parameter, and
+          the inherited target is statically (non-virtually) dispatched -- such
+          bodies splice and run correctly. Old-style `object` methods (value
+          self passed by reference) and other self shapes still miscompile the
+          spliced inherited self, so they keep the refusal. Cross-unit inherited
+          is additionally refused at the call site (ncal.check_inlining) because
+          the ppu-reconstructed self does not line up with the caller's paras. }
         if pi_has_inherited in current_procinfo.flags then
           begin
-            _no_inline('inherited');
-            exit;
+            if not (assigned(procdef.struct) and is_class(procdef.struct)) then
+              begin
+                _no_inline('inherited');
+                exit;
+              end;
           end;
         if pio_nested_access in procdef.implprocoptions then
          begin

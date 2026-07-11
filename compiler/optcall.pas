@@ -37,6 +37,7 @@ unit optcall;
 
     uses
       cutils,cclasses,
+      globtype,
       verbose,globals,
       defutil,defcmp,
       symconst,symtype,symdef,symsym,
@@ -334,6 +335,36 @@ unit optcall;
       end;
 
 
+    { FPC Unleashed (checknodeinlining refusal b): rebind the self of an
+      `inherited` call spliced from an inline body.  Unlike an ordinary method
+      call -- whose self travels in methodpointer and is rebound by
+      replaceparaload -- an inherited call carries its self in the separate
+      call_self_node field (a load of the ENCLOSING routine's `self`).  The
+      inline splice runs replaceparaload over the body's ordinary child nodes but
+      does not descend into call_self_node, so a spliced inherited call keeps a
+      self load of the CALLEE's self paravarsym, which has no location in the
+      caller frame -> reads garbage / crashes.  Here we run the very same
+      replaceparaload over each inherited call's call_self_node, mapping that
+      self load to THIS call site's self actual exactly like every other
+      parameter (temp-wrapped complex receivers are handled by that machinery).
+      arg is the tcallnode being inlined.  Only class methods reach here
+      (psub.checknodeinlining) and cross-unit callers are excluded
+      (ncal.check_inlining). }
+    function rebind_inlined_inherited_self(var n : tnode; arg : pointer) : foreachnoderesult;
+      var
+        cn : tcallnode;
+      begin
+        result:=fen_false;
+        if (n.nodetype=calln) and
+           (cnf_inherited in tcallnode(n).callnodeflags) and
+           assigned(tcallnode(n).call_self_node) then
+          begin
+            cn:=tcallnode(arg);
+            foreachnode(pm_preprocess,tcallnode(n).call_self_node,@cn.replaceparaload,@cn.fileinfo);
+          end;
+      end;
+
+
     function doinline(var _n: tnode; arg: pointer): foreachnoderesult;
       var
         n,
@@ -418,6 +449,12 @@ unit optcall;
         foreachnodestatic(pm_postprocess,body,@importglobalsyms,nil);
         foreachnodestatic(pm_postprocess,body,@setinlinelevel,pointer(callnode.inlinelevel+1));
         foreachnode(pm_preprocess,body,@callnode.replaceparaload,@callnode.fileinfo);
+
+        { FPC Unleashed (refusal b): rebind the self of any inherited call in the
+          spliced body to this call site's self actual (see
+          rebind_inlined_inherited_self). }
+        if pi_has_inherited in (callnode.procdefinition as tprocdef).inlininginfo^.flags then
+          foreachnodestatic(body,@rebind_inlined_inherited_self,callnode);
 
         { FPC Unleashed (Task B): rebind any inlined asm block's top_local
           operands (param/local/result references) to fresh caller locals and

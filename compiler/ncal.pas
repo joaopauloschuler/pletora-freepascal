@@ -5105,6 +5105,19 @@ implementation
                     exclude(callnodeflags,cnf_do_inline);
                   end;
               end;
+            { An `inherited` call in the body (only class methods reach here --
+              psub.checknodeinlining refuses every other self shape) rebinds its
+              self load to the caller's self actual via replaceparaload; that
+              matching only lines up for a SAME-UNIT body. A body loaded from
+              another unit's ppu reconstructs its self paravarsym separately, so
+              the spliced inherited self is wrong (codegen internalerror). Keep
+              cross-unit inherited out of line. }
+            if not procdefinition.in_currentunit and
+               (pi_has_inherited in tprocdef(procdefinition).inlininginfo^.flags) then
+              begin
+                Comment(V_lineinfo+V_Debug,'Not inlining "'+tprocdef(procdefinition).procsym.realname+'", inherited call cannot be spliced across units');
+                exclude(callnodeflags,cnf_do_inline);
+              end;
             { Check if we can inline the procedure when it references proc/var that
               are not in the globally available }
             st:=procdefinition.owner;
