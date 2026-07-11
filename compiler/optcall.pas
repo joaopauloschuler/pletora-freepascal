@@ -45,6 +45,7 @@ unit optcall;
       nutils,
       fmodule,
       pass_1,
+      aasmbase,aasmtai,aasmdata,
       nbas,ncal,nld;
 
     { this procedure removes the user code flag because it prevents optimizations }
@@ -59,14 +60,110 @@ unit optcall;
       end;
 
 
+    { FPC Unleashed: give each spliced copy of an inline asm block its own fresh
+      AB_LOCAL asm labels. When a routine with an inner "asm ... jge .Lok ...
+      .Lok: ..." block is inlined at two+ call sites, dogetcopy's concatlistcopy
+      aliases the SAME tasmlabel across the copies, and tcgasmnode's alt-symbol
+      relabel always uses alt number 1 -- so both copies would emit "name_1" and
+      the assembler reports "Duplicate label". We rebind every AB_LOCAL label
+      DEFINED in this copy to a freshly allocated label (unique module-wide),
+      rewriting the definition AND every reference (branch operands, ait_const
+      sym/endsym) consistently, so each site's jmp/label pair is self-contained.
+      The alt-symbol pass then still runs (asmnf_inline_copy) but now derives its
+      "_1" names from distinct bases, so no collision. }
+    procedure unique_inline_asm_labels(p_asm : TAsmList);
+      var
+        hp   : tai;
+        i    : longint;
+        oldl : array of tasmlabel;
+        newl : array of tasmlabel;
+
+      function mapped(sym : tasmsymbol) : tasmlabel;
+        var
+          j : longint;
+        begin
+          result:=nil;
+          if not(assigned(sym) and (sym.bind=AB_LOCAL) and (sym is tasmlabel)) then
+            exit;
+          for j:=0 to high(oldl) do
+            if oldl[j]=sym then
+              exit(newl[j]);
+        end;
+
+      procedure remapsym(var sym : tasmsymbol);
+        var
+          m : tasmlabel;
+        begin
+          m:=mapped(sym);
+          if assigned(m) then
+            sym:=m;
+        end;
+
+      begin
+        oldl:=nil;
+        newl:=nil;
+        if not assigned(p_asm) then
+          exit;
+        { pass 1: allocate a fresh label for each AB_LOCAL label DEFINED here }
+        hp:=tai(p_asm.first);
+        while assigned(hp) do
+          begin
+            if (hp.typ=ait_label) and
+               assigned(tai_label(hp).labsym) and
+               (tai_label(hp).labsym.bind=AB_LOCAL) and
+               (mapped(tai_label(hp).labsym)=nil) then
+              begin
+                setlength(oldl,length(oldl)+1);
+                setlength(newl,length(newl)+1);
+                oldl[high(oldl)]:=tai_label(hp).labsym;
+                current_asmdata.getjumplabel(newl[high(newl)]);
+              end;
+            hp:=tai(hp.next);
+          end;
+        if length(oldl)=0 then
+          exit;
+        { pass 2: rewrite definitions and every reference of the mapped labels }
+        hp:=tai(p_asm.first);
+        while assigned(hp) do
+          begin
+            case hp.typ of
+              ait_label :
+                begin
+                  if assigned(mapped(tai_label(hp).labsym)) then
+                    tai_label(hp).labsym:=mapped(tai_label(hp).labsym);
+                end;
+              ait_const :
+                begin
+                  remapsym(tai_const(hp).sym);
+                  remapsym(tai_const(hp).endsym);
+                end;
+              ait_instruction :
+                for i:=0 to tai_cpu_abstract(hp).ops-1 do
+                  if tai_cpu_abstract(hp).oper[i]^.typ=top_ref then
+                    begin
+                      remapsym(tai_cpu_abstract(hp).oper[i]^.ref^.symbol);
+                      remapsym(tai_cpu_abstract(hp).oper[i]^.ref^.relsymbol);
+                    end;
+              else
+                ;
+            end;
+            hp:=tai(hp.next);
+          end;
+      end;
+
+
     { FPC Unleashed: flag asm blocks in an inlined body copy so tcgasmnode
-      relabels their local asm labels for this call site }
+      relabels their local asm labels for this call site, and give each copy its
+      own fresh AB_LOCAL labels (see unique_inline_asm_labels). }
     function mark_inline_asm_copy(var n : tnode; arg : pointer) : foreachnoderesult;
       begin
         result:=fen_false;
         if (n.nodetype=asmn) and
            not(asmnf_get_asm_position in tasmnode(n).asmnodeflags) then
-          include(tasmnode(n).asmnodeflags,asmnf_inline_copy);
+          begin
+            include(tasmnode(n).asmnodeflags,asmnf_inline_copy);
+            unique_inline_asm_labels(tasmnode(n).p_asm);
+          end;
       end;
 
 

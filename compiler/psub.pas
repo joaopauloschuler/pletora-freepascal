@@ -236,10 +236,8 @@ implementation
                 if assigned(tai_const(hp).sym) and
                    (tai_const(hp).sym.bind=AB_NONE) then
                   exit('assembler block referencing a local variable, parameter or function result');
-              ait_label :
-                { local asm labels are not yet uniqued per inline site }
-                if assigned(tai_label(hp).labsym) and (tai_label(hp).labsym.bind=AB_LOCAL) then
-                  exit('assembler block defining a label');
+              { AB_LOCAL asm labels are made unique per inline site by
+                optcall.unique_inline_asm_labels, so they no longer block inlining }
               else
                 ;
             end;
