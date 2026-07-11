@@ -953,7 +953,29 @@ interface
            have side effects (a call, a div, a deref, an overflow/range-checked or
            float op). The record-splitting half (part (b)) and the WPO-wide variant
            remain open. Opt-in; NOT part of the -O4 defaults }
-         cs_opt_dead_para
+         cs_opt_dead_para,
+         { INT8 quantized dot-product idiom recognition (-OoINT8DOT): recognize the
+           integer multiply-accumulate reduction  acc := acc + a[i]*b[i]  where a
+           and b are simple non-aliased dynamic arrays of shortint (signed 8-bit)
+           and acc is a simple non-aliased 32-bit signed/unsigned integer local,
+           and lower it to an integer-SIMD widening MAC: the 8-bit operand windows
+           are SIGN-EXTENDED to 16-bit (SSE2 punpcklbw+psraw on baseline, pmovsxbw
+           under SSE4.1/AVX, vpmovsxbw ymm under AVX2) and reduced with the exact
+           vpmaddwd (16x16->32 vertical multiply + adjacent-pair 32-bit add) +
+           vpaddd register-resident accumulator sequence, horizontally summed after
+           the loop.  The multiply is EXACT (|a|,|b|<=128 so each product fits in
+           16 bits and each vpmaddwd adjacent-pair sum in 32 bits) and integer
+           addition is associative/commutative modulo 2^32, so the partial-sum
+           reassociation is bit-identical to the wrapping scalar reference for ALL
+           inputs including the saturation-triggering extremes (-128*-128 repeated)
+           -- unlike a vpmaddubsw route whose 16-bit saturating adds are not exact
+           for the general signed case.  Requires the exact-32-bit accumulator width
+           (a 64-bit accumulator would not wrap at 32 bits per lane) and refuses
+           under -Co/-Cr (a checked reduction is left scalar).  128-bit xmm baseline
+           (VF=8); 256-bit ymm (VF=16) under -OoVECT256 on an AVX2 fputype; scalar
+           remainder tail.  Opt-in; NOT part of the -O4 defaults.  AVX-512 VNNI
+           (vpdpbusd) and the neural-api int8-storage adaptation remain open }
+         cs_opt_int8dot
        );
        toptimizerswitches = set of toptimizerswitch;
 
@@ -1035,7 +1057,7 @@ interface
          'SHRINKWRAP','GVNPRE','PURE','PARTIALINLINE','STACKALLOC','SLP',
          'UNROLLDYN','PREFETCH','ICF','IPARA','FINALVALUE','SIBCALL',
          'REPORT','DEVIRT','IPACP','VECT256','CONSTEVAL','MODREF',
-         'APPROXTRANS','LOOPINTERCHANGE','LOOPTILE','DEADPARA'
+         'APPROXTRANS','LOOPINTERCHANGE','LOOPTILE','DEADPARA','INT8DOT'
        );
        WPOptimizerSwitchStr : array [twpoptimizerswitch] of string[14] = (
          'DEVIRTCALLS','OPTVMTS','SYMBOLLIVENESS'

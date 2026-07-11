@@ -351,21 +351,58 @@ implementation
         (scalarleft=true), matching the source's non-commutative order. }
       var
         regb, regc, regs, resreg, regacc, regt : tregister;
-        regacc_x, regs_x, reghi : tregister;
+        regacc_x, regs_x, reghi, rega16, regb16, hreg : tregister;
         opps, movop, addop, mulop, xorop, movsop, fmaop : tasmop;
         refb, refc, refa, refsplat, refacc : treference;
-        avx, dbl, use_packed_fma, use256 : boolean;
+        avx, dbl, use_packed_fma, use256, isint8, has_sxbw : boolean;
         scalarsize, mmsize : tcgsize;
+
+      { -OoINT8DOT: load VL shortint elements at ref and SIGN-EXTEND them to a
+        register of VL 16-bit lanes (xmm=8 lanes / ymm=16 lanes).  With SSE4.1 or
+        AVX a single (v)pmovsxbw reads the bytes straight from memory; on an SSE2
+        baseline the classic  movq + punpcklbw + psraw,8  sequence sign-extends the
+        low 8 bytes exactly.  The 16-bit values are exact (a shortint fits). }
+      function load_sext_bytes(const r : treference) : tregister;
+        var w : tregister;
+        begin
+          if use256 then
+            w:=cg.getmmregister(current_asmdata.CurrAsmList,OS_M256)
+          else
+            w:=cg.getmmregister(current_asmdata.CurrAsmList,OS_M128);
+          if has_sxbw then
+            begin
+              if avx then
+                current_asmdata.CurrAsmList.concat(taicpu.op_ref_reg(A_VPMOVSXBW,S_NO,r,w))
+              else
+                current_asmdata.CurrAsmList.concat(taicpu.op_ref_reg(A_PMOVSXBW,S_NO,r,w));
+            end
+          else
+            begin
+              { SSE2 baseline, xmm only (the ymm path always has AVX2/pmovsxbw) }
+              current_asmdata.CurrAsmList.concat(taicpu.op_ref_reg(A_MOVQ,S_NO,r,w));
+              current_asmdata.CurrAsmList.concat(taicpu.op_reg_reg(A_PUNPCKLBW,S_NO,w,w));
+              current_asmdata.CurrAsmList.concat(taicpu.op_const_reg(A_PSRAW,S_NO,8,w));
+            end;
+          result:=w;
+        end;
+
       begin
         avx:=UseAVX;
         dbl:=isdouble;
+        isint8:=kind in [vok_int8dot_init,vok_int8dot_body,vok_int8dot_finish];
         { window byte width = vecwidth lanes * element size (4 single / 8 double).
           32 bytes selects a 256-bit ymm register (OS_M256), 16 bytes the legacy
           128-bit xmm path.  A ymm window is only ever built by the recognizer on
           an AVX fputype (vect_want_ymm gates on FPUX86_HAS_AVXUNIT), so use256
           implies avx; assert it so a mis-sized node fails loudly rather than
           emitting a bad encoding. }
-        use256:=(vecwidth*(4+4*ord(dbl)))=32;   { vecwidth*(4 or 8) bytes = 32 -> ymm }
+        if isint8 then
+          { -OoINT8DOT window: vecwidth is the int8 ELEMENT count, 8 (xmm, 4 int32
+            lanes) or 16 (ymm, 8 int32 lanes).  The ymm path uses AVX2 vpmovsxbw/
+            vpmaddwd/vpaddd, so it is only ever built on an AVX2 fputype. }
+          use256:=(vecwidth=16)
+        else
+          use256:=(vecwidth*(4+4*ord(dbl)))=32;   { vecwidth*(4 or 8) bytes = 32 -> ymm }
         if use256 then
           begin
             if not avx then
@@ -374,6 +411,9 @@ implementation
           end
         else
           mmsize:=OS_M128;
+        { pmovsxbw is SSE4.1 (VEX form under AVX); on an SSE2-only fputype the
+          128-bit int8 path falls back to a movq+punpcklbw+psraw sign-extend. }
+        has_sxbw:=avx or (FPUX86_HAS_SSE4_1 in fpu_capabilities[current_settings.fputype]);
         { packed-FMA gate for the dot-product reduction: mirror the scalar a*b+c ->
           fma() contraction gate (tx86addnode.use_fma + try_fma), i.e. fast-math is
           enabled AND the fputype has an FMA/FMA4 unit.  The reduction recognizer
@@ -564,6 +604,117 @@ implementation
             { store the low lane back into the scalar accumulator s (left) }
             secondpass(left);
             cg.a_loadmm_reg_loc(current_asmdata.CurrAsmList,scalarsize,regacc,left.location,mms_movescalar);
+            location_reset(location,LOC_VOID,OS_NO);
+            exit;
+          end;
+
+        { --- INT8DOT accumulator init: acc := [s,0,..] (32-bit int lanes, once) ---
+          The register-resident packed accumulator holds 4 (xmm) or 8 (ymm) 32-bit
+          integer partial sums; lane 0 is seeded with the incoming scalar s so the
+          horizontal sum at finish reproduces  s + Sum(a[i]*b[i]). }
+        if kind=vok_int8dot_init then
+          begin
+            if not assigned(redctx) then
+              internalerror(2026071101);
+            secondpass(left);   { the incoming 32-bit int seed s }
+            hreg:=cg.getintregister(current_asmdata.CurrAsmList,OS_32);
+            cg.a_load_loc_reg(current_asmdata.CurrAsmList,OS_32,left.location,hreg);
+            regacc:=cg.getmmregister(current_asmdata.CurrAsmList,mmsize);
+            regacc_x:=regacc;
+            if use256 then
+              regacc_x:=cg.makeregsize(current_asmdata.CurrAsmList,regacc,OS_M128);
+            { movd r32 -> xmm zero-extends bits 32..127 (VEX form zero-extends the
+              whole ymm), so lanes 1..3/1..7 are exactly zero -- s is counted once }
+            if avx then
+              current_asmdata.CurrAsmList.concat(taicpu.op_reg_reg(A_VMOVD,S_NO,hreg,regacc_x))
+            else
+              current_asmdata.CurrAsmList.concat(taicpu.op_reg_reg(A_MOVD,S_NO,hreg,regacc_x));
+            redctx^.accreg:=regacc;
+            redctx^.seeded:=true;
+            location_reset(location,LOC_VOID,OS_NO);
+            exit;
+          end;
+
+        { --- INT8DOT body: acc += widen16(a[i..])*widen16(b[i..]) via vpmaddwd ---
+          Sign-extend the two shortint windows to 16-bit, multiply-add adjacent
+          pairs with (v)pmaddwd (exact: each 16x16 product fits in 32 bits and the
+          adjacent-pair sum does too for +-128 inputs), then accumulate with
+          (v)paddd.  All arithmetic is modulo 2^32, associative/commutative, so the
+          partial-sum order is bit-identical to the scalar wrapping reduction. }
+        if kind=vok_int8dot_body then
+          begin
+            if not (assigned(redctx) and redctx^.seeded) then
+              internalerror(2026071102);
+            regacc:=redctx^.accreg;
+            secondpass(left);   { a[i..] window }
+            if not (left.location.loc in [LOC_REFERENCE,LOC_CREFERENCE]) then
+              internalerror(2026071103);
+            refb:=left.location.reference;
+            tcgx86(cg).make_simple_ref(current_asmdata.CurrAsmList,refb);
+            rega16:=load_sext_bytes(refb);
+            secondpass(right);  { b[i..] window }
+            if not (right.location.loc in [LOC_REFERENCE,LOC_CREFERENCE]) then
+              internalerror(2026071104);
+            refc:=right.location.reference;
+            tcgx86(cg).make_simple_ref(current_asmdata.CurrAsmList,refc);
+            regb16:=load_sext_bytes(refc);
+            if avx then
+              begin
+                current_asmdata.CurrAsmList.concat(taicpu.op_reg_reg_reg(A_VPMADDWD,S_NO,regb16,rega16,rega16));
+                current_asmdata.CurrAsmList.concat(taicpu.op_reg_reg_reg(A_VPADDD,S_NO,rega16,regacc,regacc));
+              end
+            else
+              begin
+                current_asmdata.CurrAsmList.concat(taicpu.op_reg_reg(A_PMADDWD,S_NO,regb16,rega16));
+                current_asmdata.CurrAsmList.concat(taicpu.op_reg_reg(A_PADDD,S_NO,rega16,regacc));
+              end;
+            location_reset(location,LOC_VOID,OS_NO);
+            exit;
+          end;
+
+        { --- INT8DOT finish: s := horizontal-sum of the 32-bit int accumulator --- }
+        if kind=vok_int8dot_finish then
+          begin
+            if not (assigned(redctx) and redctx^.seeded) then
+              internalerror(2026071105);
+            regacc:=redctx^.accreg;
+            { ymm: fold the two 128-bit halves (vextracti128 + vpaddd) into an xmm }
+            if use256 then
+              begin
+                reghi:=cg.getmmregister(current_asmdata.CurrAsmList,OS_M128);
+                current_asmdata.CurrAsmList.concat(taicpu.op_const_reg_reg(A_VEXTRACTI128,S_NO,1,regacc,reghi));
+                regacc_x:=cg.makeregsize(current_asmdata.CurrAsmList,regacc,OS_M128);
+                current_asmdata.CurrAsmList.concat(taicpu.op_reg_reg_reg(A_VPADDD,S_NO,reghi,regacc_x,regacc_x));
+                regacc:=regacc_x;
+              end;
+            { 4-lane xmm horizontal sum via pshufd+paddd (SSE2, no SSSE3 phaddd):
+                regt   := [l2,l3,l2,l3]  (pshufd $EE)
+                regacc += regt           -> lane0=l0+l2, lane1=l1+l3
+                regt   := broadcast lane1 (pshufd $55)
+                regacc += regt           -> lane0 = l0+l1+l2+l3 }
+            regt:=cg.getmmregister(current_asmdata.CurrAsmList,OS_M128);
+            if avx then
+              begin
+                current_asmdata.CurrAsmList.concat(taicpu.op_const_reg_reg(A_VPSHUFD,S_NO,$EE,regacc,regt));
+                current_asmdata.CurrAsmList.concat(taicpu.op_reg_reg_reg(A_VPADDD,S_NO,regt,regacc,regacc));
+                current_asmdata.CurrAsmList.concat(taicpu.op_const_reg_reg(A_VPSHUFD,S_NO,$55,regacc,regt));
+                current_asmdata.CurrAsmList.concat(taicpu.op_reg_reg_reg(A_VPADDD,S_NO,regt,regacc,regacc));
+              end
+            else
+              begin
+                current_asmdata.CurrAsmList.concat(taicpu.op_const_reg_reg(A_PSHUFD,S_NO,$EE,regacc,regt));
+                current_asmdata.CurrAsmList.concat(taicpu.op_reg_reg(A_PADDD,S_NO,regt,regacc));
+                current_asmdata.CurrAsmList.concat(taicpu.op_const_reg_reg(A_PSHUFD,S_NO,$55,regacc,regt));
+                current_asmdata.CurrAsmList.concat(taicpu.op_reg_reg(A_PADDD,S_NO,regt,regacc));
+              end;
+            { extract lane 0 (movd xmm->r32) and store into the scalar target s }
+            hreg:=cg.getintregister(current_asmdata.CurrAsmList,OS_32);
+            if avx then
+              current_asmdata.CurrAsmList.concat(taicpu.op_reg_reg(A_VMOVD,S_NO,regacc,hreg))
+            else
+              current_asmdata.CurrAsmList.concat(taicpu.op_reg_reg(A_MOVD,S_NO,regacc,hreg));
+            secondpass(left);   { the 32-bit int target scalar temp }
+            cg.a_load_reg_loc(current_asmdata.CurrAsmList,OS_32,hreg,left.location);
             location_reset(location,LOC_VOID,OS_NO);
             exit;
           end;

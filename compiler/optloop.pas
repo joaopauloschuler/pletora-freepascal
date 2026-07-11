@@ -3270,6 +3270,54 @@ unit optloop;
 {$endif}
       end;
 
+    function vect_int8dot_want_ymm : boolean;
+      { -OoINT8DOT at 256-bit (ymm) width.  The widening MAC uses vpmovsxbw,
+        vpmaddwd and vpaddd at ymm width -- all AVX2 instructions -- so the int8
+        dot product only widens to 16 elements/iteration when -OoVECT256 is
+        requested AND the fputype has an AVX2 unit; otherwise it stays at the
+        128-bit (8 elements/iteration) width, which runs on the SSE2 baseline. }
+      begin
+{$if defined(i386) or defined(x86_64)}
+        vect_int8dot_want_ymm:=(cs_opt_vect256 in current_settings.optimizerswitches) and
+          (FPUX86_HAS_AVX2 in fpu_capabilities[current_settings.fputype]);
+{$else}
+        vect_int8dot_want_ymm:=false;
+{$endif}
+      end;
+
+    function vect_int8_elem_reason(n : tnode; counter : tabstractvarsym; out vec : tvecnode) : string;
+      { -OoINT8DOT: returns '' and sets vec if n (after peeling typeconv wrappers)
+        is  A[i]  where A is a simple non-aliased dynamic array of shortint (signed
+        8-bit) and the index is exactly a plain read of the loop counter; otherwise
+        a human-readable reason. }
+      var
+        vn, idx : tnode;
+        eledef : tdef;
+      begin
+        result:='';
+        vec:=nil;
+        vn:=rangeelim_skip_typeconv(n);
+        if not assigned(vn) or (vn.nodetype<>vecn) then
+          exit('operand is not an array-element access');
+        if not assigned(tvecnode(vn).left) or not assigned(tvecnode(vn).left.resultdef) then
+          exit('array base has no known type');
+        if not assigned(rangeelim_simple_var(tvecnode(vn).left)) then
+          exit('array base is not a simple non-aliased variable (possible aliasing)');
+        if not is_dynamic_array(tvecnode(vn).left.resultdef) then
+          exit('array is not a dynamic array');
+        eledef:=tarraydef(tvecnode(vn).left.resultdef).elementdef;
+        if not assigned(eledef) or (eledef.typ<>orddef) or (torddef(eledef).ordtype<>s8bit) then
+          exit('array element type is not shortint (signed 8-bit)');
+        idx:=rangeelim_skip_typeconv(tvecnode(vn).right);
+        if not assigned(idx) or (idx.nodetype<>loadn) then
+          exit('array index is not a plain variable read');
+        if ([nf_write,nf_modify]*idx.flags)<>[] then
+          exit('array index expression has side effects');
+        if tloadnode(idx).symtableentry<>tsym(counter) then
+          exit('array index is not the loop counter (non-unit stride or offset)');
+        vec:=tvecnode(vn);
+      end;
+
     function vect_widthtag : string;
       { -OoREPORT width suffix: appended to the vectorize remark ONLY when the
         256-bit ymm width was chosen (-OoVECT256 on an AVX fputype). The default
@@ -3754,6 +3802,62 @@ unit optloop;
             reduction the vectorizer took: the vectorizer wins with no ordering
             change (and the scalar tail is a while-loop, which REASSOC ignores). }
           redlhs:=rangeelim_skip_typeconv(assign.left);
+
+          { -OoINT8DOT: integer quantized dot product  acc := acc + a[i]*b[i]  where
+            a,b are shortint dynamic arrays and acc is an EXACTLY-32-bit integer
+            local.  Lowered to a widening vpmaddwd MAC.  Unlike the float reduction
+            it needs NO fast-math: integer addition is associative/commutative
+            modulo 2^32, so the packed partial-sum order is bit-identical to the
+            wrapping scalar reduction, and each shortint*shortint product is exact
+            in the 16->32 widening.  A 64-bit accumulator is NOT accepted (its scalar
+            reduction does not wrap at 32 bits, so per-lane int32 wrapping would
+            diverge); -Co/-Cr is already excluded by the range/overflow-check bail
+            above (a checked reduction stays scalar). }
+          if (cs_opt_int8dot in current_settings.optimizerswitches) and
+             assigned(redlhs) and (redlhs.nodetype=loadn) and
+             assigned(redlhs.resultdef) and is_32bitint(redlhs.resultdef) then
+            begin
+              accsym:=rangeelim_simple_var(redlhs);
+              if not assigned(accsym) then
+                exit('INT8DOT accumulator is not a simple non-aliased local integer scalar');
+              if tloadnode(redlhs).symtableentry=tsym(counter) then
+                exit('INT8DOT accumulator is the loop counter');
+              rhs:=rangeelim_skip_typeconv(assign.right);
+              if not assigned(rhs) then
+                exit('INT8DOT reduction right-hand side is missing');
+              if rhs.nodetype<>addn then
+                exit('INT8DOT reduction right-hand side is not an addition into the accumulator');
+              redla:=rangeelim_skip_typeconv(taddnode(rhs).left);
+              redra:=rangeelim_skip_typeconv(taddnode(rhs).right);
+              if assigned(redla) and (redla.nodetype=loadn) and (tloadnode(redla).symtableentry=tsym(accsym)) then
+                redexpr:=taddnode(rhs).right
+              else if assigned(redra) and (redra.nodetype=loadn) and (tloadnode(redra).symtableentry=tsym(accsym)) then
+                redexpr:=taddnode(rhs).left
+              else
+                exit('INT8DOT addition does not have the accumulator as one operand');
+              { the addend must be a product a[i]*b[i] whose value is computed at the
+                accumulator's (32-bit) width -- FPC widens shortint*shortint to a
+                32-bit product, matching the packed 16->32 madd exactly }
+              if not assigned(redexpr.resultdef) or not is_32bitint(redexpr.resultdef) then
+                exit('INT8DOT addend is not a 32-bit integer product');
+              redprod:=rangeelim_skip_typeconv(redexpr);
+              if not (assigned(redprod) and (redprod.nodetype=muln)) then
+                exit('INT8DOT addend is not a product of two array elements');
+              leftreason:=vect_int8_elem_reason(taddnode(redprod).left,counter,bvec);
+              rightreason:=vect_int8_elem_reason(taddnode(redprod).right,counter,cvec);
+              if leftreason<>'' then
+                exit('INT8DOT first factor '+leftreason);
+              if rightreason<>'' then
+                exit('INT8DOT second factor '+rightreason);
+              vshape:=vok_int8dot;
+              CalcDefSum(forn.t2);
+              if not assigned(forn.t2.optinfo) or not assigned(forn.left.optinfo) then
+                exit('data-flow information is unavailable for the loop body');
+              if DynSetIn(forn.t2.optinfo^.defsum,forn.left.optinfo^.index) then
+                exit('loop counter is modified inside the loop body');
+              exit('');
+            end;
+
           if assigned(redlhs) and (redlhs.nodetype=loadn) and
              assigned(redlhs.resultdef) and
              (is_single(redlhs.resultdef) or is_double(redlhs.resultdef)) then
@@ -4075,6 +4179,20 @@ unit optloop;
             exit;
           end;
 
+        { -OoINT8DOT: the reduction runs over shortint elements with a 32-bit
+          integer accumulator.  eletype is the 32-bit int type used for the
+          register-resident accumulator seed/finish scalar temps; elewidth is the
+          number of int8 ELEMENTS consumed per iteration -- 8 on the 128-bit xmm
+          baseline (4 int32 lanes), 16 on the AVX2 ymm width (8 int32 lanes). }
+        if vshape=vok_int8dot then
+          begin
+            eletype:=s32inttype;
+            if vect_int8dot_want_ymm then
+              elewidth:=16
+            else
+              elewidth:=8;
+          end
+        else
         { pick the packed element type and lane count for this loop's precision:
           single -> [s32floattype x4], double -> [s64floattype x2]. All slot
           sizes, window advances and node widths below use these. }
@@ -4095,7 +4213,7 @@ unit optloop;
           the wider window and its scalar remainder (now up to VL-1 = 7/3
           iterations) follow automatically; the backend node derives the ymm
           register width from vecwidth*element-size. }
-        if vect_want_ymm then
+        if vect_want_ymm and (vshape<>vok_int8dot) then
           elewidth:=elewidth*2;
         { -OoAPPROXTRANS width: the 2^n exponent build uses packed 32-bit integer
           add/shift (paddd/pslld), which at 256-bit are VPADDD/VPSLLD ymm -- AVX2
@@ -4123,6 +4241,81 @@ unit optloop;
         addstatement(stat,cassignmentnode.create(
           cloadnode.create(tsym(counter),counter.owner),
           ctemprefnode.create(lotemp)));
+
+        { ---- INT8DOT build (integer widening MAC dot product) ----
+          Structurally identical to the float reduction below (register-resident
+          init / body / finish trio + vector while-loop + scalar remainder), but
+          with a 32-bit integer accumulator and no fast-math gate. }
+        if vshape=vok_int8dot then
+          begin
+            { seed lane 0 of the packed int accumulator with the incoming s, read
+              through a plain assignment so the incoming def of s stays live (a
+              backend node's operand reads are not modelled by DFA) }
+            seedtemp:=ctempcreatenode.create(eletype,eletype.size,tt_persistent,false);
+            addstatement(stat,seedtemp);
+            addstatement(stat,cassignmentnode.create(
+              ctemprefnode.create(seedtemp),
+              cloadnode.create(tsym(accsym),accsym.owner)));
+            redinit:=cvectoropnode.create_int8dot_init(
+              ctemprefnode.create(seedtemp),elewidth);
+            redctx:=redinit.new_redctx;
+            addstatement(stat,redinit);
+
+            { vector loop:  while i<=hi-(VL-1) do begin acc:=acc+a[i]*b[i]; i:=i+VL end }
+            vecbody:=internalstatements(vstat);
+            redbody:=cvectoropnode.create_int8dot(bvec.getcopy,cvec.getcopy,elewidth);
+            redbody.attach_redctx(redctx);
+            addstatement(vstat,redbody);
+            addstatement(vstat,cassignmentnode.create(
+              cloadnode.create(tsym(counter),counter.owner),
+              caddnode.create(addn,cloadnode.create(tsym(counter),counter.owner),
+                cordconstnode.create(elewidth,ctype,false))));
+            addstatement(stat,cwhilerepeatnode.create(
+              caddnode.create(lten,cloadnode.create(tsym(counter),counter.owner),
+                caddnode.create(subn,ctemprefnode.create(hitemp),
+                  cordconstnode.create(elewidth-1,ctype,false))),
+              vecbody,true,false));
+
+            { finish:  s := horizontal-sum(acc) via a memory-backed scalar temp }
+            splattemp:=ctempcreatenode.create(eletype,eletype.size,tt_persistent,false);
+            addstatement(stat,splattemp);
+            redfin:=cvectoropnode.create_int8dot_finish(
+              ctemprefnode.create(splattemp),elewidth);
+            redfin.attach_redctx(redctx);
+            addstatement(stat,redfin);
+            addstatement(stat,cassignmentnode.create(
+              cloadnode.create(tsym(accsym),accsym.owner),
+              ctemprefnode.create(splattemp)));
+
+            { scalar remainder:  while i<=hi do begin <original body>; i:=i+1 end }
+            scalbody:=internalstatements(sstat);
+            addstatement(sstat,forn.t2.getcopy);
+            addstatement(sstat,cassignmentnode.create(
+              cloadnode.create(tsym(counter),counter.owner),
+              caddnode.create(addn,cloadnode.create(tsym(counter),counter.owner),
+                cordconstnode.create(1,ctype,false))));
+            addstatement(stat,cwhilerepeatnode.create(
+              caddnode.create(lten,cloadnode.create(tsym(counter),counter.owner),
+                ctemprefnode.create(hitemp)),
+              scalbody,true,false));
+
+            addstatement(stat,ctempdeletenode.create(lotemp));
+            addstatement(stat,ctempdeletenode.create(hitemp));
+            addstatement(stat,ctempdeletenode.create(seedtemp));
+            addstatement(stat,ctempdeletenode.create(splattemp));
+
+            do_firstpass(block);
+            MessagePos1(forn.fileinfo,cg_n_loop_reduction_vectorized,tostr(elewidth));
+            if elewidth=16 then
+              leftreason:=' width=ymm256'
+            else
+              leftreason:='';
+            OptRemark(forn.fileinfo,'int8dot','int8 dot-product loop vectorized to a widening vpmaddwd MAC, VF='+tostr(elewidth)+', tail=scalar'+leftreason);
+            forn.free;
+            n:=block;
+            changed:=true;
+            exit;
+          end;
 
         { ---- REDUCTION build (sum / dot product) ---- }
         if vshape in [vok_reduce_sum,vok_reduce_dot] then

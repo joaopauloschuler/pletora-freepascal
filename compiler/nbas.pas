@@ -453,7 +453,23 @@ interface
                           inlined APPROXIMATE single-precision transcendental
                           (-OoAPPROXTRANS).  transfunc selects which; left=dest
                           window a[i], right=source window b[i]. }
-                        vok_transc);
+                        vok_transc,
+                        { INT8 quantized dot-product reduction (-OoINT8DOT). Three
+                          cooperating nodes share a register-resident 32-bit-integer
+                          packed accumulator (via redctx), exactly like the float
+                          vok_reduce_* trio but with an integer widening MAC body:
+                            vok_int8dot_init   acc := [s,0,..]  (32-bit int lanes;
+                                    left=incoming scalar 32-bit int seed s)
+                            vok_int8dot_body   acc += widen16(a[i..])*widen16(b[i..])
+                                    reduced with vpmaddwd (left=a[i], right=b[i]
+                                    shortint windows)
+                            vok_int8dot_finish s := horizontal-sum(acc)
+                                    (left=target 32-bit int scalar temp)
+                          vecwidth is the number of int8 ELEMENTS per iteration:
+                          8 (128-bit xmm, 4 int32 lanes) or 16 (256-bit ymm, 8 int32
+                          lanes under AVX2). isdouble is unused (always false). }
+                        vok_int8dot,
+                        vok_int8dot_init, vok_int8dot_body, vok_int8dot_finish);
 
        { the approximate transcendental a vok_transc node evaluates per lane }
        ttranscfunc = (tf_exp, tf_tanh, tf_sigmoid);
@@ -510,6 +526,14 @@ interface
           constructor create_reduce_init(seed : tnode; _vecwidth : longint; _isdouble : boolean);
           constructor create_reduce(b,c : tnode; _isdot : boolean; _vecwidth : longint; _isdouble : boolean);
           constructor create_reduce_finish(target : tnode; _vecwidth : longint; _isdouble : boolean);
+          { INT8 quantized dot-product reduction (-OoINT8DOT): a register-resident
+            32-bit-integer packed accumulator, seeded with the incoming scalar,
+            accumulated with a widening vpmaddwd MAC across the loop, then
+            horizontally summed back into the scalar.  _vecwidth is the int8 element
+            count per iteration (8 -> xmm/4 lanes, 16 -> ymm/8 lanes). }
+          constructor create_int8dot_init(seed : tnode; _vecwidth : longint);
+          constructor create_int8dot(b,c : tnode; _vecwidth : longint);
+          constructor create_int8dot_finish(target : tnode; _vecwidth : longint);
           { allocate a fresh shared reduction context and attach it to self }
           function new_redctx : pvecreducectx;
           { attach an existing shared reduction context to self (bumps its share count) }
@@ -795,6 +819,39 @@ implementation
         kind:=vok_reduce_finish;
         scalarleft:=false;
         isdouble:=_isdouble;
+      end;
+
+
+    constructor tvectoropnode.create_int8dot_init(seed : tnode; _vecwidth : longint);
+      begin
+        inherited create(vectoropn,seed,nil,nil);
+        op:=OP_NONE;
+        vecwidth:=_vecwidth;
+        kind:=vok_int8dot_init;
+        scalarleft:=false;
+        isdouble:=false;
+      end;
+
+
+    constructor tvectoropnode.create_int8dot(b,c : tnode; _vecwidth : longint);
+      begin
+        inherited create(vectoropn,b,c,nil);
+        op:=OP_ADD;
+        vecwidth:=_vecwidth;
+        kind:=vok_int8dot_body;
+        scalarleft:=false;
+        isdouble:=false;
+      end;
+
+
+    constructor tvectoropnode.create_int8dot_finish(target : tnode; _vecwidth : longint);
+      begin
+        inherited create(vectoropn,target,nil,nil);
+        op:=OP_ADD;
+        vecwidth:=_vecwidth;
+        kind:=vok_int8dot_finish;
+        scalarleft:=false;
+        isdouble:=false;
       end;
 
 
