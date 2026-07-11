@@ -10703,6 +10703,12 @@ unit optloop;
         [addn,subn,muln,andn,orn,xorn,shln,shrn,notn,unaryminusn,
          derefn,vecn,subscriptn,typeconvn];
 
+    var
+      { set by gvn_call_no_memwrite when an impure but write-free call is admitted
+        as memory-transparent under -OoMODREF (for the -OoREPORT remark); reset at
+        the start of each OptimizeGVNPRE run }
+      gvnpre_modref_transp : boolean;
+
     { --- small helpers ------------------------------------------------------ }
 
     { true if N is a direct call to a routine proven PURE by -OoPURE (reads but
@@ -10767,14 +10773,58 @@ unit optloop;
       end;
 
 
+    { -OoMODREF lift: a resolved DIRECT call whose mod/ref summary proves it
+      writes NO memory whatsoever (modref_writes = mr_none: not through a global,
+      not through a by-reference parameter, not through a deref).  Such a call --
+      even though it is impure (it may READ global memory, do input, or trap, so
+      -OoPURE rightly refuses to prove it pure) -- cannot invalidate ANY
+      value-numbered memory reader (gvn_mem) nor local (gvn_pure) entry, because
+      GVN-PRE only re-uses a value across an unchanged memory/local state and this
+      call changes neither.  Trapping is irrelevant here: the reuse temp is
+      materialised at the FIRST (dominating) occurrence and merely READ later, so
+      if an intervening call traps the later read is simply never reached.
+      writes = mr_byref is NOT sufficient: it would write caller storage bound to
+      a by-ref actual (an address-taken local or a global), which a gvn_mem entry
+      could alias and read. }
+    function gvn_call_no_memwrite(n : tnode) : boolean;
+      var
+        cn : tcallnode;
+        pd : tprocdef;
+      begin
+        result:=false;
+        if not(cs_opt_modref in current_settings.optimizerswitches) then
+          exit;
+        if (n=nil) or (n.nodetype<>calln) then
+          exit;
+        cn:=tcallnode(n);
+        { resolved direct call only (excludes indirect / procvar targets) }
+        if not assigned(cn.procdefinition) or not(cn.procdefinition is tprocdef) then
+          exit;
+        pd:=tprocdef(cn.procdefinition);
+        { a method call must dispatch to a statically known body }
+        if assigned(cn.methodpointer) and
+           ((po_virtualmethod in pd.procoptions) or
+            (po_abstractmethod in pd.procoptions)) then
+          exit;
+        { aggregate-return machinery performs hidden stores -> stay a barrier }
+        if assigned(cn.funcretnode) or assigned(cn.callinitblock) or
+           assigned(cn.callcleanupblock) then
+          exit;
+        result:=modref_summary_available(pd) and (pd.modref_writes=mr_none);
+        if result then
+          gvnpre_modref_transp:=true;
+      end;
+
+
     function gvn_sideeffect_cb(var n : tnode; arg : pointer) : foreachnoderesult;
       begin
         result:=fen_false;
         case n.nodetype of
           calln:
-            { a proven-pure call is not a barrier -- recurse into its arguments so
-              a side effect hiding in an argument is still caught }
-            if not gvn_pure_call(n) then
+            { a proven-pure call, or (under -OoMODREF) an impure call proven to
+              write no memory, is not a barrier -- recurse into its arguments so a
+              side effect hiding in an argument is still caught }
+            if not gvn_pure_call(n) and not gvn_call_no_memwrite(n) then
               result:=fen_norecurse_true;
           assignn,asmn,finalizetempsn:
             result:=fen_norecurse_true;
@@ -11259,7 +11309,11 @@ unit optloop;
                 ki^.mem:=true;
             end;
           calln:
-            ki^.mem:=true;
+            { any call that may WRITE memory kills every memory-reader entry
+              carried into/around the loop; a call proven to write no memory
+              (-OoMODREF, gvn_call_no_memwrite) leaves them available }
+            if not gvn_call_no_memwrite(n) then
+              ki^.mem:=true;
           asmn:
             ki^.killall:=true;
           inlinen:
@@ -11520,16 +11574,23 @@ unit optloop;
       begin
         result:=false;
         ctx.init;
+        gvnpre_modref_transp:=false;
         avail:=nil;
         gvn_process(node,@ctx,avail);
         if ctx.eliminated>0 then
           begin
             MessagePos2(current_procinfo.entrypos,cg_n_gvnpre_eliminated,
               tostr(ctx.eliminated),ctx.firstexpr);
-            OptRemark(current_procinfo.entrypos,'gvnpre',
-              'eliminated '+tostr(ctx.eliminated)+
-              ' fully-redundant expression(s) (first: '+ctx.firstexpr+
-              '), reused from a dominating computation');
+            if gvnpre_modref_transp then
+              OptRemark(current_procinfo.entrypos,'gvnpre',
+                'eliminated '+tostr(ctx.eliminated)+
+                ' fully-redundant expression(s) (first: '+ctx.firstexpr+
+                '), reused from a dominating computation across a mod/ref write-free call (-OoMODREF)')
+            else
+              OptRemark(current_procinfo.entrypos,'gvnpre',
+                'eliminated '+tostr(ctx.eliminated)+
+                ' fully-redundant expression(s) (first: '+ctx.firstexpr+
+                '), reused from a dominating computation');
             if assigned(ctx.preambleblk) then
               begin
                 do_firstpass(ctx.preambleblk);
