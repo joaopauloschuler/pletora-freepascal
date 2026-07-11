@@ -1653,6 +1653,26 @@ implementation
                RedoDFA:=false;
              end;
 
+           { loop interchange: reorder a perfect two-level counted nest so the
+             innermost loop strides the row-contiguous dimension, improving spatial
+             locality and exposing the (now unit-stride) inner loop to the
+             vectorizer that runs below.  Run before unroll-and-jam / the
+             vectorizer / strength reduction / the for->while lowering: it matches
+             on for-nodes with plain a[i*W+j] index nodes and rebuilds the nest
+             with the two loop headers swapped.  Needs valid DFA (it counts counter
+             references to prove the counters are dead outside the nest); skips
+             procedures with labels like the loop passes below so control cannot
+             enter a reordered body mid-stream. }
+           if (cs_opt_loopinterchange in current_settings.optimizerswitches)
+             and not(pi_has_label in flags) then
+             RedoDFA:=OptimizeLoopInterchange(code) or RedoDFA;
+
+           if RedoDFA then
+             begin
+               dfabuilder.redodfainfo(code);
+               RedoDFA:=false;
+             end;
+
            { unroll-and-jam: unroll the outer loop of a perfect two-level counted
              nest by a small factor and fuse (jam) the duplicated inner-loop
              bodies into one inner loop, so a value the inner body loads once

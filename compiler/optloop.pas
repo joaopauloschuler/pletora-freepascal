@@ -49,6 +49,7 @@ unit optloop;
     function OptimizeLoopFuse(node : tnode) : boolean;
     function OptimizeReassoc(node : tnode) : boolean;
     function OptimizeUnrollJam(node : tnode) : boolean;
+    function OptimizeLoopInterchange(node : tnode) : boolean;
     function OptimizePredCom(node : tnode) : boolean;
     function OptimizeCodeSink(node : tnode) : boolean;
     function OptimizeStoreMotion(node : tnode) : boolean;
@@ -7907,6 +7908,479 @@ unit optloop;
           declines for lack of its own nested loop, then the outer 2-level nest
           matches) }
         foreachnodestatic(pm_postprocess,node,@ujam_processloop_cb,@ctx);
+        Result:=ctx.changed;
+      end;
+
+
+{****************************************************************************
+                              Loop interchange
+ ****************************************************************************}
+
+    { -OoLOOPINTERCHANGE reorders a perfect two-deep counted for-nest so the
+      innermost loop strides the row-contiguous dimension.  See the switch
+      comment in globtype.pas for the soundness argument; in brief, two body
+      shapes are accepted:
+
+        (R) element-wise map   W[idx] := f(R0[idx], R1[idx], ...)
+            the write array W is distinct from every read array and the SAME
+            index tree indexes the write and every read, so if the (i,j)->idx
+            map is not injective the colliding writes are idempotent (they store
+            f of the same, never-written read cells) -- interchange is therefore
+            bit-exact regardless of injectivity; and
+
+        (S) scalar sum-reduction   s := s + T
+            T only READS arrays, so reordering the pure read-and-accumulate is a
+            legal reassociation of an associative+commutative reduction -- exact
+            for an integer accumulator, and for a float accumulator only under
+            -OoFASTMATH (which permits FP reassociation).
+
+      A cost model on the affine subscript coefficients fires the transform only
+      when the interchanged order is strictly more cache-contiguous. }
+
+    type
+      tic_scan = record
+        iout, iin : tabstractvarsym;  { current outer / inner loop counters }
+        wsym      : tsym;             { subset R: the write-array sym; nil for S }
+        accum     : tsym;            { subset S: the reduction accumulator; nil for R }
+        idxproto  : tnode;           { subset R: the required index of every subscript }
+        subset_r  : boolean;
+        bad       : boolean;
+        badreason : string;
+        idxs      : array of tnode;   { every array-subscript index, for the cost model }
+        nidx      : longint;
+      end;
+
+    function ic_elem_ok(d : tdef) : boolean;
+      { an unmanaged scalar we can element-wise map/reduce without reordering a
+        managed-type refcount side effect: an 8/16/32/64-bit ordinal or Single/
+        Double }
+      begin
+        result:=false;
+        if not assigned(d) then
+          exit;
+        if is_managed_type(d) then
+          exit;
+        if (d.typ=orddef) and (d.size in [1,2,4,8]) then
+          exit(true);
+        if is_single(d) or is_double(d) then
+          exit(true);
+      end;
+
+    function ic_appears_in_mul(n : tnode; c : tsym) : boolean;
+      { true if the counter c appears as a factor of a multiplication -- or of a
+        left-shift, which is how the front end lowers a multiply by a power-of-two
+        stride such as  i*2048 -> i shl 11 -- anywhere in the (affine) index n, i.e.
+        its memory stride over c is non-unit }
+      begin
+        result:=false;
+        n:=rangeelim_skip_typeconv(n);
+        if not assigned(n) then
+          exit;
+        if n.nodetype=muln then
+          if (ujam_count_refs(tbinarynode(n).left,c)>0) or
+             (ujam_count_refs(tbinarynode(n).right,c)>0) then
+            exit(true);
+        if n.nodetype=shln then
+          if (ujam_count_refs(tbinarynode(n).left,c)>0) or
+             (ujam_count_refs(tbinarynode(n).right,c)>0) then
+            exit(true);
+        case n.nodetype of
+          addn,subn,muln,divn,modn,slashn,andn,orn,xorn,shln,shrn:
+            result:=ic_appears_in_mul(tbinarynode(n).left,c) or
+                    ic_appears_in_mul(tbinarynode(n).right,c);
+          unaryminusn,notn:
+            result:=ic_appears_in_mul(tunarynode(n).left,c);
+        end;
+      end;
+
+    function ic_has_bare_term(n : tnode; c : tsym) : boolean;
+      { true if c appears as a bare additive term of the index n (stride +/-1),
+        not folded inside a multiplication }
+      begin
+        result:=false;
+        n:=rangeelim_skip_typeconv(n);
+        if not assigned(n) then
+          exit;
+        case n.nodetype of
+          addn,subn:
+            result:=ic_has_bare_term(tbinarynode(n).left,c) or
+                    ic_has_bare_term(tbinarynode(n).right,c);
+          loadn:
+            result:=(tloadnode(n).symtableentry=c);
+        end;
+      end;
+
+    procedure ic_add_idx(var sc : tic_scan; idx : tnode);
+      begin
+        if sc.nidx>=length(sc.idxs) then
+          setlength(sc.idxs,2*sc.nidx+4);
+        sc.idxs[sc.nidx]:=idx;
+        inc(sc.nidx);
+      end;
+
+    procedure ic_check_expr(var sc : tic_scan; n : tnode);
+      { recursive whitelist of the body RHS / reduction addend: only literals,
+        loop-invariant scalar reads, single-dimension array subscripts (validated
+        against the subset rules) and pure arithmetic are allowed.  Collects every
+        subscript index for the cost model.  Any call/deref/unknown node, a bare
+        counter use, or (subset R) a read of the written array / a mismatched read
+        index sets sc.bad. }
+      var
+        s, bsym : tsym;
+        base : tnode;
+      begin
+        if sc.bad then
+          exit;
+        n:=rangeelim_skip_typeconv(n);
+        if not assigned(n) then
+          exit;
+        case n.nodetype of
+          ordconstn,realconstn,pointerconstn,niln:
+            ; { a literal }
+          loadn:
+            begin
+              s:=tloadnode(n).symtableentry;
+              if (s=tsym(sc.iout)) or (s=tsym(sc.iin)) then
+                begin
+                  sc.bad:=true;
+                  sc.badreason:='a loop counter is used outside an array subscript';
+                end
+              else if assigned(sc.accum) and (s=sc.accum) then
+                begin
+                  sc.bad:=true;
+                  sc.badreason:='the reduction accumulator is re-read in the addend';
+                end;
+              { otherwise a loop-invariant scalar read -- fine }
+            end;
+          vecn:
+            begin
+              base:=rangeelim_skip_typeconv(tvecnode(n).left);
+              if not assigned(base) or (base.nodetype<>loadn) then
+                begin
+                  sc.bad:=true;
+                  sc.badreason:='a multi-dimensional or computed array base is not supported';
+                  exit;
+                end;
+              bsym:=tloadnode(base).symtableentry;
+              if sc.subset_r then
+                begin
+                  if bsym=sc.wsym then
+                    begin
+                      sc.bad:=true;
+                      sc.badreason:='the written array is also read in the body (possible loop-carried dependence)';
+                      exit;
+                    end;
+                  if not assigned(sc.idxproto) or not tvecnode(n).right.isequal(sc.idxproto) then
+                    begin
+                      sc.bad:=true;
+                      sc.badreason:='a read subscript uses a different index than the write (unproven dependence)';
+                      exit;
+                    end;
+                end;
+              ic_add_idx(sc,tvecnode(n).right);
+              { deliberately do NOT recurse into the subscript index (it holds the
+                counters) nor into the plain array-base load }
+            end;
+          addn,subn,muln,divn,modn,slashn,andn,orn,xorn,shln,shrn:
+            begin
+              ic_check_expr(sc,tbinarynode(n).left);
+              ic_check_expr(sc,tbinarynode(n).right);
+            end;
+          unaryminusn,notn:
+            ic_check_expr(sc,tunarynode(n).left);
+          else
+            begin
+              sc.bad:=true;
+              sc.badreason:='body contains an unsupported operation (call, pointer deref, ...)';
+            end;
+        end;
+      end;
+
+    function ic_single_stmt(body : tnode) : tnode;
+      { the sole meaningful (non-nothingn) statement of body, descending through
+        block wrappers; nil if there is not exactly one }
+      var
+        s, found : tnode;
+        cnt : longint;
+      begin
+        result:=nil;
+        while assigned(body) and (body.nodetype=blockn) do
+          body:=tblocknode(body).left;
+        if not assigned(body) then
+          exit;
+        if body.nodetype<>statementn then
+          exit(body);
+        found:=nil;
+        cnt:=0;
+        s:=body;
+        while assigned(s) and (s.nodetype=statementn) do
+          begin
+            if assigned(tstatementnode(s).left) and (tstatementnode(s).left.nodetype<>nothingn) then
+              begin
+                found:=tstatementnode(s).left;
+                inc(cnt);
+              end;
+            s:=tstatementnode(s).right;
+          end;
+        if cnt<>1 then
+          exit;
+        if found.nodetype=blockn then
+          result:=ic_single_stmt(found)
+        else
+          result:=found;
+      end;
+
+    type
+      tinterchangecontext = object
+        root : tnode;
+        changed : boolean;
+        procedure processloop(var n : tnode);
+      end;
+
+    procedure tinterchangecontext.processloop(var n : tnode);
+      var
+        outerfor, innerfor : tfornode;
+        iout, iin, accsym : tabstractvarsym;
+        sc : tic_scan;
+        body, lhs, rhs, taddend, base : tnode;
+        la, ra : tnode;
+        accdef : tdef;
+        recognized_nest : boolean;
+        cont_in, cont_out : longint;
+        any_in_scaled : boolean;
+        hascheck : boolean;
+        newinner, newouter, oldouter : tnode;
+        reason : string;
+
+      function ic_reason : string;
+        var
+          a : longint;
+        begin
+          result:='';
+          { --- outer loop shape --- }
+          if lnf_backward in outerfor.loopflags then
+            exit('outer loop is descending (downto)');
+          if assigned(outerfor.loopstep) then
+            exit('outer loop has a non-unit step');
+          iout:=rangeelim_simple_var(outerfor.left);
+          if not assigned(iout) then
+            exit('outer counter is not a simple non-aliased variable');
+          if not assigned(outerfor.left.resultdef) or (outerfor.left.resultdef.typ<>orddef) or
+             not is_signed(outerfor.left.resultdef) or not(outerfor.left.resultdef.size in [4,8]) then
+            exit('outer counter is not a signed 32/64-bit integer');
+          if ([cs_check_range,cs_check_overflow]*current_settings.localswitches)<>[] then
+            exit('range/overflow checking is enabled (-Cr/-Co)');
+          if not fuse_bound_pure(outerfor.right) or not fuse_bound_pure(outerfor.t1) then
+            exit('outer loop bounds are not side-effect free');
+
+          { --- the outer body must be exactly one nested counted loop --- }
+          body:=ic_single_stmt(outerfor.t2);
+          if not assigned(body) or (body.nodetype<>forn) then
+            exit('outer body is not a single perfectly-nested counted loop');
+          innerfor:=tfornode(body);
+          if lnf_backward in innerfor.loopflags then
+            exit('inner loop is descending (downto)');
+          if assigned(innerfor.loopstep) then
+            exit('inner loop has a non-unit step');
+          iin:=rangeelim_simple_var(innerfor.left);
+          if not assigned(iin) then
+            exit('inner counter is not a simple non-aliased variable');
+          if iin=iout then
+            exit('inner and outer loops share one counter');
+          if not assigned(innerfor.left.resultdef) or (innerfor.left.resultdef.typ<>orddef) or
+             not is_signed(innerfor.left.resultdef) or not(innerfor.left.resultdef.size in [4,8]) then
+            exit('inner counter is not a signed 32/64-bit integer');
+          if not fuse_bound_pure(innerfor.right) or not fuse_bound_pure(innerfor.t1) then
+            exit('inner loop bounds are not side-effect free');
+          { rectangular nest: inner bounds must not depend on the outer counter }
+          if (ujam_count_refs(innerfor.right,tsym(iout))<>0) or
+             (ujam_count_refs(innerfor.t1,tsym(iout))<>0) then
+            exit('inner loop bounds depend on the outer counter (non-rectangular nest)');
+          { and the outer bounds must not reference the inner counter }
+          if (ujam_count_refs(outerfor.right,tsym(iin))<>0) or
+             (ujam_count_refs(outerfor.t1,tsym(iin))<>0) then
+            exit('outer loop bounds reference the inner counter');
+          { decline any per-region R+/Q+ inside the nest }
+          hascheck:=false;
+          if foreachnodestatic(outerfor.t2,@vect_check_cb,@hascheck) then
+            exit('nest body has per-region range/overflow checking');
+
+          { Both counters must be dead on exit from their loop: interchange only
+            changes a counter's post-loop value in the zero-trip-count corner
+            cases (when both trip counts are non-zero the terminal values are
+            identical), so requiring the DFA-computed lnf_dont_mind_loopvar_on_exit
+            makes that difference unobservable while still permitting the usual
+            reuse of i/j by later loops (each re-initialises the counter before any
+            read).  The inner flag reflects i being dead after the inner loop,
+            which -- the nest being perfect -- is also the nest exit. }
+          if not(lnf_dont_mind_loopvar_on_exit in outerfor.loopflags) then
+            exit('outer counter may be read after the nest (live on loop exit)');
+          if not(lnf_dont_mind_loopvar_on_exit in innerfor.loopflags) then
+            exit('inner counter may be read after the nest (live on loop exit)');
+
+          recognized_nest:=true;
+
+          { --- inner body must be a single assignment --- }
+          body:=ic_single_stmt(innerfor.t2);
+          if not assigned(body) or (body.nodetype<>assignn) then
+            exit('inner loop body is not a single assignment');
+          lhs:=tassignmentnode(body).left;
+          rhs:=tassignmentnode(body).right;
+
+          sc.iout:=iout;
+          sc.iin:=iin;
+          sc.wsym:=nil;
+          sc.accum:=nil;
+          sc.idxproto:=nil;
+          sc.subset_r:=false;
+          sc.bad:=false;
+          sc.badreason:='';
+          setlength(sc.idxs,0);
+          sc.nidx:=0;
+
+          if lhs.nodetype=vecn then
+            begin
+              { subset R: W[idx] := f(...) }
+              base:=rangeelim_skip_typeconv(tvecnode(lhs).left);
+              if not assigned(base) or (base.nodetype<>loadn) or not assigned(rangeelim_simple_var(base)) then
+                exit('the written array is not a simple single-dimension array variable');
+              if not ic_elem_ok(lhs.resultdef) then
+                exit('the written element is not an unmanaged scalar');
+              sc.subset_r:=true;
+              sc.wsym:=tloadnode(base).symtableentry;
+              if (sc.wsym=tsym(iout)) or (sc.wsym=tsym(iin)) then
+                exit('the write target is a loop counter');
+              sc.idxproto:=tvecnode(lhs).right;
+              ic_add_idx(sc,sc.idxproto);
+              ic_check_expr(sc,rhs);
+              if sc.bad then
+                exit(sc.badreason);
+            end
+          else if lhs.nodetype=loadn then
+            begin
+              { subset S: s := s + T }
+              accsym:=rangeelim_simple_var(lhs);
+              if not assigned(accsym) then
+                exit('the assignment target is not a simple non-aliased scalar');
+              accdef:=accsym.vardef;
+              if not ic_elem_ok(accdef) then
+                exit('the reduction accumulator is not an unmanaged scalar');
+              if (tsym(accsym)=tsym(iout)) or (tsym(accsym)=tsym(iin)) then
+                exit('the assignment target is a loop counter');
+              if rhs.nodetype<>addn then
+                exit('body is not a recognized  s := s + <addend>  reduction');
+              la:=taddnode(rhs).left;
+              ra:=taddnode(rhs).right;
+              taddend:=nil;
+              if (rangeelim_skip_typeconv(la).nodetype=loadn) and
+                 (tloadnode(rangeelim_skip_typeconv(la)).symtableentry=tsym(accsym)) then
+                taddend:=ra
+              else if (rangeelim_skip_typeconv(ra).nodetype=loadn) and
+                 (tloadnode(rangeelim_skip_typeconv(ra)).symtableentry=tsym(accsym)) then
+                taddend:=la;
+              if not assigned(taddend) then
+                exit('body is not a recognized  s := s + <addend>  reduction');
+              if (is_single(accdef) or is_double(accdef)) and
+                 not(cs_opt_fastmath in current_settings.optimizerswitches) then
+                exit('floating-point reduction interchange needs fast-math (-OoFASTMATH)');
+              sc.accum:=tsym(accsym);
+              ic_check_expr(sc,taddend);
+              if sc.bad then
+                exit(sc.badreason);
+            end
+          else
+            exit('inner body is neither an element-wise array write nor a scalar reduction');
+
+          { --- cost model: interchange only when the swapped inner counter (iout)
+            is contiguous on strictly more accesses than the current inner (iin),
+            and at least one current-inner access is non-contiguous (scaled) --- }
+          cont_in:=0;
+          cont_out:=0;
+          any_in_scaled:=false;
+          for a:=0 to sc.nidx-1 do
+            begin
+              if ic_appears_in_mul(sc.idxs[a],tsym(iin)) then
+                any_in_scaled:=true
+              else if ic_has_bare_term(sc.idxs[a],tsym(iin)) then
+                inc(cont_in);
+              if (not ic_appears_in_mul(sc.idxs[a],tsym(iout))) and
+                 ic_has_bare_term(sc.idxs[a],tsym(iout)) then
+                inc(cont_out);
+            end;
+          if not(any_in_scaled and (cont_out>cont_in)) then
+            exit('interchange is not more cache-contiguous than the current order');
+        end;
+
+      begin
+        if n.nodetype<>forn then
+          exit;
+        outerfor:=tfornode(n);
+        recognized_nest:=false;
+        reason:=ic_reason;
+        if reason<>'' then
+          begin
+            { only diagnose genuine 2-deep nests, to avoid noise on every loop }
+            if recognized_nest and (cs_opt_report in current_settings.optimizerswitches) then
+              OptRemark(outerfor.fileinfo,'loopinterchange','not interchanged: '+reason);
+            exit;
+          end;
+
+        { --- rebuild the nest with the loops swapped.  The outer counter/bounds
+          become the new INNER loop and the inner counter/bounds the new OUTER
+          loop, wrapping an unchanged copy of the body. --- }
+        newinner:=cfornode.create(
+          outerfor.left.getcopy,outerfor.right.getcopy,outerfor.t1.getcopy,
+          innerfor.t2.getcopy,false);
+        newouter:=cfornode.create(
+          innerfor.left.getcopy,innerfor.right.getcopy,innerfor.t1.getcopy,
+          newinner,false);
+
+        if cs_opt_report in current_settings.optimizerswitches then
+          OptRemark(outerfor.fileinfo,'loopinterchange',
+            'perfect 2-deep counted nest interchanged so the inner loop strides the contiguous dimension');
+
+        oldouter:=n;
+        n:=newouter;
+        do_firstpass(n);
+        oldouter.free;
+        changed:=true;
+      end;
+
+    function interchange_processloop_cb(var n : tnode; arg : pointer) : foreachnoderesult;
+      var
+        before : boolean;
+      begin
+        result:=fen_false;
+        if n.nodetype=forn then
+          begin
+            before:=tinterchangecontext(arg^).changed;
+            tinterchangecontext(arg^).processloop(n);
+            { pm_postprocess invokes this callback BEFORE descending into the
+              node's children, so a for-node we DECLINE must still let the walk
+              recurse -- otherwise a nest wrapped in an outer loop (e.g. a
+              repeat-count  for r  around the 2-deep nest) would never be reached.
+              Only when we actually transformed this node do we stop, because n is
+              now a freshly built replacement whose inner loop must not be
+              re-walked. }
+            if tinterchangecontext(arg^).changed<>before then
+              result:=fen_norecurse_false;
+          end;
+      end;
+
+    function OptimizeLoopInterchange(node : tnode) : boolean;
+      var
+        ctx : tinterchangecontext;
+      begin
+        Result:=false;
+        if (cs_opt_size in current_settings.optimizerswitches) then
+          exit;
+        if not(pi_dfaavailable in current_procinfo.flags) then
+          exit;
+        ctx.root:=node;
+        ctx.changed:=false;
+        { postorder so a nested inner loop is visited (and declines) before the
+          2-level nest that encloses it }
+        foreachnodestatic(pm_postprocess,node,@interchange_processloop_cb,@ctx);
         Result:=ctx.changed;
       end;
 

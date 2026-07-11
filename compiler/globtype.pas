@@ -894,7 +894,26 @@ interface
            breaks strict-IEEE determinism.  Single precision only; the scalar
            remainder tail keeps the exact RTL call (documented contract).  Opt-in
            (-OoAPPROXTRANS); NOT part of the -O4 defaults }
-         cs_opt_approxtrans
+         cs_opt_approxtrans,
+         { loop interchange (-OoLOOPINTERCHANGE): reorder a perfect 2-deep counted
+           for-nest so the innermost loop strides the row-contiguous dimension,
+           improving spatial locality and exposing the inner loop to the
+           vectorizer.  The named gcc/LLVM -floop-interchange transform ported to
+           FPC's tree-node optimizer.  Fires only when the interchanged order is
+           strictly more cache-contiguous than the current one (a cost model on the
+           affine array-subscript coefficients).  Two sound body shapes: (a) an
+           element-wise map  W[idx]:=f(R0[idx],R1[idx],..)  where the write array is
+           distinct from every read array and the SAME index expression indexes the
+           write and all reads (so repeated writes to a colliding cell are
+           idempotent -- interchange is bit-exact regardless of the index map's
+           injectivity), and (b) a scalar sum-reduction  s:=s+T  whose addend T only
+           READS arrays (reordering a pure read-and-accumulate is legal for an
+           associative+commutative reduction -- exact for integer s, and for
+           floating-point s ONLY under -OoFASTMATH which permits the reassociation).
+           Rectangular nest only (inner bounds independent of the outer counter),
+           both counters dead outside the nest, unit ascending step, no range/
+           overflow checking.  Opt-in; NOT part of the -O4 defaults in this landing }
+         cs_opt_loopinterchange
        );
        toptimizerswitches = set of toptimizerswitch;
 
@@ -976,7 +995,7 @@ interface
          'SHRINKWRAP','GVNPRE','PURE','PARTIALINLINE','STACKALLOC','SLP',
          'UNROLLDYN','PREFETCH','ICF','IPARA','FINALVALUE','SIBCALL',
          'REPORT','DEVIRT','IPACP','VECT256','CONSTEVAL','MODREF',
-         'APPROXTRANS'
+         'APPROXTRANS','LOOPINTERCHANGE'
        );
        WPOptimizerSwitchStr : array [twpoptimizerswitch] of string[14] = (
          'DEVIRTCALLS','OPTVMTS','SYMBOLLIVENESS'

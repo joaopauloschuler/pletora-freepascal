@@ -2614,7 +2614,8 @@ const
          'cs_opt_vect256',
          'cs_opt_consteval',
          'cs_opt_modref',
-         'cs_opt_approxtrans'
+         'cs_opt_approxtrans',
+         'cs_opt_loopinterchange'
        );
     var
          globalswitch  : tglobalswitch;
