@@ -18725,8 +18725,34 @@ unit aoptx86;
               Callee-saved registers are, by definition, never argument registers,
               so hoisting the pops above the (now) jump cannot clobber an outgoing
               argument of X.
+            * X must receive ALL of its parameters in registers: a stack-passed
+              argument (the 7th+ integer/pointer arg, an xmm/FPU stack arg, an
+              open-array/hidden/varargs stack arg, ...) is staged in the outgoing
+              parameter area at the BOTTOM of the very frame the hoisted
+              "leaq N(%rsp),%rsp" releases, so releasing rsp before the jmp would
+              leave X reading its stack args from above the restored rsp
+              (garbage).  We prove "no stack args to any callee" cheaply and
+              soundly from the caller side: current_procinfo.maxpushedparasize is
+              the size of this routine's outgoing-parameter area (the max over
+              every call it makes of callerargareasize / varargs area); when it is
+              0 no call in the routine -- including this tail call -- passes ANY
+              argument on the stack, whatever the callee's ABI, arity, varargs or
+              hidden-parameter layout.  If it is >0 we cannot cheaply tell whether
+              THIS particular callee is the one with stack args, so we bail
+              (conservative but always correct).  This also excludes the win64
+              ms_abi (its 32-byte shadow space always makes maxpushedparasize>0
+              for any routine that calls); we reject ms_abi explicitly as well.
             * The teardown restores rsp exactly to routine entry, hence the jump
               enters X with the ABI-mandated alignment regardless of stackalign.
+            * The teardown/pop reasoning assumes a plain caller convention
+              (register/cdecl/stdcall); safecall and the exotic conventions
+              change teardown / hidden-result handling and are rejected.
+            * X must be a DIRECT call to a symbol.  An indirect call holds its
+              target in a register or memory operand; that register may be a
+              callee-saved register the hoisted teardown pops (leaving a stale
+              caller value) or the memory operand may be an rsp-relative frame
+              slot the hoisted release invalidates -- either way "jmp <target>"
+              would branch to garbage.  Indirect calls are rejected.
             * CurrentProcAllowsSiblingTailFrameReuse rejects routines with
               address-taken locals/parameters (a pointer into the released frame
               could be an argument), nested routines capturing the frame,
@@ -18741,6 +18767,30 @@ unit aoptx86;
           orthogonal to frame teardown. }
         if (not Result) and
           (cs_opt_level4 in current_settings.optimizerswitches) and
+          { no outgoing stack arguments anywhere in the routine: releasing the
+            frame before the jmp would leave a stack-arg callee reading its args
+            from the released outgoing-parameter area (garbage).  maxpushedparasize=0
+            proves, from the caller side, that no call -- including this tail call --
+            passes any argument on the stack (also excludes win64 ms_abi). }
+          (current_procinfo.maxpushedparasize=0) and
+          not(target_info.system in systems_x86_64_ms_abi) and
+          { plain caller convention only; safecall / exotic conventions change
+            teardown and hidden-result handling }
+          (current_procinfo.procdef.proccalloption in
+            [pocall_register,pocall_cdecl,pocall_stdcall]) and
+          { p must be a DIRECT call to a symbol.  An indirect call -- through a
+            register or through memory -- may hold its target in a callee-saved
+            register the hoisted teardown pops (jmp *poppedreg -> caller's stale
+            value) or in an rsp-relative frame slot the hoisted release
+            invalidates (jmp *N(%rsp) -> wrong slot); either way the jmp goes to
+            garbage.  (The compiler itself hits this on virtual/procvar tail
+            calls, which is why plain -O4 miscompiled the self-hosted compiler.) }
+          (taicpu(p).ops=1) and
+          (taicpu(p).oper[0]^.typ=top_ref) and
+          (taicpu(p).oper[0]^.ref^.refaddr=addr_full) and
+          (taicpu(p).oper[0]^.ref^.symbol<>nil) and
+          (taicpu(p).oper[0]^.ref^.base=NR_NO) and
+          (taicpu(p).oper[0]^.ref^.index=NR_NO) and
           CurrentProcAllowsSiblingTailFrameReuse then
           begin
             { walk the epilogue: a non-empty run of stack-release / callee-saved

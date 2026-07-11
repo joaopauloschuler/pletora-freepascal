@@ -102,26 +102,58 @@
 #      With #4 fixed, plain OPT="-O4" now compiles the WHOLE compiler past
 #      aoptx86.pas -- no more uninitialised-variable aborts.
 #
-#   5. OPEN (tasklist self-host blocker #5): the FIRST plain-`-O4` MISCOMPILE
-#      (blockers #1-#4 were all warning-only).  With #4 fixed, OPT="-O4" compiles
-#      the whole compiler, but the stage-2 compiler ppc2 (built by ppc1 at -O4)
-#      is MISCOMPILED and crashes (EAccessViolation) on ANY input, aborting the
-#      cycle at `next` while rebuilding system.pp.  Bisected to the fork's
-#      "sibling tail-call frame reuse" peephole (TX86AsmOptimizer.PostPeepholeOptCall,
-#      compiler/x86/aoptx86.pas ~18743, DebugMsg "CallFrameRet2Jmp done"), gated
-#      DIRECTLY on cs_opt_level4 (NOT the -OoSIBCALL toggle -- so disabling every
-#      level-4 -Oo pass does not help; -O2/-O3 are clean).  It hoists a copy of the
-#      frame teardown (leaq N(%rsp),%rsp / addq $N,%rsp + callee-saved pops) ABOVE
-#      a tail call and turns the call into a jmp, but MISSES stack-passed callee
-#      arguments: a callee with >6 int/ptr args reads them from the outgoing-param
-#      area in the just-released frame -> garbage.  Reduced reproducer:
-#      unleashed/tests/known_miscompiles/o4_sibcall_frame_reuse_stackargs_01.pp
-#      (ppcx64 -O4 -> garbage/FAIL, -O3/-O2 -> ok).  Fix: refuse the hoist when the
-#      callee has stack-passed parameters (or preserve the outgoing stack args).
+#   5. FIXED (fork commit on branch a3, aoptx86.pas PostPeepholeOptCall): the
+#      first plain-`-O4` MISCOMPILE (blockers #1-#4 were all warning-only).  The
+#      fork's "sibling tail-call frame reuse" peephole (TX86AsmOptimizer.
+#      PostPeepholeOptCall, DebugMsg "CallFrameRet2Jmp done", gated DIRECTLY on
+#      cs_opt_level4) hoists the frame teardown (leaq/addq rsp release + callee-
+#      saved pops) above a tail call and turns the call into a jmp.  It had TWO
+#      unsound holes, both fixed by extra gates that keep the transform firing for
+#      the provably-safe register-args-only DIRECT-call case: (a) STACK-PASSED
+#      ARGS -- a callee with >6 int/ptr args (or any xmm/hidden/varargs stack arg)
+#      reads them from the outgoing-parameter area in the just-released frame ->
+#      garbage; rejected via current_procinfo.maxpushedparasize=0 (proves, from
+#      the caller side, no call passes any stack arg; also excludes win64 ms_abi)
+#      plus a plain-caller-convention gate.  (b) INDIRECT CALLS -- `call *%reg`
+#      whose target is a callee-saved reg the teardown pops, or `call *N(%rsp)`
+#      whose target lives in the released frame, become `jmp <garbage>`; rejected
+#      by requiring a direct call to a symbol.  Hole (b) is what actually crashed
+#      the self-hosted compiler (virtual/procvar tail calls are everywhere).
+#      Reproducers: unleashed/tests/known_miscompiles/o4_sibcall_frame_reuse_
+#      stackargs_01.pp and testfiles/sibcall_frame_reuse/{stackargs,indirect}_01.pp
+#      (%OPT=-O4); codegen guard unleashed/tests/sibcall_frame_reuse_check.sh.
+#      With #5 fixed, OPT="-O4" now builds a WORKING stage-2 compiler (ppc2 runs on
+#      simple inputs) -- the cycle advances to CYCLELEVEL=3, exposing blocker #6.
 #
-#   So plain -O4 self-host is BLOCKED pending #5.  Once green, adopt the winning
-#   flag set here as the documented default gate and (optionally) fold in the
-#   opt-in -Oo* passes one at a time via OPTFORK.
+#   6. OPEN (tasklist self-host blocker #6): the SECOND plain-`-O4` codegen
+#      miscompile, DISTINCT from and independent of #5 (it reproduces with the #5
+#      peephole fully disabled).  With #5 fixed, ppc2 compiles hello but still
+#      CRASHES (EAccessViolation / memory corruption) compiling complex sources
+#      like the RTL's system.pp, aborting the cycle at CYCLELEVEL=3.  Single-pass
+#      -OoNO* bisection while building ppc2 pins it to exactly ONE pass:
+#      -OoUNROLLJAM (cs_opt_unrolljam, unroll-and-jam, gated in -O4).  The only
+#      routine unroll-and-jammed in the whole compiler is TMessage.ResetStates
+#      (compiler/cmsgs.pas:482, "outer factor 4"), whose INNER loop trip count
+#      msgidxmax[i] DEPENDS ON THE OUTER COUNTER i; jamming K inner loops with
+#      different trip counts drives all K rows with one wrong bound -> wrong
+#      values + out-of-bounds stores that corrupt the heap (surfacing later as a
+#      corrupt virtual dispatch in symtable.pas search_macro).  Reduced reproducer:
+#      unleashed/tests/known_miscompiles/o4_unrolljam_varying_inner_bound_01.pp
+#      (ppcx64 -O4 -> FAIL, -O4 -OoNOUNROLLJAM / -O3 / -O2 -> ok).  Fix: the pass
+#      must refuse to jam (or peel/guard) when the inner loop count is not
+#      invariant across the unrolled outer iterations.
+#
+#   So plain -O4 self-host is BLOCKED pending #6.  OPT="-O4"
+#   OPTFORK="-OoNOUNROLLJAM" (the seed never sees -Oo*, so it must go through
+#   OPTFORK) clears #6's crash and lets the cycle advance further, but then hits
+#   yet ANOTHER distinct -O4 issue at CYCLELEVEL=3 (ppc2 miscompiles the RTL:
+#   "Illegal type conversion Extended to QWord" / internal error 2014091205 at
+#   system.inc) -- so more blockers remain past #6 and there is no green -O4 flag
+#   set yet; no default gate is documented here.  Each blocker gets reduced and
+#   filed one at a time (blockers #1-#5 fixed, #6 filed).  Once plain -O4 is
+#   finally green (byte-identical ppc2/ppc3 + byte-identical unleashed set),
+#   adopt it as the documented default gate and fold in the opt-in -Oo* passes one
+#   at a time via OPTFORK.
 set -e
 FP="$(cd "$(dirname "$0")" && pwd)"
 
