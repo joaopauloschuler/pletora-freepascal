@@ -485,6 +485,8 @@ implementation
         sym : tsym;
         b : boolean;
         fres : double;
+        shraw,shcount : qword;
+        opbits : longint;
       begin
         result:=false;
         if f^.shared^.failed then
@@ -672,6 +674,33 @@ implementation
                   end;
                   v:=mk_ord(trunc_to(ov,n.resultdef));
                 end;
+              result:=true;
+            end;
+          shln,shrn:
+            begin
+              if not eval_expr(f,tbinarynode(n).left,lv) then exit;
+              if not eval_expr(f,tbinarynode(n).right,rv) then exit;
+              if (lv.kind<>cev_ord) or (rv.kind<>cev_ord) then
+                begin fail(f,'non-ordinal shift operand'); exit; end;
+              { mirror x86-64 codegen EXACTLY: the shift operands are promoted to
+                at least 32-bit, so the result is 4- or 8-byte. The hardware masks
+                the count to 5 bits for a <=32-bit operation and to 6 bits for a
+                64-bit one (so a >width shift is count mod width, NOT zero). shr
+                is a LOGICAL (zero-fill) shift even for a signed left operand, so
+                zero-extend the value to its width before shifting. }
+              if n.resultdef.size>=8 then
+                shcount:=rv.ord.uvalue and qword(63)
+              else
+                shcount:=rv.ord.uvalue and qword(31);
+              opbits:=n.resultdef.size*8;
+              shraw:=lv.ord.uvalue;
+              if opbits<64 then
+                shraw:=shraw and ((qword(1) shl opbits)-1);
+              if n.nodetype=shln then
+                shraw:=shraw shl shcount
+              else
+                shraw:=shraw shr shcount;
+              v:=mk_ord(trunc_to(make_cei(shraw,is_signed(n.resultdef)),n.resultdef));
               result:=true;
             end;
           notn:

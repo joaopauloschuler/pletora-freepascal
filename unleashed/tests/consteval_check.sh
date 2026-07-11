@@ -221,6 +221,48 @@ echo "                     double folded=$n_fold_dchain runtime-calls=$n_call_dc
 [ -n "$bf_fs" ] && [ "$bf_fs" = "$bf_us" ] || { echo "  X single folded literal not bit-identical to runtime"; fail=1; }
 [ -n "$bf_fd" ] && [ "$bf_fd" = "$bf_ud" ] || { echo "  X double folded literal not bit-identical to runtime"; fail=1; }
 
+# --- (10) shl/shr masking: a const routine that shifts by a (parameter) count
+#          folds, and the folded literal equals the SAME routine at run time even
+#          for a >width shift count (x86-64 masks mod 32 / mod 64, so the shift is
+#          count-mod-width, never zeroed) and for a signed logical shr. ---
+cat > sbit.pas <<'EOF'
+program sbit;
+{$mode objfpc}{$H+}{$Q-}{$R-}
+function shl_l(x: longint; c: longint): longint; begin shl_l := x shl c; end;
+function shl_q(x: int64;   c: longint): int64;   begin shl_q := x shl c; end;
+function shr_l(x: longint; c: longint): longint; begin shr_l := x shr c; end;
+var g1: longint = 1; q1: int64 = 1; gm8: longint = -8;
+    c40: longint = 40; c65: longint = 65; c1: longint = 1;
+begin
+  { folded (const args) then runtime (mutable-global args), same values }
+  Writeln(shl_l(1, 40),  ' ', shl_l(g1, c40),
+      ' ', shl_q(1, 65),  ' ', shl_q(q1, c65),
+      ' ', shr_l(-8, 1),  ' ', shr_l(gm8, c1));
+end.
+EOF
+"$CC" $FLAGS -a -OoREPORT sbit.pas -osbit >sbit.log 2>&1
+sbit_link=$?
+n_fold_shift=$(grep -ciE 'consteval: call to (shl_l|shl_q|shr_l) folded' sbit.log)
+# each of the three helpers keeps exactly its ONE runtime (global-arg) call
+n_call_shl_l=$(grep -ciE 'call[^A-Za-z0-9_]+.*SHL_L' sbit.s)
+n_call_shl_q=$(grep -ciE 'call[^A-Za-z0-9_]+.*SHL_Q' sbit.s)
+n_call_shr_l=$(grep -ciE 'call[^A-Za-z0-9_]+.*SHR_L' sbit.s)
+read -r s_fl s_rl s_fq s_rq s_fsr s_rsr < <( ( ulimit -v 3000000; timeout 60 ./sbit ) 2>/dev/null )
+
+echo "(10) shift mask: folded-remarks=$n_fold_shift  runtime-calls(shl_l,shl_q,shr_l)=$n_call_shl_l,$n_call_shl_q,$n_call_shr_l"
+echo "     longint 1 shl 40: folded=$s_fl runtime=$s_rl (expect 256)"
+echo "     int64   1 shl 65: folded=$s_fq runtime=$s_rq (expect 2)"
+echo "     longint -8 shr 1: folded=$s_fsr runtime=$s_rsr (expect 2147483644)"
+
+[ "$sbit_link" -eq 0 ]               || { echo "  X shift program failed to link"; cat sbit.log; fail=1; }
+[ "$n_fold_shift" -ge 3 ]            || { echo "  X shift const calls not folded"; fail=1; }
+[ "$n_call_shl_l" -eq 1 ]            || { echo "  X shl_l: expected exactly the one runtime call to survive"; fail=1; }
+[ "$n_call_shl_q" -eq 1 ]            || { echo "  X shl_q: expected exactly the one runtime call to survive"; fail=1; }
+[ "$n_call_shr_l" -eq 1 ]            || { echo "  X shr_l: expected exactly the one runtime call to survive"; fail=1; }
+[ "$s_fl" = "$s_rl" ] && [ "$s_fl" = "256" ]        || { echo "  X longint >width shl fold wrong/!=runtime"; fail=1; }
+[ "$s_fq" = "$s_rq" ] && [ "$s_fq" = "2" ]          || { echo "  X int64 >width shl fold wrong/!=runtime"; fail=1; }
+[ "$s_fsr" = "$s_rsr" ] && [ "$s_fsr" = "2147483644" ] || { echo "  X signed logical shr fold wrong/!=runtime"; fail=1; }
+
 if [ "$fail" -eq 0 ]; then
   echo "PASS: -OoCONSTEVAL folds const calls (scalar, recursive, cross-unit, counted-for, single/double float) to literals bit-exactly; refuses over-budget/non-const/non-constant; sound and byte-identical to baseline"
   exit 0
