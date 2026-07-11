@@ -462,6 +462,21 @@ implementation
         st : tsymtabletype;
       begin
         alias_safe:=false;
+        { The zero-byte fold RELOCATES DUP's entry symbol out of DUP's own
+          per-function section (.text.n_<dup>) into REP's section (.text.n_<rep>).
+          Under section-per-function (the default here) DUP and REP always live in
+          distinct sections, so with debug info this strands DUP's end/line labels:
+          the per-proc DWARF address range and .debug_aranges entry for DUP were
+          already emitted (during DUP's own compilation, before ICF) with low_pc =
+          DUP's symbol and length = <DUP-end-label> - <DUP-symbol>.  After the move
+          those two operands straddle two sections and the internal assembler raises
+          IE 200404124 on the aranges length const (fantastica/fpc-torture seeds
+          3 & 11).  The thunk fold keeps DUP's symbol, end-label and section header
+          together, so its debug range stays intra-section and valid -- fall back to
+          it whenever per-proc debug ranges are generated. }
+        if (cs_debuginfo in current_settings.moduleswitches) or
+           (cs_use_lineinfo in current_settings.globalswitches) then
+          exit;
         { a multi-entry routine (extra aliasnames) would strand its other entry
           symbols if we moved only the primary one to the survivor }
         if not dup.single_entry then
