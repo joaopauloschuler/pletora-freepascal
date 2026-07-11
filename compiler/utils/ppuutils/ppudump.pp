@@ -4631,7 +4631,7 @@ begin
                  optsum_pure:
                    begin
                      b:=ppufile.getbyte;
-                     writeln([space,' Optimizer summary : PURE  is_pure=',ord((b and 1)<>0),' is_const=',ord((b and 2)<>0)]);
+                     writeln([space,' Optimizer summary : PURE  is_pure=',ord((b and 1)<>0),' is_const=',ord((b and 2)<>0),' is_nothrow=',ord((b and 4)<>0),' is_mempure=',ord((b and 8)<>0)]);
                    end;
                  optsum_modref:
                    begin

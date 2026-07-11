@@ -3148,6 +3148,17 @@ cg_o_opt_remark=06089_O_$1: $2
 % \var{-Ooreport} (independent of message verbosity) and carries no
 % \i{Note:}/\i{Hint:} label, so it is machine-greppable. Measure-only: enabling
 % it never changes generated code.
+cg_h_proc_nothrow=06090_H_Function "$1" proven nothrow by -OoPURE (cannot raise an exception or trap)
+% The interprocedural pure/const discovery pass (\var{-OoPURE}) proved that this
+% routine -- and every routine it calls -- can never raise an exception or trap
+% (no division/checked arithmetic, no faulting dereference, no inline assembler,
+% no indirect/virtual/external call, no \var{raise}/\var{try}). This \i{nothrow}
+% attribute is tracked INDEPENDENTLY of purity, so it can hold for a routine that
+% is not pure (e.g. one that only writes a global). A consumer such as
+% \var{-OoLICM} may speculatively hoist a proven nothrow, side-effect-free,
+% loop-invariant call into a loop preheader even when the loop may run zero
+% times. This hint is only emitted while the pass is enabled and is shown at hint
+% verbosity (\var{-vh}).
 %
 % \end{description}
 # EndOfTeX

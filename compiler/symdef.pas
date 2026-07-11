@@ -1003,6 +1003,15 @@ interface
           pure_analyzed : boolean;
           pure_intrinsic_impure : boolean;
           pure_reads_global : boolean;
+          { -OoPURE nothrow attribute, tracked INDEPENDENTLY of purity: the body
+            (or a callee) may raise an exception or trap (div/mod by zero,
+            range/overflow check, inline asm, indirect/virtual/external call).
+            pure_intrinsic_impure above now carries only the MEMORY / side-effect
+            causes (a global write, addr-taken, goto, ...), so the two facts are
+            orthogonal: a routine that writes a global (impure) can still be
+            nothrow, and the fold  pure = not(mem-impure or can-trap)  keeps the
+            pure/const verdict byte-identical to before the split. }
+          pure_can_trap : boolean;
           pure_callees : array of tprocdef;
           pure_qtoken : cardinal;
           pure_qresult : byte;
@@ -1040,6 +1049,12 @@ interface
           pure_ppu_valid : boolean;
           pure_ppu_is_pure : boolean;
           pure_ppu_is_const : boolean;
+          { cross-unit nothrow / mem-pure verdicts (carried alongside pure/const
+            in the same optsum_pure summary, so a caller in another unit can
+            consult them without re-deriving the call graph). nothrow = cannot
+            raise/trap; mempure = writes no memory (may read globals, may trap) }
+          pure_ppu_is_nothrow : boolean;
+          pure_ppu_is_mempure : boolean;
           { identical code folding (-OoICF).
               icf_addrtaken  : transient (this-unit) flag set the moment this
                                routine's address is loaded as a value (@proc /
@@ -1330,7 +1345,9 @@ interface
          routine's final pure/const verdict at write time, so the two booleans
          can be persisted for callers in other units. nil (pass off / optpure
          not linked) => the pure summary is not written. }
-       proc_query_purity_verdict : function(pd:tprocdef; wantconst:boolean):boolean = nil;
+       { want: 0=pure, 1=const, 2=nothrow (cannot raise/trap), 3=mempure
+         (writes no memory; may read globals / may trap) }
+       proc_query_purity_verdict : function(pd:tprocdef; want:byte):boolean = nil;
 
 
     { default types }
@@ -7447,10 +7464,16 @@ implementation
         if pure_analyzed and assigned(proc_query_purity_verdict) then
           begin
             pureflags:=0;
-            if proc_query_purity_verdict(self,false) then
+            if proc_query_purity_verdict(self,0) then
               pureflags:=pureflags or 1;
-            if proc_query_purity_verdict(self,true) then
+            if proc_query_purity_verdict(self,1) then
               pureflags:=pureflags or 2;
+            { bit 2: nothrow (cannot raise/trap), bit 3: mem-pure (writes no
+              memory) -- tracked independently of purity (-OoPURE nothrow) }
+            if proc_query_purity_verdict(self,2) then
+              pureflags:=pureflags or 4;
+            if proc_query_purity_verdict(self,3) then
+              pureflags:=pureflags or 8;
             ppufile.putbyte(optsum_pure);
             ppufile.putword(1);
             ppufile.putbyte(pureflags);
@@ -7531,6 +7554,8 @@ implementation
         pure_ppu_valid:=false;
         pure_ppu_is_pure:=false;
         pure_ppu_is_const:=false;
+        pure_ppu_is_nothrow:=false;
+        pure_ppu_is_mempure:=false;
         icf_hash_valid:=false;
         modref_ppu_valid:=false;
         modref_reads:=0;
@@ -7548,6 +7573,8 @@ implementation
                 pure_ppu_valid:=true;
                 pure_ppu_is_pure:=(pureflags and 1)<>0;
                 pure_ppu_is_const:=(pureflags and 2)<>0;
+                pure_ppu_is_nothrow:=(pureflags and 4)<>0;
+                pure_ppu_is_mempure:=(pureflags and 8)<>0;
               end;
             optsum_modref:
               begin

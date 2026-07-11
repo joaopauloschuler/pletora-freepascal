@@ -43,7 +43,9 @@ rc=0
 grep -qE 'Function "cst[^"]*" proven const' <<<"$on" || { echo "FAIL: cst not reported const"; rc=1; }
 grep -qE 'Function "pur[^"]*" proven pure'  <<<"$on" || { echo "FAIL: pur not reported pure";  rc=1; }
 grep -qE 'Function "Sq[^"]*" proven pure'   <<<"$on" || { echo "FAIL: read-only method Sq not reported pure"; rc=1; }
-grep -qE 'imp[^"]*" proven'                 <<<"$on" && { echo "FAIL: impure imp wrongly reported pure/const"; rc=1; } || true
+# imp writes a global -> never pure/const (it MAY still be nothrow, an
+# orthogonal -OoPURE attribute, so match only the pure/const verdict here)
+grep -qE 'imp[^"]*" proven (pure|const)'    <<<"$on" && { echo "FAIL: impure imp wrongly reported pure/const"; rc=1; } || true
 grep -qE 'proven (pure|const)'              <<<"$off" && { echo "FAIL: hint emitted without -OoPURE"; rc=1; } || true
 
 [ "$rc" -eq 0 ] && echo "PASS: -vh reports const/pure/method verdicts; silent for impure and with -OoPURE off"

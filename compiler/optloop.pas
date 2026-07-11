@@ -1379,7 +1379,15 @@ unit optloop;
           expr : tnode;
         end;
         changed : boolean;
+        { -OoPURE nothrow consumer: true when the loop body writes NO memory
+          (only locals / non-address-taken temps), computed once per loop in
+          processloop. Lets a proven MEM-PURE + NOTHROW loop-invariant call be
+          hoisted even though it reads globals: with no memory written in the
+          loop its global reads are invariant, and nothrow makes the zero-trip
+          speculation into the preheader sound. }
+        loopmaywrite : boolean;
         function is_pure_invariant(expr : tnode) : boolean;
+        function nothrow_call_hoistable(expr : tnode) : boolean;
         function find_existing_hoist(n : tnode) : ttempcreatenode;
         function hoistcandidate(var n : tnode) : foreachnoderesult;
         procedure processloop(var n : tnode);
@@ -1506,6 +1514,141 @@ unit optloop;
       end;
 
 
+    { does writing to l-value L touch memory observable outside the frame?
+      (a static/global, a by-reference parameter, or a pointer deref). A store
+      to a plain local / non-address-taken temp is NOT. Mirrors optpure's
+      lvalue_write_is_side_effect, kept local to optloop. }
+    function licm_lvalue_writes_memory(t : tnode) : boolean;
+      var
+        sym : tsym;
+      begin
+        result:=true;
+        while assigned(t) do
+          case t.nodetype of
+            typeconvn: t:=ttypeconvnode(t).left;
+            subscriptn: t:=tsubscriptnode(t).left;
+            vecn: t:=tvecnode(t).left;
+            temprefn: exit(false);
+            derefn: exit(true);
+            loadn:
+              begin
+                sym:=tloadnode(t).symtableentry;
+                if sym is tstaticvarsym then
+                  exit(true)
+                else if sym is tparavarsym then
+                  begin
+                    if (vo_is_self in tparavarsym(sym).varoptions) then
+                      exit(true);
+                    if (tparavarsym(sym).varspez in [vs_var,vs_out,vs_constref]) and
+                       not(vo_is_funcret in tparavarsym(sym).varoptions) then
+                      exit(true)
+                    else
+                      exit(false);
+                  end
+                else if sym is tlocalvarsym then
+                  exit(false)
+                else
+                  exit(true);
+              end;
+            else
+              exit(true);
+          end;
+      end;
+
+
+    { conservative "this node writes memory" test for the loop-body scan below.
+      Over-reporting only DISABLES the nothrow hoist (never enables an unsound
+      one), so anything not obviously local-only counts as a write. }
+    function licm_writes_memory_cb(var n : tnode; arg : pointer) : foreachnoderesult;
+      var
+        pd : tprocdef;
+        para : tcallparanode;
+      begin
+        result:=fen_false;
+        case n.nodetype of
+          asmn:
+            begin pboolean(arg)^:=true; result:=fen_norecurse_true; end;
+          calln:
+            begin
+              { a call writes no memory only if -OoPURE proved it MEM-PURE
+                (const/pure both imply mem-pure); anything else may store }
+              pd:=loop_call_target(n);
+              if not(assigned(pd) and proc_is_mempure(pd)) then
+                begin pboolean(arg)^:=true; result:=fen_norecurse_true; end;
+            end;
+          assignn:
+            if licm_lvalue_writes_memory(tassignmentnode(n).left) then
+              begin pboolean(arg)^:=true; result:=fen_norecurse_true; end;
+          derefn:
+            if ([nf_write,nf_modify]*n.flags)<>[] then
+              begin pboolean(arg)^:=true; result:=fen_norecurse_true; end;
+          inlinen:
+            case tinlinenode(n).inlinenumber of
+              in_inc_x,in_dec_x,in_succ_x,in_pred_x:
+                { in-place ordinal step: a memory write only if the mutated
+                  target is externally observable }
+                begin
+                  para:=tcallparanode(tinlinenode(n).left);
+                  while assigned(para) do
+                    begin
+                      if assigned(para.left) and
+                         (([nf_write,nf_modify]*para.left.flags)<>[]) and
+                         licm_lvalue_writes_memory(para.left) then
+                        begin pboolean(arg)^:=true; result:=fen_norecurse_true; end;
+                      para:=tcallparanode(para.right);
+                    end;
+                end;
+              else
+                { any other intrinsic (setlength/new/dispose/I/O/...) -> assume
+                  it may write memory }
+                begin pboolean(arg)^:=true; result:=fen_norecurse_true; end;
+            end;
+          else
+            ;
+        end;
+      end;
+
+
+    { -OoPURE nothrow consumer: a resolved DIRECT call to a routine proved
+      MEM-PURE (writes no memory; may read globals) AND NOTHROW (cannot raise or
+      trap), whose every argument is loop-invariant, is hoistable into the
+      preheader when the loop body writes no memory (so the globals it reads are
+      loop-invariant). It is NOT admitted by licm_is_pure_invariant, which
+      requires the stronger CONST verdict; here the NOTHROW bit -- tracked
+      independently of purity -- supplies exactly the "safe to speculate into a
+      possibly zero-trip preheader" guarantee that CONST otherwise stood in for.
+      A MEM-PURE call that may still TRAP (e.g. `100 div g`) is correctly
+      rejected here by the nothrow check. }
+    function tlicmcontext.nothrow_call_hoistable(expr : tnode) : boolean;
+      var
+        pd : tprocdef;
+        para : tcallparanode;
+      begin
+        result:=false;
+        if (expr.nodetype<>calln) or loopmaywrite then
+          exit;
+        if not licm_simple_type(expr.resultdef) then
+          exit;
+        if ([nf_write,nf_modify]*expr.flags)<>[] then
+          exit;
+        pd:=loop_call_target(expr);
+        if not assigned(pd) then
+          exit;
+        { const calls are already handled (and hoisted) by is_pure_invariant;
+          this path is for the strictly weaker mem-pure+nothrow case }
+        if not(proc_is_mempure(pd) and proc_is_nothrow(pd)) then
+          exit;
+        para:=tcallparanode(tcallnode(expr).left);
+        while assigned(para) do
+          begin
+            if not licm_is_pure_invariant(loopdefsum,para.paravalue) then
+              exit;
+            para:=tcallparanode(para.nextpara);
+          end;
+        result:=true;
+      end;
+
+
     function tlicmcontext.find_existing_hoist(n : tnode) : ttempcreatenode;
       var
         i : sizeint;
@@ -1539,8 +1682,12 @@ unit optloop;
           exit;
         if ([nf_write,nf_modify]*n.flags)<>[] then
           exit;
+        { is_pure_invariant covers const calls; a strictly weaker MEM-PURE +
+          NOTHROW loop-invariant call is also hoistable when the loop writes no
+          memory (nothrow_call_hoistable) }
         if not is_pure_invariant(n) then
-          exit;
+          if not nothrow_call_hoistable(n) then
+            exit;
 
         { a purely constant arithmetic expression is already folded; require at
           least one variable read so we actually save work. A call is always
@@ -1563,6 +1710,14 @@ unit optloop;
             result:=fen_norecurse_false;
             exit;
           end;
+
+        { -OoREPORT: a mem-pure+nothrow call hoisted via the nothrow relaxation
+          (is_pure_invariant said no, i.e. it is not CONST) -- make the consumer
+          of the independent nothrow attribute observable }
+        if (cs_opt_report in current_settings.optimizerswitches) and
+           (n.nodetype=calln) and not is_pure_invariant(n) then
+          OptRemark(n.fileinfo,'licm',
+            'hoisted a proven mem-pure + NOTHROW loop-invariant call into the preheader (-OoPURE nothrow attribute)');
 
         if not assigned(inittemps) then
           begin
@@ -1609,6 +1764,19 @@ unit optloop;
         if not assigned(n.optinfo) then
           exit;
         loopdefsum:=n.optinfo^.defsum;
+
+        { -OoPURE nothrow consumer: does the loop body write any memory? (only
+          relevant with -OoPURE; the scan is cheap and gates nothrow_call_hoistable) }
+        loopmaywrite:=false;
+        if cs_opt_pure in current_settings.optimizerswitches then
+          begin
+            if n.nodetype=forn then
+              foreachnodestatic(pm_postprocess,tfornode(n).t2,@licm_writes_memory_cb,@loopmaywrite)
+            else
+              foreachnodestatic(pm_postprocess,twhilerepeatnode(n).right,@licm_writes_memory_cb,@loopmaywrite);
+          end
+        else
+          loopmaywrite:=true;
 
         inittemps:=nil;
         deletetemps:=nil;
