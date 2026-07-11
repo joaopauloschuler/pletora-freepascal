@@ -54,7 +54,13 @@ const
     (opsize), operand order (FOperandOrder) and top_ref/relsymbol/label symbols
     by name+bind+typ so an asm block can be spliced cross-unit (FPC Unleashed
     cross-unit inline-asm splicing) }
-  CurrentPPULongVersion = 36;
+  { bumped to 37: the optsum_modref blob now carries the per-static-variable
+    read/write sets (-OoMODREF item (d) per-location aliasing precision): after
+    the two by-ref per-formal masks, an smask_exact flag bit (byte bit 6) plus a
+    count byte + that many mangled-name ansistrings for the reads set, then the
+    writes set. Statics are identified cross-unit by their (globally-unique,
+    linker-stable) mangled name. }
+  CurrentPPULongVersion = 37;
 
   { Tags for the per-procdef optimizer-summary blob streamed inside the
     ibprocdef entry (see tprocdef.ppuwrite/ppuload). The blob is a self-

@@ -10387,6 +10387,15 @@ unit optloop;
         Vars: TLinkedList;
       end;
 
+    var
+      { during a store-motion body-safety scan, the set of globals THIS loop
+        would promote to registers (written qualifying statics). A body call is
+        transparent only if it provably neither reads nor writes ANY of them
+        (per-static -OoMODREF precision, item (d)); a call touching only OTHER
+        globals / heap is harmless because store motion caches nothing else.
+        nil outside the scan => the coarse "no global access at all" test. }
+      sm_promote_data : PStoreMotionData;
+
     { A global (tstaticvarsym) that may be promoted for the loop's duration. }
     function sm_qualifies_sym(sym: tsym): boolean;
       var
@@ -10446,11 +10455,19 @@ unit optloop;
       -OoMODREF additionally admits an IMPURE routine whose reads/writes at THIS
       call site are confined to non-global actuals -- the motivating case being
       a helper that writes only its own out parameter bound to a caller local --
-      provided its summary proves it cannot trap. }
+      provided its summary proves it cannot trap.
+
+      With the per-static summary (item (d)) and a known promotion set
+      (sm_promote_data), the requirement further relaxes from "touches NO global"
+      to "touches none of the PROMOTED globals": a helper that writes only an
+      unrelated static B may stay in a loop that promotes only global A, because
+      B is never register-cached (it keeps its normal in-memory semantics). }
     function sm_call_transparent(n: tnode): boolean;
       var
         pd : tprocdef;
+        cn : tcallnode;
         readsglobal,writesglobal : boolean;
+        v : TStoreMotionVar;
       begin
         result:=loop_is_const_call(n);
         if result then
@@ -10458,10 +10475,31 @@ unit optloop;
         if not(cs_opt_modref in current_settings.optimizerswitches) then
           exit;
         pd:=loop_call_target(n);
-        result:=assigned(pd) and
-                modref_call_effect(tcallnode(n),readsglobal,writesglobal) and
-                not readsglobal and not writesglobal and
-                not modref_pd_can_trap(pd);
+        if not assigned(pd) or modref_pd_can_trap(pd) then
+          exit;
+        cn:=tcallnode(n);
+        if assigned(sm_promote_data) then
+          begin
+            { per-static: the call may stay iff it provably neither reads nor
+              writes ANY global this loop promotes; touching other globals/heap is
+              harmless (store motion caches only the promoted set). An empty
+              promotion set (Vars.Count=0) makes every non-trapping resolved call
+              transparent, but such a loop promotes nothing and is dropped later. }
+            v:=TStoreMotionVar(sm_promote_data^.Vars.First);
+            while assigned(v) do
+              begin
+                if modref_call_may_access_static(cn,v.Sym,true) or
+                   modref_call_may_access_static(cn,v.Sym,false) then
+                  exit;
+                v:=TStoreMotionVar(v.Next);
+              end;
+            result:=true;
+          end
+        else
+          { no known promotion set (e.g. the -OoREPORT rescan): the coarse test --
+            the call must touch no globally-reachable memory at all }
+          result:=modref_call_effect(cn,readsglobal,writesglobal) and
+                  not readsglobal and not writesglobal;
       end;
 
     { Recursive whitelist over statements *and* expressions: true only if every
@@ -10632,21 +10670,11 @@ unit optloop;
         if not (n.nodetype in [forn,whilerepeatn]) or (nf_internal in n.flags) then
           exit;
 
-        { the whole loop node (bounds/condition + body) must be provably
-          call-free, non-trapping and alias-safe }
-        if n.nodetype=forn then
-          bodysafe:=sm_node_safe(tfornode(n).right) and   { start bound }
-                    sm_node_safe(tfornode(n).t1) and       { end bound }
-                    sm_node_safe(tfornode(n).t2)           { body }
-        else
-          bodysafe:=sm_node_safe(twhilerepeatnode(n).left) and  { condition }
-                    sm_node_safe(twhilerepeatnode(n).right) and  { body }
-                    sm_node_safe(twhilerepeatnode(n).t1);
-        if not bodysafe then
-          exit;
-
         data.Vars:=TLinkedList.Create;
         try
+          { collect the promotion set FIRST -- the written qualifying globals --
+            so the body-safety scan can judge each in-body call against exactly
+            the globals this loop would register-cache (per-static -OoMODREF). }
           foreachnodestatic(pm_postprocess,n,@sm_collectrefs,@data);
 
           { keep only globals actually WRITTEN in the loop -- those are the ones
@@ -10680,6 +10708,33 @@ unit optloop;
 
           if data.Vars.Count=0 then
             exit;
+
+          { the whole loop node (bounds/condition + body) must be provably
+            non-trapping and alias-safe; an in-body call is admitted only if it
+            provably touches none of the promoted globals (sm_promote_data) }
+          sm_promote_data:=@data;
+          if n.nodetype=forn then
+            bodysafe:=sm_node_safe(tfornode(n).right) and   { start bound }
+                      sm_node_safe(tfornode(n).t1) and       { end bound }
+                      sm_node_safe(tfornode(n).t2)           { body }
+          else
+            bodysafe:=sm_node_safe(twhilerepeatnode(n).left) and  { condition }
+                      sm_node_safe(twhilerepeatnode(n).right) and  { body }
+                      sm_node_safe(twhilerepeatnode(n).t1);
+          sm_promote_data:=nil;
+          if not bodysafe then
+            begin
+              { the promotion-candidate temps were built before the safety scan
+                (so it could judge body calls against them); none were consumed,
+                so release them here (the finally only frees the list items) }
+              v:=TStoreMotionVar(data.Vars.First);
+              while assigned(v) do
+                begin
+                  v.TempCreate.Free;
+                  v:=TStoreMotionVar(v.Next);
+                end;
+              exit;
+            end;
 
           { rewrite every reference in the loop to the corresponding temp }
           if not foreachnodestatic(pm_postprocess,n,@sm_replacerefs,@data) then
@@ -10739,6 +10794,7 @@ unit optloop;
           n.pass_typecheck;
           result:=fen_true;
         finally
+          sm_promote_data:=nil;
           data.Vars.Free;
         end;
       end;

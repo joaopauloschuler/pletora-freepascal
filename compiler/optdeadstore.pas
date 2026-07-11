@@ -305,13 +305,21 @@ unit optdeadstore;
       thazinfo = record
         barrier  : boolean; { deref / asm / impure call -> hard flush }
         purecall : boolean; { a proven-PURE (global-reading) call was seen }
+        { the elc_pure call nodes seen, so a per-static (-OoMODREF) check can ask
+          each of them whether it may read/write a SPECIFIC pending static base
+          instead of blanket-invalidating every globally-reachable pending store }
+        calls    : array of tcallnode;
+        ncalls   : longint;
       end;
       phazinfo = ^thazinfo;
 
     { scan a tree for memory hazards, treating a proven pure/const call as a
       non-barrier (recursing into its arguments so a nested hazard is still
-      caught) and recording whether any pure (global-reading) call occurred. }
+      caught) and recording whether any pure (global-reading) call occurred (and
+      collecting those call nodes for the per-static refinement). }
     function el_haz_scan(var n: tnode; arg: pointer): foreachnoderesult;
+      var
+        hz : phazinfo;
       begin
         result:=fen_true;
         case n.nodetype of
@@ -328,7 +336,14 @@ unit optdeadstore;
                   result:=fen_norecurse_true;
                 end;
               elc_pure:
-                phazinfo(arg)^.purecall:=true;
+                begin
+                  hz:=phazinfo(arg);
+                  hz^.purecall:=true;
+                  if hz^.ncalls>=length(hz^.calls) then
+                    setlength(hz^.calls,(hz^.ncalls+1)*2);
+                  hz^.calls[hz^.ncalls]:=tcallnode(n);
+                  inc(hz^.ncalls);
+                end;
               elc_const:
                 ;
             end;
@@ -390,14 +405,36 @@ unit optdeadstore;
             end;
         end;
 
-      { drop pending stores a pure call may observe (globally reachable bases) }
-      procedure invalidate_globals;
+      { true if any collected pure call in HZ may read or write the static base S
+        at its call site. A non-static globally-reachable base (a by-ref const
+        parameter) has no stable per-location identity here, so it stays
+        conservatively reachable. }
+      function static_base_call_hazard(hz: phazinfo; s: tsym): boolean;
+        var
+          k : longint;
+        begin
+          result:=true;
+          if s.typ<>staticvarsym then
+            exit;
+          for k:=0 to hz^.ncalls-1 do
+            if modref_call_may_access_static(hz^.calls[k],s,true) or
+               modref_call_may_access_static(hz^.calls[k],s,false) then
+              exit;
+          result:=false;
+        end;
+
+      { drop pending stores a pure call may observe (globally reachable bases).
+        With -OoMODREF a pending store to a STATIC survives a call set whose exact
+        read/write footprint provably excludes that static (per-location
+        precision); other globally-reachable bases stay conservative. }
+      procedure invalidate_globals(hz: phazinfo);
         var
           i : longint;
         begin
           i:=0;
           while i<npend do
-            if el_base_globally_reachable(pend[i].base) then
+            if el_base_globally_reachable(pend[i].base) and
+               static_base_call_hazard(hz,pend[i].base) then
               pend_remove(i)
             else
               inc(i);
@@ -414,6 +451,8 @@ unit optdeadstore;
         begin
           hz.barrier:=false;
           hz.purecall:=false;
+          hz.calls:=nil;
+          hz.ncalls:=0;
           tmp:=tree;
           foreachnodestatic(tmp,@el_haz_scan,@hz);
           if hz.barrier then
@@ -422,8 +461,9 @@ unit optdeadstore;
             begin
               invalidate_reads(tree);
               if hz.purecall then
-                invalidate_globals;
+                invalidate_globals(@hz);
             end;
+          setlength(hz.calls,0);
         end;
 
       procedure handle_stmt(sn: tstatementnode);

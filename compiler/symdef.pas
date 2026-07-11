@@ -1104,15 +1104,34 @@ interface
                                 access was attributable to an in-range formal).
                                 When false the masks are ignored and mr_byref is
                                 read as "all by-ref actuals" (the coarse
-                                behaviour), so precision never becomes unsound. }
+                                behaviour), so precision never becomes unsound.
+              modref_reads_statics / modref_writes_statics : the bounded set of
+                                static/global variables the routine reads /
+                                writes, each identified by its (globally-unique,
+                                linker-stable) MANGLED NAME so the identity is
+                                sound cross-unit (a same-source-named static in a
+                                different unit has a different mangled name).
+                                Meaningful only when the direction is mr_unknown
+                                AND modref_smask_exact: the direction's whole
+                                global footprint is then EXACTLY this set (plus
+                                any by-ref actuals recorded in the pmask).
+              modref_smask_exact : the static sets are complete -- every
+                                unknown-global access was attributable to a
+                                nameable static that fit the bounded set. When
+                                false the sets are ignored and mr_unknown reverts
+                                to the coarse "any global" meaning, so per-static
+                                precision is a strict subset and never unsound. }
           modref_analyzed : boolean;
           modref_ppu_valid : boolean;
           modref_reads : byte;
           modref_writes : byte;
           modref_can_trap : boolean;
           modref_pmask_exact : boolean;
+          modref_smask_exact : boolean;
           modref_reads_pmask : dword;
           modref_writes_pmask : dword;
+          modref_reads_statics : array of ansistring;
+          modref_writes_statics : array of ansistring;
           constructor create(level:byte;doregister:boolean);virtual;
           constructor ppuload(ppufile:tcompilerppufile);
           destructor  destroy;override;
@@ -7140,8 +7159,11 @@ implementation
          modref_writes:=0;
          modref_can_trap:=false;
          modref_pmask_exact:=false;
+         modref_smask_exact:=false;
          modref_reads_pmask:=0;
          modref_writes_pmask:=0;
+         modref_reads_statics:=nil;
+         modref_writes_statics:=nil;
       end;
 
 
@@ -7162,8 +7184,11 @@ implementation
          modref_writes:=0;
          modref_can_trap:=false;
          modref_pmask_exact:=false;
+         modref_smask_exact:=false;
          modref_reads_pmask:=0;
          modref_writes_pmask:=0;
+         modref_reads_statics:=nil;
+         modref_writes_statics:=nil;
 {$ifdef symansistr}
          if po_has_mangledname in procoptions then
            _mangledname:=ppufile.getansistring
@@ -7476,6 +7501,7 @@ implementation
       var
         pureflags : byte;
         icfname : TSymStr;
+        i : longint;
       begin
         { -OoPURE: persist the final pure/const verdict (computed now, when the
           whole defining unit is analysed) as two ready-made booleans, so a
@@ -7553,13 +7579,26 @@ implementation
         if modref_analyzed then
           begin
             ppufile.putbyte(optsum_modref);
+            { framing length word: the reader does not skip modref by it (it reads
+              the fields directly), so a fixed value for the flag byte + two masks
+              is adequate; the variable-length static sets follow field-by-field. }
             ppufile.putword(1+2*sizeof(dword));
             ppufile.putbyte((modref_reads and 3) or
                             ((modref_writes and 3) shl 2) or
                             (ord(modref_can_trap) shl 4) or
-                            (ord(modref_pmask_exact) shl 5));
+                            (ord(modref_pmask_exact) shl 5) or
+                            (ord(modref_smask_exact) shl 6));
             ppufile.putdword(modref_reads_pmask);
             ppufile.putdword(modref_writes_pmask);
+            { per-static read/write sets (mangled names), only carried when the
+              corresponding sets are meaningful (mr_unknown + smask_exact); empty
+              otherwise, which serializes to a single 0 count byte each }
+            ppufile.putbyte(length(modref_reads_statics));
+            for i:=0 to high(modref_reads_statics) do
+              ppufile.putansistring(modref_reads_statics[i]);
+            ppufile.putbyte(length(modref_writes_statics));
+            for i:=0 to high(modref_writes_statics) do
+              ppufile.putansistring(modref_writes_statics[i]);
           end;
 
         { terminator }
@@ -7573,7 +7612,7 @@ implementation
         len : word;
         sig : longint;
         skip : array[0..255] of byte;
-        left,chunk : longint;
+        left,chunk,i : longint;
         icfname : TSymStr;
       begin
         { defaults: no summary loaded -> conservative fallback everywhere }
@@ -7588,8 +7627,11 @@ implementation
         modref_writes:=0;
         modref_can_trap:=false;
         modref_pmask_exact:=false;
+        modref_smask_exact:=false;
         modref_reads_pmask:=0;
         modref_writes_pmask:=0;
+        modref_reads_statics:=nil;
+        modref_writes_statics:=nil;
         repeat
           tag:=ppufile.getbyte;
           if tag=optsum_end then
@@ -7613,8 +7655,15 @@ implementation
                 modref_writes:=(pureflags shr 2) and 3;
                 modref_can_trap:=(pureflags and 16)<>0;
                 modref_pmask_exact:=(pureflags and 32)<>0;
+                modref_smask_exact:=(pureflags and 64)<>0;
                 modref_reads_pmask:=ppufile.getdword;
                 modref_writes_pmask:=ppufile.getdword;
+                setlength(modref_reads_statics,ppufile.getbyte);
+                for i:=0 to high(modref_reads_statics) do
+                  modref_reads_statics[i]:=ppufile.getansistring;
+                setlength(modref_writes_statics,ppufile.getbyte);
+                for i:=0 to high(modref_writes_statics) do
+                  modref_writes_statics[i]:=ppufile.getansistring;
               end;
             optsum_ipara:
               begin

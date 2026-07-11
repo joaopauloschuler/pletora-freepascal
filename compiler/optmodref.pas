@@ -45,7 +45,7 @@ unit optmodref;
 interface
 
     uses
-      node,ncal,symdef;
+      node,ncal,symtype,symdef;
 
     const
       { the three-level read/write access lattice (stored in a byte so it
@@ -78,12 +78,26 @@ interface
       means no information -- the caller must treat the call as a full barrier. }
     function modref_call_effect(cn : tcallnode; out reads_global, writes_global : boolean) : boolean;
 
+    { For a RESOLVED DIRECT call node CN, decide whether the call may READ (when
+      FORWRITE is false) or WRITE (when FORWRITE is true) the SPECIFIC static /
+      global variable S at this call site.  Returns TRUE unless the -OoMODREF
+      summary proves S is excluded from that direction's footprint -- the
+      per-location refinement of modref_call_effect's coarse reads_global /
+      writes_global booleans (which cannot express "writes only static A").
+
+      S is compared against the callee's serialized static set by MANGLED NAME
+      (globally-unique, linker-stable), so a same-source-named static in another
+      unit -- a distinct location with a distinct mangled name -- is correctly
+      not matched.  When S is not a tstaticvarsym, or the summary is not exact,
+      or the target is opaque, the result is the conservative TRUE. }
+    function modref_call_may_access_static(cn : tcallnode; s : tsym; forwrite : boolean) : boolean;
+
 implementation
 
     uses
       cutils,
       globtype,globals,
-      symconst,symtype,symsym,
+      symconst,symsym,
       defutil,
       nutils,nbas,nld,nmem,ncnv,ninl,
       optpure,optutils,
@@ -116,16 +130,35 @@ implementation
       end;
 
 
+    { the static/global variable SYM denotes, or nil when SYM is not a nameable
+      static. A tstaticvarsym is identified cross-unit by its (globally-unique,
+      linker-stable) mangled name, so attributing a global access to it is sound;
+      anything else (self/with-field/absolute/local/param) is NOT a nameable
+      static and yields nil, which forces the caller to fall back to the coarse
+      "any global" meaning. }
+    function static_of_sym(sym : tsym) : tstaticvarsym;
+      begin
+        if sym is tstaticvarsym then
+          result:=tstaticvarsym(sym)
+        else
+          result:=nil;
+      end;
+
     { classify the ultimate base of an l-value / addressable expression: what
       memory, in the CURRENT routine's frame, does it denote? (mr_none for a
       non-escaping local / by-value parameter, mr_byref for something reached
       through a by-reference parameter, mr_unknown for a static/global, a pointer
       dereference or anything not recognised).  BASESYM is the by-reference
       parameter symbol the result mr_byref was reached through (nil otherwise),
-      so a caller can attribute the access to a specific formal-parameter index. }
-    function classify_lvalue_base_ex(t : tnode; out basesym : tsym) : byte;
+      so a caller can attribute the access to a specific formal-parameter index.
+      STATICSYM is the tstaticvarsym the result mr_unknown was reached through
+      when the base is exactly a nameable static (nil otherwise -- e.g. a deref /
+      heap / self / with-field access, which is unattributable), so a caller can
+      attribute the access to a specific global. }
+    function classify_lvalue_base_ex(t : tnode; out basesym : tsym; out staticsym : tstaticvarsym) : byte;
       begin
         basesym:=nil;
+        staticsym:=nil;
         result:=mr_unknown;
         while assigned(t) do
           case t.nodetype of
@@ -157,7 +190,9 @@ implementation
               begin
                 result:=classify_sym(tloadnode(t).symtableentry);
                 if result=mr_byref then
-                  basesym:=tloadnode(t).symtableentry;
+                  basesym:=tloadnode(t).symtableentry
+                else if result=mr_unknown then
+                  staticsym:=static_of_sym(tloadnode(t).symtableentry);
                 exit;
               end;
             else
@@ -168,8 +203,9 @@ implementation
     function classify_lvalue_base(t : tnode) : byte;
       var
         dummy : tsym;
+        dummys : tstaticvarsym;
       begin
-        result:=classify_lvalue_base_ex(t,dummy);
+        result:=classify_lvalue_base_ex(t,dummy,dummys);
       end;
 
     { index of a by-reference formal parameter SYM in its owning routine's
@@ -207,6 +243,13 @@ implementation
 
     { ---- summary computation ---------------------------------------------- }
 
+    const
+      { how many distinct static/global variables one direction's set may hold
+        before it overflows to the coarse "any global" meaning (smask_exact
+        clears). Small and bounded: the serialized ppu image stays tiny and a
+        consumer's membership test is a short linear scan. }
+      MODREF_MAXSTATICS = 8;
+
     type
       pmodrefscan = ^tmodrefscan;
       tmodrefscan = record
@@ -216,7 +259,76 @@ implementation
         reads_pmask : dword;
         writes_pmask : dword;
         pmask_exact : boolean;
+        { per-static read/write sets (mangled names) and their exactness bit.
+          When smask_exact holds, every unknown-global access was attributable to
+          a nameable static that fit the set, so the mr_unknown footprint is
+          EXACTLY these statics (plus any by-ref pmask actuals). Once an
+          unattributable global/heap access is seen (or a set overflows),
+          smask_exact clears and mr_unknown reverts to the coarse "any global". }
+        reads_statics : array of ansistring;
+        writes_statics : array of ansistring;
+        smask_exact : boolean;
         can_trap : boolean;
+      end;
+
+    { add a static's mangled name to one direction's set, deduplicating; overflow
+      past MODREF_MAXSTATICS clears smask_exact (the set becomes the coarse "any
+      global"). Once inexact, nothing more need be recorded. }
+    procedure add_static_name(ctx : pmodrefscan; iswrite : boolean; const name : ansistring);
+      var
+        i : longint;
+      begin
+        if not ctx^.smask_exact then
+          exit;
+        if iswrite then
+          begin
+            for i:=0 to high(ctx^.writes_statics) do
+              if ctx^.writes_statics[i]=name then
+                exit;
+            if length(ctx^.writes_statics)>=MODREF_MAXSTATICS then
+              begin
+                ctx^.smask_exact:=false;
+                exit;
+              end;
+            setlength(ctx^.writes_statics,length(ctx^.writes_statics)+1);
+            ctx^.writes_statics[high(ctx^.writes_statics)]:=name;
+          end
+        else
+          begin
+            for i:=0 to high(ctx^.reads_statics) do
+              if ctx^.reads_statics[i]=name then
+                exit;
+            if length(ctx^.reads_statics)>=MODREF_MAXSTATICS then
+              begin
+                ctx^.smask_exact:=false;
+                exit;
+              end;
+            setlength(ctx^.reads_statics,length(ctx^.reads_statics)+1);
+            ctx^.reads_statics[high(ctx^.reads_statics)]:=name;
+          end;
+      end;
+
+    { record a nameable-static leaf access (STATICSYM<>nil) into the set, or, when
+      the global access is UNATTRIBUTABLE (STATICSYM=nil: deref / heap / self /
+      with-field / absolute), drop to the coarse "any global" meaning. }
+    procedure record_static(ctx : pmodrefscan; staticsym : tstaticvarsym; iswrite : boolean);
+      begin
+        if assigned(staticsym) then
+          add_static_name(ctx,iswrite,staticsym.mangledname)
+        else
+          ctx^.smask_exact:=false;
+      end;
+
+    { true if NAME is a member of the direction's serialized static set. }
+    function static_name_in_set(const name : ansistring; const setarr : array of ansistring) : boolean;
+      var
+        i : longint;
+      begin
+        result:=true;
+        for i:=0 to high(setarr) do
+          if setarr[i]=name then
+            exit;
+        result:=false;
       end;
 
     { fold a callee's summary, mapped through the call's actual arguments, into
@@ -265,6 +377,7 @@ implementation
         para : tcallparanode;
         c : byte;
         basesym : tsym;
+        staticsym : tstaticvarsym;
         fidx,cidx : longint;
       begin
         result:=mr_none;
@@ -276,7 +389,7 @@ implementation
                 fidx:=pd_para_index(calleepd,para.parasym);
                 if (fidx>=0) and ((mask and (dword(1) shl fidx))<>0) then
                   begin
-                    c:=classify_lvalue_base_ex(para.paravalue,basesym);
+                    c:=classify_lvalue_base_ex(para.paravalue,basesym,staticsym);
                     if c>result then
                       result:=c;
                     if c=mr_byref then
@@ -370,6 +483,39 @@ implementation
       end;
 
 
+    { fold a resolved callee's mr_unknown direction: its global footprint is the
+      union of its per-static set (when the callee is smask-exact) and its by-ref
+      pmask actuals; an inexact callee contributes the coarse "any global" and
+      clears our own smask_exact. }
+    procedure fold_unknown_dir(ctx : pmodrefscan; cn : tcallnode; calleepd : tprocdef; forwrite : boolean);
+      var
+        i : longint;
+      begin
+        if forwrite then
+          ctx^.writes:=mr_unknown
+        else
+          ctx^.reads:=mr_unknown;
+        if calleepd.modref_smask_exact then
+          begin
+            if forwrite then
+              for i:=0 to high(calleepd.modref_writes_statics) do
+                add_static_name(ctx,true,calleepd.modref_writes_statics[i])
+            else
+              for i:=0 to high(calleepd.modref_reads_statics) do
+                add_static_name(ctx,false,calleepd.modref_reads_statics[i]);
+            { fold the by-ref part of the footprint too (kept in the pmask even for
+              an mr_unknown direction when the callee is smask-exact) }
+            if forwrite then
+              fold_byref_dir(ctx,cn,calleepd,calleepd.modref_writes_pmask,calleepd.modref_pmask_exact,true)
+            else
+              fold_byref_dir(ctx,cn,calleepd,calleepd.modref_reads_pmask,calleepd.modref_pmask_exact,false);
+          end
+        else
+          { the callee's global footprint is not enumerable: coarse "any global" }
+          ctx^.smask_exact:=false;
+      end;
+
+
     procedure fold_call(ctx : pmodrefscan; cn : tcallnode);
       var
         pd : tprocdef;
@@ -379,6 +525,7 @@ implementation
             ctx^.reads:=mr_unknown;
             ctx^.writes:=mr_unknown;
             ctx^.can_trap:=true;
+            ctx^.smask_exact:=false;
             exit;
           end;
         pd:=tprocdef(cn.procdefinition);
@@ -388,9 +535,11 @@ implementation
           exit;
         if proc_is_pure(pd) then
           begin
-            { may read global memory, writes nothing, non-trapping }
+            { may read arbitrary (unenumerable) global memory, writes nothing,
+              non-trapping: coarse read footprint }
             if mr_unknown>ctx^.reads then
               ctx^.reads:=mr_unknown;
+            ctx^.smask_exact:=false;
             exit;
           end;
         if modref_summary_available(pd) then
@@ -400,14 +549,14 @@ implementation
               mr_byref:
                 fold_byref_dir(ctx,cn,pd,pd.modref_writes_pmask,pd.modref_pmask_exact,true);
               else
-                ctx^.writes:=mr_unknown;
+                fold_unknown_dir(ctx,cn,pd,true);
             end;
             case pd.modref_reads of
               mr_none: ;
               mr_byref:
                 fold_byref_dir(ctx,cn,pd,pd.modref_reads_pmask,pd.modref_pmask_exact,false);
               else
-                ctx^.reads:=mr_unknown;
+                fold_unknown_dir(ctx,cn,pd,false);
             end;
             if pd.modref_can_trap then
               ctx^.can_trap:=true;
@@ -418,6 +567,7 @@ implementation
         ctx^.reads:=mr_unknown;
         ctx^.writes:=mr_unknown;
         ctx^.can_trap:=true;
+        ctx^.smask_exact:=false;
       end;
 
 
@@ -427,11 +577,13 @@ implementation
         c : byte;
         iswrite : boolean;
         basesym : tsym;
+        staticsym : tstaticvarsym;
       begin
         result:=fen_true;
         ctx:=pmodrefscan(arg);
         { once maximally conservative there is nothing left to discover }
-        if (ctx^.reads=mr_unknown) and (ctx^.writes=mr_unknown) and ctx^.can_trap then
+        if (ctx^.reads=mr_unknown) and (ctx^.writes=mr_unknown) and
+           ctx^.can_trap and not ctx^.smask_exact then
           begin
             result:=fen_norecurse_true;
             exit;
@@ -443,6 +595,7 @@ implementation
               ctx^.reads:=mr_unknown;
               ctx^.writes:=mr_unknown;
               ctx^.can_trap:=true;
+              ctx^.smask_exact:=false;
             end;
           goton,labeln:
             ctx^.can_trap:=true;
@@ -452,12 +605,16 @@ implementation
             if ([cs_check_overflow,cs_check_range]*n.localswitches)<>[] then
               ctx^.can_trap:=true;
           derefn:
-            if iswrite then
-              ctx^.writes:=mr_unknown
-            else
-              begin
-                if mr_unknown>ctx^.reads then ctx^.reads:=mr_unknown;
-              end;
+            begin
+              { a dereferenced pointer is an unattributable global/heap access }
+              ctx^.smask_exact:=false;
+              if iswrite then
+                ctx^.writes:=mr_unknown
+              else
+                begin
+                  if mr_unknown>ctx^.reads then ctx^.reads:=mr_unknown;
+                end;
+            end;
           subscriptn:
             begin
               { a field through an implicit object pointer is a heap access; a
@@ -465,6 +622,7 @@ implementation
               if assigned(tsubscriptnode(n).left.resultdef) and
                  is_implicit_pointer_object_type(tsubscriptnode(n).left.resultdef) then
                 begin
+                  ctx^.smask_exact:=false;
                   if iswrite then
                     ctx^.writes:=mr_unknown
                   else if mr_unknown>ctx^.reads then
@@ -480,6 +638,7 @@ implementation
               if not assigned(tvecnode(n).left.resultdef) or
                  not is_normal_array(tvecnode(n).left.resultdef) then
                 begin
+                  ctx^.smask_exact:=false;
                   if iswrite then
                     ctx^.writes:=mr_unknown
                   else if mr_unknown>ctx^.reads then
@@ -488,10 +647,12 @@ implementation
             end;
           assignn:
             begin
-              c:=classify_lvalue_base_ex(tassignmentnode(n).left,basesym);
+              c:=classify_lvalue_base_ex(tassignmentnode(n).left,basesym,staticsym);
               if c>ctx^.writes then ctx^.writes:=c;
               if c=mr_byref then
-                record_byref(ctx,basesym,true);
+                record_byref(ctx,basesym,true)
+              else if c=mr_unknown then
+                record_static(ctx,staticsym,true);
             end;
           inlinen:
             if not pure_inline(tinlinenode(n).inlinenumber) then
@@ -499,6 +660,7 @@ implementation
                 ctx^.reads:=mr_unknown;
                 ctx^.writes:=mr_unknown;
                 ctx^.can_trap:=true;
+                ctx^.smask_exact:=false;
               end;
           loadn:
             begin
@@ -507,13 +669,17 @@ implementation
                 begin
                   if c>ctx^.writes then ctx^.writes:=c;
                   if c=mr_byref then
-                    record_byref(ctx,tloadnode(n).symtableentry,true);
+                    record_byref(ctx,tloadnode(n).symtableentry,true)
+                  else if c=mr_unknown then
+                    record_static(ctx,static_of_sym(tloadnode(n).symtableentry),true);
                 end
               else
                 begin
                   if c>ctx^.reads then ctx^.reads:=c;
                   if c=mr_byref then
-                    record_byref(ctx,tloadnode(n).symtableentry,false);
+                    record_byref(ctx,tloadnode(n).symtableentry,false)
+                  else if c=mr_unknown then
+                    record_static(ctx,static_of_sym(tloadnode(n).symtableentry),false);
                 end;
             end;
           calln:
@@ -568,6 +734,34 @@ implementation
           else pmasktext:=pmasktext+']';
         end;
 
+      { the per-static set of an mr_unknown direction, rendered as a
+        mangled-name list ('~any' when the set is not exact, i.e. the coarse
+        "any global" meaning) }
+      function smasktext(cls : byte; const setarr : array of ansistring) : string;
+        var
+          i : longint;
+        begin
+          smasktext:='';
+          if cls<>mr_unknown then
+            exit;
+          if not ctx.smask_exact then
+            begin
+              smasktext:=' [statics ~any]';
+              exit;
+            end;
+          if length(setarr)=0 then
+            begin
+              smasktext:=' [statics none]';
+              exit;
+            end;
+          for i:=0 to high(setarr) do
+            begin
+              if i=0 then smasktext:=' [statics '+setarr[i]
+              else smasktext:=smasktext+','+setarr[i];
+            end;
+          smasktext:=smasktext+']';
+        end;
+
       begin
         if not assigned(pd) or not assigned(code) then
           exit;
@@ -583,8 +777,11 @@ implementation
             pd.modref_writes:=mr_unknown;
             pd.modref_can_trap:=true;
             pd.modref_pmask_exact:=false;
+            pd.modref_smask_exact:=false;
             pd.modref_reads_pmask:=0;
             pd.modref_writes_pmask:=0;
+            pd.modref_reads_statics:=nil;
+            pd.modref_writes_statics:=nil;
             pd.modref_analyzed:=true;
             exit;
           end;
@@ -594,29 +791,46 @@ implementation
         ctx.reads_pmask:=0;
         ctx.writes_pmask:=0;
         ctx.pmask_exact:=true;
+        ctx.reads_statics:=nil;
+        ctx.writes_statics:=nil;
+        ctx.smask_exact:=true;
         ctx.can_trap:=false;
         foreachnodestatic(pm_postprocess,code,@modrefscan_node,@ctx);
         pd.modref_reads:=ctx.reads;
         pd.modref_writes:=ctx.writes;
         pd.modref_can_trap:=ctx.can_trap;
-        { the per-formal masks are only meaningful for the by-ref class; keep
-          them zero (and exact irrelevant) in the none/unknown cases so the ppu
-          image is deterministic }
+        pd.modref_smask_exact:=ctx.smask_exact;
+        { the per-formal masks are meaningful for the mr_byref class and, when the
+          static sets are exact, also for the by-ref part of an mr_unknown
+          direction's footprint; keep them zero otherwise so the ppu image is
+          deterministic }
         pd.modref_pmask_exact:=ctx.pmask_exact;
-        if ctx.reads=mr_byref then
+        if (ctx.reads=mr_byref) or ((ctx.reads=mr_unknown) and ctx.smask_exact) then
           pd.modref_reads_pmask:=ctx.reads_pmask
         else
           pd.modref_reads_pmask:=0;
-        if ctx.writes=mr_byref then
+        if (ctx.writes=mr_byref) or ((ctx.writes=mr_unknown) and ctx.smask_exact) then
           pd.modref_writes_pmask:=ctx.writes_pmask
         else
           pd.modref_writes_pmask:=0;
+        { the per-static sets are meaningful only for an mr_unknown direction with
+          an exact static footprint; keep them empty otherwise }
+        if (ctx.reads=mr_unknown) and ctx.smask_exact then
+          pd.modref_reads_statics:=copy(ctx.reads_statics)
+        else
+          pd.modref_reads_statics:=nil;
+        if (ctx.writes=mr_unknown) and ctx.smask_exact then
+          pd.modref_writes_statics:=copy(ctx.writes_statics)
+        else
+          pd.modref_writes_statics:=nil;
         pd.modref_analyzed:=true;
         { -OoREPORT: the discovered summary, once, where it first becomes
           available (never per call site) }
         OptRemark(pd.fileinfo,'modref',pd.fullprocname(false)+
           ' mod/ref summary: reads '+classname(ctx.reads)+pmasktext(ctx.reads,ctx.reads_pmask)+
+          smasktext(ctx.reads,pd.modref_reads_statics)+
           ', writes '+classname(ctx.writes)+pmasktext(ctx.writes,ctx.writes_pmask)+
+          smasktext(ctx.writes,pd.modref_writes_statics)+
           ', '+traptext(ctx.can_trap));
       end;
 
@@ -699,6 +913,126 @@ implementation
             end;
             exit(true);
           end;
+      end;
+
+
+    { true if any by-reference actual the callee touches in direction FORWRITE
+      may ALIAS the specific static S at this call site. A by-ref actual whose
+      base is a DIFFERENT named static cannot alias S; a caller local / by-value
+      base cannot be a static at all; but a base reached through the caller's OWN
+      by-ref parameter (it may have been bound to S by the caller's caller) or an
+      unattributable deref / heap base could be S, so both are conservative. The
+      set of touched actuals is the exact pmask when EXACT, else every by-ref
+      actual (mirrors map_byref_actuals / _masked). }
+    function byref_may_alias_static(cn : tcallnode; pd : tprocdef; mask : dword;
+        exact, forwrite : boolean; s : tstaticvarsym) : boolean;
+      var
+        para : tcallparanode;
+        c : byte;
+        basesym : tsym;
+        staticsym : tstaticvarsym;
+        fidx : longint;
+        relevant : boolean;
+        sname : ansistring;
+      begin
+        result:=true;
+        sname:=s.mangledname;
+        para:=tcallparanode(cn.left);
+        while assigned(para) do
+          begin
+            if assigned(para.parasym) and assigned(para.paravalue) then
+              begin
+                if exact then
+                  begin
+                    fidx:=pd_para_index(pd,para.parasym);
+                    relevant:=(fidx>=0) and ((mask and (dword(1) shl fidx))<>0);
+                  end
+                else if forwrite then
+                  relevant:=para.parasym.varspez in [vs_var,vs_out]
+                else
+                  relevant:=para.parasym.varspez in [vs_var,vs_out,vs_const,vs_constref];
+                if relevant then
+                  begin
+                    c:=classify_lvalue_base_ex(para.paravalue,basesym,staticsym);
+                    case c of
+                      mr_none: ; { caller local / by-value: never a static }
+                      mr_byref:
+                        exit(true); { caller by-ref param: could be bound to S }
+                      else { mr_unknown }
+                        if assigned(staticsym) then
+                          begin
+                            if staticsym.mangledname=sname then
+                              exit(true); { the very same static }
+                            { a different named static: cannot alias S }
+                          end
+                        else
+                          exit(true); { deref / heap / unattributable: could be S }
+                    end;
+                  end;
+              end;
+            para:=tcallparanode(para.nextpara);
+          end;
+        result:=false;
+      end;
+
+
+    function modref_call_may_access_static(cn : tcallnode; s : tsym; forwrite : boolean) : boolean;
+      var
+        pd : tprocdef;
+        cls : byte;
+        pmask : dword;
+        sst : tstaticvarsym;
+      begin
+        result:=true;
+        sst:=static_of_sym(s);
+        { only a genuine static has a stable mangled-name identity to test }
+        if not assigned(sst) then
+          exit;
+        if not(cs_opt_modref in current_settings.optimizerswitches) then
+          exit;
+        if call_target_opaque(cn) then
+          exit;
+        pd:=tprocdef(cn.procdefinition);
+        { -OoPURE verdict is authoritative where it holds }
+        if proc_is_const(pd) then
+          exit(false);
+        if proc_is_pure(pd) then
+          begin
+            { pure: writes nothing, but may read ANY global including S }
+            if forwrite then exit(false) else exit(true);
+          end;
+        if not modref_summary_available(pd) then
+          exit;
+        if forwrite then
+          begin
+            cls:=pd.modref_writes;
+            pmask:=pd.modref_writes_pmask;
+          end
+        else
+          begin
+            cls:=pd.modref_reads;
+            pmask:=pd.modref_reads_pmask;
+          end;
+        case cls of
+          mr_none:
+            result:=false;
+          mr_byref:
+            result:=byref_may_alias_static(cn,pd,pmask,pd.modref_pmask_exact,forwrite,sst);
+          else { mr_unknown }
+            begin
+              if not pd.modref_smask_exact then
+                exit(true);
+              { exact footprint = the per-static set UNION the by-ref pmask
+                actuals; S is accessed iff it is in the set or a touched by-ref
+                actual may alias it }
+              if forwrite then
+                result:=static_name_in_set(sst.mangledname,pd.modref_writes_statics)
+              else
+                result:=static_name_in_set(sst.mangledname,pd.modref_reads_statics);
+              if not result then
+                result:=byref_may_alias_static(cn,pd,pmask,pd.modref_pmask_exact,forwrite,sst);
+            end;
+        end;
       end;
 
 end.
