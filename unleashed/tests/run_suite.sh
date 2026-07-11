@@ -59,7 +59,7 @@ run_one() {
   local exe="$dir/t"
   # Compile.
   local cout
-  cout="$( (ulimit -v 3000000; timeout 120 "$CC" -Fu"$RTL" -FU"$dir" -o"$exe" $D_OPT $checkbin "$f") 2>&1 )"
+  cout="$( (ulimit -v 3000000; timeout 120 "$CC" -Fu"$RTL" -FU"$dir" -o"$exe" ${SUITE_EXTRA_OPT:-} $D_OPT $checkbin "$f") 2>&1 )"
   local crc=$?
 
   if [ "$D_FAIL" = "1" ]; then

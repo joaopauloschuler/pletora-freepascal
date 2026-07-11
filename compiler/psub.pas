@@ -2649,6 +2649,21 @@ implementation
               CreateInlineInfo;   { deliberately WITHOUT include(procoptions,po_inline) }
           end;
 
+        { -OoIPACP cross-unit: retain the body of an IPACP-eligible routine that
+          is reachable from another unit (an interface routine, or one already
+          inline) as inlininginfo so its tree is streamed into this unit's PPU.
+          A caller in a USED unit then recovers that tree and clones it,
+          specialized on the constants it passes.  Retained WITHOUT po_inline
+          (like the DEVIRT retention above): ordinary call/inlining behaviour is
+          unchanged, only optipacp.make_crossunit_stash consumes the tree, and
+          it independently re-verifies eligibility on the loaded copy.  Gated on
+          the same size/eligibility screen as the intra-unit stash, so PPU bloat
+          is bounded to routines that could actually be specialized. }
+        if (cs_opt_ipacp in current_settings.optimizerswitches) and
+           not(procdef.has_inlininginfo) and not(has_nestedprocs) and
+           ipacp_crossunit_retain_candidate(procdef,code,flags,has_nestedprocs) then
+          CreateInlineInfo;   { deliberately WITHOUT include(procoptions,po_inline) }
+
         templist:=TAsmList.create;
 
         { add parast/localst to symtablestack }

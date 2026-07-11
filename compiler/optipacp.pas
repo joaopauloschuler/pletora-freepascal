@@ -65,8 +65,26 @@
         routines, or non-plain-local locals are rejected, keeping the remap
         total and the re-typecheck clean.
 
-    Opt-in via -OoIPACP (NOT part of -O4 defaults).  Intra-unit only: the stash
-    is per-module, so cross-unit specialization is out of scope.
+    Opt-in via -OoIPACP (NOT part of -O4 defaults).
+
+    CROSS-UNIT cloning (no new PPU tags, no PPU-version bump): an eligible
+    routine that is reachable from another unit (an interface routine, or one
+    already inline) has its pre-firstpass body tree RETAINED as inlininginfo --
+    the very vehicle cross-unit inlining already streams into the PPU -- via the
+    same DEVIRT-style retention (WITHOUT po_inline, so ordinary call/inlining
+    behaviour is unchanged; the producer gate is ipacp_crossunit_retain_candidate,
+    invoked from psub.generate_code).  A caller in a USED unit recovers that
+    streamed body (make_crossunit_stash), INDEPENDENTLY re-runs the full
+    eligibility screen on the loaded copy -- so no eligibility verdict has to be
+    serialized and the caller vouches for soundness itself -- and clones it just
+    like an intra-unit template.  A cross-unit clone is instantiated in the
+    CALLER's module (like a generic specialization): its code is emitted into
+    the caller's object, the per-module caps count per instantiating module, and
+    its mangled name carries the caller module's name (and it is a hidden/local
+    symbol) so two units that specialize the same used-unit routine on the same
+    constant never collide at link time.  The referenced unit-private symbols of
+    the callee body are made linkable by the same export_local_ref machinery
+    cross-unit inlining relies on (run by CreateInlineInfo at retention).
 
     This module is free software; see the FPC copying conditions.
 }
@@ -89,6 +107,14 @@ interface
       called on the final node tree BEFORE generate_code_tree lowers/frees it. }
     procedure ipacp_stash_candidate(pd : tprocdef; code : tnode;
       piflags : tprocinfoflags; hasnested : boolean);
+
+    { True when PD (a routine in the unit currently being compiled) should have
+      its body tree retained as inlininginfo so it is streamed into the PPU as a
+      cross-unit IPACP clone template.  Cross-unit producer-side gate; see the
+      body for the eligibility screen.  Retention itself (CreateInlineInfo) is
+      done by the caller in psub so this unit needs no psub dependency. }
+    function ipacp_crossunit_retain_candidate(pd : tprocdef; code : tnode;
+      piflags : tprocinfoflags; hasnested : boolean) : boolean;
 
     { Scan CALLERPD's type-checked (not-yet-first-passed) body CODE for direct
       calls that pass a compile-time constant to an eligible parameter of a
@@ -204,6 +230,7 @@ implementation
         calleepd     : tprocdef;
         bodytemplate : tnode;        { deep copy: typechecked, NOT firstpassed }
         eligibleparas : array of longint;  { visible indices of substitutable params }
+        crossunit    : boolean;      { template came from a used unit's PPU }
         destructor destroy; override;
       end;
 
@@ -316,7 +343,12 @@ implementation
         result:=true;
       end;
 
-    function proc_eligible(pd : tprocdef) : boolean;
+    { ALLOWGLOBAL relaxes the owner-symtable check so a routine exported from a
+      unit's INTERFACE (globalsymtable) is eligible as a cross-unit clone target
+      -- such a routine is exactly the one a caller in another unit can reach.
+      When false (the intra-unit path) only unit-private (staticsymtable)
+      routines qualify, as before. }
+    function proc_eligible(pd : tprocdef; allowglobal : boolean) : boolean;
       var
         i : longint;
         pv : tparavarsym;
@@ -349,23 +381,37 @@ implementation
           exit;
         if assigned(pd.struct) then
           exit;
-        if pd.owner.symtabletype<>staticsymtable then
+        if allowglobal then
+          begin
+            if not(pd.owner.symtabletype in [staticsymtable,globalsymtable]) then
+              exit;
+          end
+        else if pd.owner.symtabletype<>staticsymtable then
           exit;
         if pd.parast.symtablelevel>normal_function_level then
           exit;
         if [df_generic,df_specialization]*pd.defoptions<>[] then
           exit;
+        { po_inline is NOT rejected on the cross-unit path: an inline routine
+          already carries a PPU-streamed body tree, which is exactly the clone
+          template we want to reuse.  On the intra-unit path it stays rejected
+          (its body has already been consumed for inlining locally). }
         if ([po_external,po_virtualmethod,po_abstractmethod,po_assembler,
-             po_exports,po_interrupt,po_inline,po_noinline,
+             po_exports,po_interrupt,po_noinline,
              po_classmethod,po_varargs]*pd.procoptions)<>[] then
+          exit;
+        if (not allowglobal) and (po_inline in pd.procoptions) then
           exit;
         if not assigned(pd.procsym) or (pd.procsym.typ<>procsym) then
           exit;
-        { a separate forward/interface declaration means earlier-parsed call
-          sites and (for interface routines) external units bind this name }
+        { an overloaded name has several procdefs; we clone one specific procdef,
+          so require a single, unambiguous definition either way }
         if tprocsym(pd.procsym).ProcdefList.Count<>1 then
           exit;
-        if pd.interfacedef then
+        { a separate forward/interface declaration means earlier-parsed call
+          sites bind this name on the intra-unit path; a cross-unit callee is
+          reached precisely THROUGH its interface declaration, so allow it }
+        if (not allowglobal) and pd.interfacedef then
           exit;
         result:=true;
       end;
@@ -452,7 +498,17 @@ implementation
           result:=fen_norecurse_true;
       end;
 
-    function param_readonly(pv : tparavarsym; code : tnode) : boolean;
+    { STRUCTURAL_ONLY suppresses the pv.varstate early-out: varstate is a
+      reliable read-only witness only for a routine whose paravarsyms have not
+      yet been through their own codegen.  On the cross-unit path the callee's
+      ORIGINAL live paravarsyms may already have been code-generated in the same
+      compilation (e.g. -B builds the used unit in-memory first), which flips a
+      never-written value param's varstate to vs_written even though the body
+      never assigns it.  The exhaustive scan_param_write walk (assignment /
+      address-of / var/out/constref passing) is the authoritative test and is
+      always run; only the varstate shortcut is skipped cross-unit. }
+    function param_readonly(pv : tparavarsym; code : tnode;
+      structural_only : boolean) : boolean;
       var
         ctx : twritescan;
       begin
@@ -461,7 +517,7 @@ implementation
           value parameters must not have been written }
         if pv.varspez=vs_value then
           begin
-            if pv.varstate in [vs_written,vs_readwritten] then
+            if (not structural_only) and (pv.varstate in [vs_written,vs_readwritten]) then
               exit;
           end
         else if pv.varspez<>vs_const then
@@ -484,7 +540,8 @@ implementation
       would need init/final adjustments we do not replicate.  Currency is a
       floatdef but is fixed-point (value_currency, not value_real) so it is
       excluded here as well. }
-    function para_specializable(pv : tparavarsym; code : tnode) : boolean;
+    function para_specializable(pv : tparavarsym; code : tnode;
+      structural_only : boolean) : boolean;
       begin
         result:=false;
         if vo_is_hidden_para in pv.varoptions then
@@ -496,7 +553,7 @@ implementation
         if not((pv.vardef.typ in [orddef,enumdef]) or
                (is_single(pv.vardef) or is_double(pv.vardef))) then
           exit;
-        if not param_readonly(pv,code) then
+        if not param_readonly(pv,code,structural_only) then
           exit;
         result:=true;
       end;
@@ -527,14 +584,52 @@ implementation
 
     { -------- stash ---------------------------------------------------------- }
 
+    { The structural screens shared by the intra-unit stash, the cross-unit
+      producer-side retention gate and the cross-unit consumer-side on-demand
+      stash.  Returns the visible indices of specializable parameters in ELIG
+      (function result = their count); 0 means "not a clone candidate".
+      ALLOWGLOBAL is threaded into proc_eligible so a unit's exported (interface)
+      routine qualifies on the cross-unit paths but not the intra-unit one. }
+    function screen_body(pd : tprocdef; code : tnode; allowglobal : boolean;
+      out elig : array of longint) : longint;
+      var
+        i,vis : longint;
+        pv : tparavarsym;
+      begin
+        result:=0;
+        if not assigned(pd) or not assigned(code) then
+          exit;
+        if not proc_eligible(pd,allowglobal) then
+          exit;
+        if not localst_is_simple(pd) then
+          exit;
+        if not body_is_safe(code) then
+          exit;
+        if node_count(code,ipacp_body_budget)>=ipacp_body_budget then
+          exit;
+        if not body_has_control_flow(code) then
+          exit;
+        vis:=0;
+        for i:=0 to pd.paras.count-1 do
+          begin
+            pv:=tparavarsym(pd.paras[i]);
+            if vo_is_hidden_para in pv.varoptions then
+              continue;
+            if para_specializable(pv,code,allowglobal) then
+              begin
+                elig[result]:=vis;
+                inc(result);
+              end;
+            inc(vis);
+          end;
+      end;
+
     procedure ipacp_stash_candidate(pd : tprocdef; code : tnode;
       piflags : tprocinfoflags; hasnested : boolean);
       var
         stash : tipacpstash;
-        i,vis : longint;
-        pv : tparavarsym;
+        i,neligible : longint;
         elig : array of longint;
-        neligible : longint;
       begin
         if not assigned(pd) or not assigned(code) then
           exit;
@@ -545,43 +640,51 @@ implementation
              pi_has_label,pi_has_global_goto,pi_calls_c_varargs,
              pi_has_open_array_parameter,pi_uses_threadvar])<>[] then
           exit;
-        if not proc_eligible(pd) then
-          exit;
-        if not localst_is_simple(pd) then
-          exit;
-        if not body_is_safe(code) then
-          exit;
-        if node_count(code,ipacp_body_budget)>=ipacp_body_budget then
-          exit;
-        if not body_has_control_flow(code) then
-          exit;
-
-        { collect the visible indices of specializable parameters }
         setlength(elig,pd.paras.count);
-        neligible:=0;
-        vis:=0;
-        for i:=0 to pd.paras.count-1 do
-          begin
-            pv:=tparavarsym(pd.paras[i]);
-            if vo_is_hidden_para in pv.varoptions then
-              continue;
-            if para_specializable(pv,code) then
-              begin
-                elig[neligible]:=vis;
-                inc(neligible);
-              end;
-            inc(vis);
-          end;
+        neligible:=screen_body(pd,code,false,elig);
         if neligible=0 then
           exit;
 
         stash:=tipacpstash.create;
         stash.calleepd:=pd;
+        stash.crossunit:=false;
         stash.bodytemplate:=code.getcopy;
         setlength(stash.eligibleparas,neligible);
         for i:=0 to neligible-1 do
           stash.eligibleparas[i]:=elig[i];
         stashlist.add(stash);
+      end;
+
+    { Cross-unit PRODUCER gate (called at codegen of a routine in the defining
+      unit, BEFORE do_firstpass, exactly like the intra-unit stash): true when
+      this routine should have its body tree retained as inlininginfo so it is
+      streamed into the unit's PPU and can serve as a clone template for callers
+      in OTHER units.  Same screens as the stash but with ALLOWGLOBAL=true so an
+      exported (interface) routine qualifies; PIFLAGS filters the assembler /
+      exception / open-array / threadvar cases the tree scan cannot see.  Kept
+      cheap and side-effect-free: it only decides retention. }
+    function ipacp_crossunit_retain_candidate(pd : tprocdef; code : tnode;
+      piflags : tprocinfoflags; hasnested : boolean) : boolean;
+      var
+        elig : array of longint;
+      begin
+        result:=false;
+        if not assigned(pd) or not assigned(code) then
+          exit;
+        if hasnested then
+          exit;
+        if (piflags*[pi_has_assembler_block,pi_is_assembler,pi_uses_exceptions,
+             pi_has_label,pi_has_global_goto,pi_calls_c_varargs,
+             pi_has_open_array_parameter,pi_uses_threadvar])<>[] then
+          exit;
+        { only routines reachable from another unit are worth streaming for
+          cross-unit cloning: an interface (globalsymtable) routine, or a
+          unit-private one that is already inline (its tree is streamed anyway) }
+        if not((pd.owner.symtabletype=globalsymtable) or
+               (po_inline in pd.procoptions)) then
+          exit;
+        setlength(elig,pd.paras.count);
+        result:=screen_body(pd,code,true,elig)>0;
       end;
 
     function find_stash(pd : tprocdef) : tipacpstash;
@@ -594,6 +697,54 @@ implementation
         for i:=0 to stashlist.count-1 do
           if tipacpstash(stashlist[i]).calleepd=pd then
             exit(tipacpstash(stashlist[i]));
+      end;
+
+    { Consumer-side cross-unit stash: PD is a routine defined in a USED unit
+      whose body tree we recovered from its PPU-streamed inlininginfo (the same
+      vehicle cross-unit inlining rides).  Independently re-run the eligibility
+      screens on that loaded tree -- so the caller unit VERIFIES soundness for
+      itself and no eligibility verdict has to be serialized -- and, if it
+      passes, build a stash from a COPY of the inline body (the original belongs
+      to PD and must not be freed by the stash).  The resulting clones are
+      instantiated in the CALLER's module.  Cached in stashlist so repeated call
+      sites in this unit share one screen. }
+    function make_crossunit_stash(pd : tprocdef) : tipacpstash;
+      var
+        stash : tipacpstash;
+        i,neligible : longint;
+        elig : array of longint;
+        body : tnode;
+      begin
+        result:=nil;
+        if pd.owner.iscurrentunit then
+          exit;
+        if not pd.has_inlininginfo then
+          exit;
+        if not assigned(pd.inlininginfo) or not assigned(pd.inlininginfo^.code) then
+          exit;
+        body:=pd.inlininginfo^.code;
+        setlength(elig,pd.paras.count);
+        neligible:=screen_body(pd,body,true,elig);
+        if neligible=0 then
+          exit;
+        stash:=tipacpstash.create;
+        stash.calleepd:=pd;
+        stash.crossunit:=true;
+        stash.bodytemplate:=body.getcopy;
+        setlength(stash.eligibleparas,neligible);
+        for i:=0 to neligible-1 do
+          stash.eligibleparas[i]:=elig[i];
+        stashlist.add(stash);
+        result:=stash;
+      end;
+
+    { the stash for PD, whether it was stashed locally (intra-unit) or must be
+      recovered from a used unit's PPU inline body (cross-unit) }
+    function find_or_make_stash(pd : tprocdef) : tipacpstash;
+      begin
+        result:=find_stash(pd);
+        if not assigned(result) then
+          result:=make_crossunit_stash(pd);
       end;
 
     function para_is_eligible(stash : tipacpstash; visidx : longint) : boolean;
@@ -819,14 +970,27 @@ implementation
         targetpv : tparavarsym;
         ctx : tremap;
         i : longint;
+        ownerst : tsymtable;
       begin
         result:=nil;
         clonecode:=nil;
         if length(specs)=0 then
           exit;
 
+        { intra-unit clones live beside the original in the defining unit; a
+          cross-unit clone is instantiated in the CALLER's module (like a
+          generic specialization) so its code is emitted into THIS unit's object
+          and the per-module caps count per instantiating module.  Placing it in
+          the caller's staticsymtable also makes it a unit-local symbol, so two
+          units that instantiate the same specialization never collide at link
+          time (their mangled names additionally carry the module name). }
+        if stash.crossunit then
+          ownerst:=current_module.localsymtable
+        else
+          ownerst:=stash.calleepd.owner;
+
         clonepd:=create_procdef_alias(stash.calleepd,clonerealname,clonemangled,
-          stash.calleepd.owner,nil,tsk_none,nil);
+          ownerst,nil,tsk_none,nil);
         clonepd.forwarddef:=false;
         clonepd.interfacedef:=false;
         { never let the clone itself become an inline/clone target }
@@ -931,7 +1095,16 @@ implementation
             exit;
           end;
         rn:='$ipacp$'+stash.calleepd.procsym.realname+'$'+specs_suffix(specs);
-        mn:=stash.calleepd.mangledname+'$ipacp$'+specs_suffix(specs);
+        { the cross-unit mangled name carries the INSTANTIATING module's name so
+          two units that specialize the same used-unit routine on the same
+          constant emit distinct (unit-local) symbols and never collide at link
+          time; the intra-unit name is unchanged so existing behaviour/tests are
+          byte-stable }
+        if stash.crossunit then
+          mn:=stash.calleepd.mangledname+'$ipacp$'+current_module.modulename^+'$'+
+              specs_suffix(specs)
+        else
+          mn:=stash.calleepd.mangledname+'$ipacp$'+specs_suffix(specs);
         clonepd:=build_clone(stash,specs,rn,mn,clonecode);
         if not assigned(clonepd) then
           exit;
@@ -1055,9 +1228,9 @@ implementation
            (call.procdefinition.typ<>procdef) then
           exit;
         calleepd:=tprocdef(call.procdefinition);
-        { never specialize a call to the routine currently being compiled into
-          itself here -- and cross-clone chaining is out of scope }
-        stash:=find_stash(calleepd);
+        { look for a clone template: either stashed locally (intra-unit) or
+          recovered on demand from a used unit's PPU inline body (cross-unit) }
+        stash:=find_or_make_stash(calleepd);
         if not assigned(stash) then
           exit;
         specs:=collect_const_paras(stash,call);
