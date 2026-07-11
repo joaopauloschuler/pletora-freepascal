@@ -11,18 +11,24 @@
 # takes the address of a local -- "takes the address of something" -- yet writes
 # nothing).
 #
-# The relaxation is restricted to calls whose actuals are all simple-typed,
-# because reassoc's addend duplicator cannot re-typecheck a copy that passes a
-# fixed array to an open-array parameter.  This script proves:
-#   * the write-free addend is split only with -OoMODREF (modref remark), and NOT
-#     under -OoPURE alone;
-#   * an open-array-parameter call is NOT admitted, and the file still COMPILES
-#     cleanly (no reassoc duplication error);
-#   * a global-writing call stays declined.
-# Runtime correctness is proven by testfiles/optreassoc/reassoc_modref_01.pp.
+# The relaxation admits any resolved write-free non-trapping call regardless of
+# its parameter shapes: reassoc's addend duplicator now preserves an already-
+# firstpassed call's expanded argument list on each copy (reassoc_reset_cb skips
+# call nodes), so an open-array-parameter call -- which -OoPURE can NEVER admit
+# (its purity analysis rejects open-array/managed/hidden parameters) -- splits
+# cleanly under -OoMODREF.  This script proves:
+#   * the simple write-free addend (viaaddr) is split with -OoMODREF, NOT with
+#     -OoPURE alone;
+#   * an OPEN-ARRAY-parameter write-free addend (pick) is ALSO split under
+#     -OoMODREF, the file COMPILES cleanly (no reassoc duplication error), and it
+#     is NOT split under -OoPURE alone;
+#   * a global-writing call (bumps) stays declined (exactly two modref splits).
+# Runtime correctness is proven by testfiles/optreassoc/reassoc_modref_01.pp
+# (simple addend) and testfiles/optreassoc/reassoc_modref_02.pp (open-array
+# addend), both run below.
 #
 # Usage: unleashed/tests/reassoc_modref_check.sh [path-to-ppcx64]
-set -euo pipefail
+set -uo pipefail
 
 here="$(cd "$(dirname "$0")" && pwd)"
 root="$(cd "$here/../.." && pwd)"
@@ -58,23 +64,50 @@ begin SetLength(a,64); for i:=0 to 63 do a[i]:=i; for i:=0 to 7 do params[i]:=i;
 EOF
 
 rc=0
+run() { ( ulimit -v 3000000; timeout 60 "$@" ); }
 
-# --- with -OoMODREF: writefree splits (modref remark), file compiles clean -----
+# --- with -OoMODREF: viaaddr AND pick (open-array) split, file compiles clean ---
 mod_out="$( "$CC" -Fu"$RTL" -O4 -OoMODREF -OoREASSOC -OoREPORT "$tmp/r.pp" -FE"$tmp" 2>&1 || true )"
 n_modref=$(grep -cE 'reassoc: reduction .* via -OoMODREF' <<<"$mod_out" || true)
 n_error=$(grep -cE 'Error:' <<<"$mod_out" || true)
 
-# --- without -OoMODREF (pure only): writefree must NOT split -------------------
+# --- the OPEN-ARRAY-parameter addend, isolated in reassoc_modref_02.pp, splits
+#     ONLY under -OoMODREF (its sole call is pick(), whose open-array parameter
+#     -OoPURE can never admit) and NOT under -OoPURE alone --------------------
+oa_src="$root/unleashed/tests/testfiles/optreassoc/reassoc_modref_02.pp"
+oa_mod="$( "$CC" -Fu"$RTL" -O4 -OoMODREF -OoREASSOC -OoREPORT "$oa_src" -FE"$tmp" 2>&1 || true )"
+n_openarray=$(grep -cE 'reassoc: reduction .* via -OoMODREF' <<<"$oa_mod" || true)
+n_oa_error=$(grep -cE 'Error:' <<<"$oa_mod" || true)
+oa_pure="$( "$CC" -Fu"$RTL" -O4 -OoPURE -OoREASSOC -OoREPORT "$oa_src" -FE"$tmp" 2>&1 || true )"
+n_oa_pure=$(grep -cE 'reassoc: reduction .* via -OoMODREF' <<<"$oa_pure" || true)
+
+# --- without -OoMODREF (pure only): neither viaaddr (addr-taken) nor pick
+#     (open-array) splits -- both beyond -OoPURE ------------------------------
 pure_out="$( "$CC" -Fu"$RTL" -O4 -OoPURE -OoREASSOC -OoREPORT "$tmp/r.pp" -FE"$tmp" 2>&1 || true )"
 n_pure_split=$(grep -cE 'reassoc: reduction .* via -OoMODREF' <<<"$pure_out" || true)
 
-echo "with -OoMODREF: write-free split remarks = $n_modref (expect 1: viaaddr)"
-echo "with -OoMODREF: compile errors           = $n_error (expect 0: open-array call NOT admitted)"
+echo "with -OoMODREF: write-free split remarks = $n_modref (expect 2: viaaddr + pick, global-writer declined)"
+echo "with -OoMODREF: compile errors           = $n_error (expect 0)"
+echo "open-array fixture: -OoMODREF splits      = $n_openarray (expect 1), errors = $n_oa_error (expect 0)"
+echo "open-array fixture: -OoPURE-only splits   = $n_oa_pure (expect 0)"
 echo "with -OoPURE only: modref split remarks   = $n_pure_split (expect 0)"
 
-[ "$n_modref" = "1" ] || { echo "FAIL: -OoMODREF did not split the write-free reduction addend"; rc=1; }
-[ "$n_error" = "0" ]  || { echo "FAIL: an open-array-parameter call was admitted and broke reassoc duplication"; rc=1; }
+[ "$n_modref" = "2" ]   || { echo "FAIL: expected exactly two -OoMODREF splits (viaaddr + pick), global-writer must stay declined"; rc=1; }
+[ "$n_error" = "0" ]    || { echo "FAIL: -OoMODREF run produced a compile error"; rc=1; }
+[ "$n_openarray" = "1" ]|| { echo "FAIL: the open-array-parameter write-free addend was NOT split under -OoMODREF"; rc=1; }
+[ "$n_oa_error" = "0" ] || { echo "FAIL: the open-array addend broke reassoc duplication (re-typecheck error)"; rc=1; }
+[ "$n_oa_pure" = "0" ]  || { echo "FAIL: the open-array addend split under -OoPURE alone (must need -OoMODREF)"; rc=1; }
 [ "$n_pure_split" = "0" ] || { echo "FAIL: a modref-only split fired without -OoMODREF"; rc=1; }
 
-[ "$rc" -eq 0 ] && echo "PASS: -OoMODREF widens the -OoREASSOC addend fence to write-free non-trapping calls, soundly and correctly gated"
+# --- runtime: split result must equal the strictly-serial reference ------------
+for fx in reassoc_modref_01 reassoc_modref_02; do
+  src="$root/unleashed/tests/testfiles/optreassoc/$fx.pp"
+  if run "$CC" -Fu"$RTL" -O4 -OoMODREF -OoREASSOC "$src" -FE"$tmp" >/dev/null 2>&1; then
+    if run "$tmp/$fx" >/dev/null 2>&1; then echo "runtime $fx: OK"; else echo "FAIL: $fx run (split != serial reference)"; rc=1; fi
+  else
+    echo "FAIL: $fx did not compile"; rc=1
+  fi
+done
+
+[ "$rc" -eq 0 ] && echo "PASS: -OoMODREF widens the -OoREASSOC addend fence to write-free non-trapping calls (incl. open-array-parameter actuals, duplicated soundly), correctly gated and bit-exact"
 exit "$rc"

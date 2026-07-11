@@ -9,9 +9,9 @@
   leaves unproven: `viaaddr` takes the address of a local, which the purity
   analysis rejects outright ("takes the address of something"), yet it writes no
   external memory and cannot trap.  (Calls with open-array / managed / hidden
-  actuals are deliberately NOT admitted -- reassoc's addend duplicator cannot
-  re-typecheck those copies -- so the simple-signature restriction keeps this
-  sound; see reassoc_modref_negatives in gvnpre/reassoc checks.)
+  actuals are ALSO admissible now -- reassoc's addend duplicator preserves the
+  already-firstpassed call's expanded argument list on each copy; that
+  open-array case is exercised by the sibling reassoc_modref_02.pp.)
 
   Correctness must hold regardless of whether the split fires: an integer sum is
   exact under any grouping.  The reference kernel takes the address of its

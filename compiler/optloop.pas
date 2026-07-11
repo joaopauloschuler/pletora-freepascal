@@ -192,7 +192,6 @@ unit optloop;
     function loop_is_modref_writefree_call(n : tnode) : boolean;
       var
         pd : tprocdef;
-        para : tcallparanode;
       begin
         result:=false;
         if not(cs_opt_modref in current_settings.optimizerswitches) then
@@ -201,23 +200,16 @@ unit optloop;
         if not(assigned(pd) and modref_summary_available(pd) and
                (pd.modref_writes=mr_none) and not modref_pd_can_trap(pd)) then
           exit;
-        { -OoREASSOC duplicates the addend (with a shifted counter) and
-          re-firstpasses each copy.  That copy step mishandles a call actual that
-          carries a hidden/managed/open-array conversion (a fixed array bound to
-          an open-array parameter re-typechecks as its element type), so restrict
-          this relaxation to calls whose every actual is a plain simple-typed
-          value -- exactly the shapes the counter-substitution re-firstpass
-          handles.  (The -OoPURE path never reaches such signatures: the purity
-          analysis rejects open-array / managed / hidden parameters outright.) }
-        para:=tcallparanode(tcallnode(n).left);
-        while assigned(para) do
-          begin
-            if assigned(para.paravalue) and
-               not(assigned(para.paravalue.resultdef) and
-                   (para.paravalue.resultdef.typ in [orddef,enumdef,floatdef,pointerdef])) then
-              exit;
-            para:=tcallparanode(para.nextpara);
-          end;
+        { -OoREASSOC duplicates the addend (with a shifted counter) and rebuilds
+          each copy.  The copy step used to mishandle a call actual carrying an
+          open-array / managed / hidden conversion (a fixed array bound to an
+          open-array parameter re-typechecked as its element type), so this
+          relaxation was restricted to calls whose every actual was a plain
+          simple-typed value.  reassoc_reset_cb now leaves an already-firstpassed
+          call's expanded argument list intact on each copy (only the counter
+          substitution, an identical-typed rewrite, is refreshed), so that
+          restriction is lifted -- any resolved write-free non-trapping call is
+          admissible regardless of its parameter shapes. }
         result:=true;
       end;
 
@@ -6696,8 +6688,29 @@ unit optloop;
         keyed to the OLD child -- dropping the +delta (i*2 stayed i*2) or, when the
         multiply is not a power of two, tripping an operand-size internalerror.
         Clearing resultdef + the pass1/error flags on the whole subtree makes the
-        enclosing block's do_firstpass rebuild it consistently. }
+        enclosing block's do_firstpass rebuild it consistently.
+
+        A CALL node (and its whole argument subtree) is the ONE exception: it is
+        left intact.  After a call has been firstpassed its parameter list is in
+        EXPANDED form -- hidden high/typinfo parameters materialised, and the
+        actual->formal conversions inserted (a fixed array bound to an open-array
+        parameter carries the dynarray-style boundary + a runtime high para; a
+        managed actual carries a copy temp).  Clearing its resultdef forces a
+        re-typecheck that re-runs parameter matching over that already-expanded
+        list, which mis-binds the array actual to the (scalar) element type
+        ("Incompatible types: got Array Of X expected X") and would double-insert
+        the hidden paras.  None of that needs redoing: the counter substitution
+        only ever rewrites a plain counter read  i  into  (i+delta)  -- an
+        expression of the IDENTICAL type -- so any call ARGUMENT containing the
+        counter keeps its type, the call's own resultdef stays valid, and the new
+        (i+delta) subtree was already firstpassed in place by reassoc_subst_cb.
+        Skip the call so its expansion is preserved verbatim on every copy. }
       begin
+        if n.nodetype=calln then
+          begin
+            result:=fen_norecurse_false;
+            exit;
+          end;
         result:=fen_false;
         { a copied load of a variable from an enclosing frame still carries the
           original's parentfp node in left; with resultdef cleared the load is
