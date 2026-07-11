@@ -81,6 +81,18 @@ begin
   result := x * 3;
 end;
 
+{ iterative factorial: a plain counted for-loop. Proven const only because
+  -OoPURE now treats the lowered counter step (temp writes + an unchecked
+  inc/succ on a local counter) as a non-side-effect; folded by the loop-body
+  evaluator (never reachable when a loop kept the routine impure). }
+function cloopfact(n: longint): longint;
+var i, r: longint;
+begin
+  r := 1;
+  for i := 2 to n do r := r * i;
+  cloopfact := r;
+end;
+
 var v: longint;
 begin
   v := 11;
@@ -90,6 +102,7 @@ begin
   Writeln(cfib(38));       { over budget -> stays a call }
   Writeln(cglob(3));       { not const -> stays a call }
   Writeln(ctripl(v));      { non-constant actual -> stays a call }
+  Writeln(cloopfact(7));   { for-loop body folds -> 5040 }
 end.
 EOF
 
@@ -107,7 +120,9 @@ n_cfact=$(grep -ciE 'call[^A-Za-z0-9_]+.*CFACT'  main.s)
 n_cfib=$(grep -ciE  'call[^A-Za-z0-9_]+.*CFIB'   main.s)
 n_cglob=$(grep -ciE 'call[^A-Za-z0-9_]+.*CGLOB'  main.s)
 n_ctripl=$(grep -ciE 'call[^A-Za-z0-9_]+.*CTRIPL' main.s)
+n_cloopfact=$(grep -ciE 'call[^A-Za-z0-9_]+.*CLOOPFACT' main.s)
 has_720=$(grep -ciE '\$720\b' main.s)
+has_5040=$(grep -ciE '\$5040\b' main.s)
 
 # report remarks
 r_folded=$(grep -ciE 'consteval: call to .* folded to compile-time constant' main.log)
@@ -129,6 +144,7 @@ echo "(3) cross-unit used-unit call: on=$n_addk (expect 0)  off=$off_addk (expec
 echo "(4) over-budget fib calls: on=$n_cfib (expect >=3: 2 recursion + 1 unfolded)"
 echo "(5) non-const (global read) calls: on=$n_cglob (expect >=1)"
 echo "(6) non-constant actual calls: on=$n_ctripl (expect >=1)"
+echo "(6b) for-loop-body fold calls: on=$n_cloopfact (expect 0)  \$5040 literal=$has_5040"
 echo "(7) run: on=[$on_out] off=[$off_out] link_rc=$link_ok (must match, rc 0)"
 echo "(8) report: folded remarks=$r_folded (expect >=3)  refusal remarks=$r_refuse (expect >=1)"
 
@@ -143,6 +159,8 @@ fail=0
 [ "$n_cfib" -ge 3 ]                   || { echo "  X over-budget fib call was folded (unsound)"; fail=1; }
 [ "$n_cglob" -ge 1 ]                  || { echo "  X non-const callee was folded (unsound)"; fail=1; }
 [ "$n_ctripl" -ge 1 ]                 || { echo "  X non-constant actual was folded (unsound)"; fail=1; }
+[ "$n_cloopfact" -eq 0 ]              || { echo "  X counted for-loop body not folded"; fail=1; }
+[ "$has_5040" -ge 1 ]                 || { echo "  X folded for-loop literal 5040 absent"; fail=1; }
 [ -n "$on_out" ] && [ "$on_out" = "$off_out" ] || { echo "  X result mismatch/empty"; fail=1; }
 [ "$r_folded" -ge 3 ]                 || { echo "  X missing -OoREPORT folded remarks"; fail=1; }
 [ "$r_refuse" -ge 1 ]                 || { echo "  X missing -OoREPORT refusal remark"; fail=1; }

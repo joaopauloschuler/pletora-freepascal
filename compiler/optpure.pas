@@ -127,6 +127,16 @@ implementation
               { a[i]: descend to the base; a deref/global base is caught there,
                 a local static array base ends at its loadn }
               t:=tvecnode(t).left;
+            temprefn:
+              { a compiler-created temporary (ttempcreatenode storage) is local,
+                non-escaping stack storage -- e.g. the from/to bound temps that
+                ConvertForLoops synthesizes when it lowers a counted for-loop to a
+                while-loop before this pass runs. A store to such a temp is never
+                externally observable, so it does not disqualify const/pure. (A
+                store THROUGH it -- temp^ := ... -- is a derefn and still caught
+                above; temp.field / temp[i] descend here to the same verdict on
+                local temp storage.) }
+              exit(false);
             derefn:
               exit(true);
             loadn:
@@ -208,6 +218,7 @@ implementation
         sym : tsym;
         pd : tabstractprocdef;
         iswrite : boolean;
+        para : tcallparanode;
       begin
         result:=fen_true;
         ctx:=ppurescan(arg);
@@ -243,8 +254,41 @@ implementation
             if lvalue_write_is_side_effect(tassignmentnode(n).left) then
               ctx^.impure:=true;
           inlinen:
-            if not pure_inline(tinlinenode(n).inlinenumber) then
-              ctx^.impure:=true;
+            case tinlinenode(n).inlinenumber of
+              in_succ_x,in_pred_x:
+                { succ/pred is a non-trapping +1/-1 value computation UNLESS
+                  range/overflow checking is on (then it may trap at the type
+                  boundary, an observable side effect we must not speculate). }
+                if ([cs_check_overflow,cs_check_range]*n.localswitches)<>[] then
+                  ctx^.impure:=true;
+              in_inc_x,in_dec_x:
+                { inc/dec mutates its target argument in place. That is a side
+                  effect only if the target is externally observable; mutating a
+                  plain LOCAL (or a compiler temp) is not. ConvertForLoops lowers
+                  a counted for-loop's counter step to  i := succ(i)  which
+                  firstpass folds to an (unchecked) inc(i) on the local counter,
+                  so admitting that form is exactly what lets a plain counted for
+                  prove const/pure. Checked inc/dec may trap -> impure. Only the
+                  write-flagged argument matters; a by-value step amount is a
+                  harmless read. }
+                if ([cs_check_overflow,cs_check_range]*n.localswitches)<>[] then
+                  ctx^.impure:=true
+                else
+                  begin
+                    para:=tcallparanode(tinlinenode(n).left);
+                    while assigned(para) do
+                      begin
+                        if (assigned(para.left)) and
+                           (([nf_write,nf_modify]*para.left.flags)<>[]) and
+                           lvalue_write_is_side_effect(para.left) then
+                          ctx^.impure:=true;
+                        para:=tcallparanode(para.right);
+                      end;
+                  end;
+              else
+                if not pure_inline(tinlinenode(n).inlinenumber) then
+                  ctx^.impure:=true;
+            end;
           loadn:
             begin
               sym:=tloadnode(n).symtableentry;
