@@ -5118,8 +5118,22 @@ implementation
                 Comment(V_lineinfo+V_Debug,'Not inlining "'+tprocdef(procdefinition).procsym.realname+'", inherited call cannot be spliced across units');
                 exclude(callnodeflags,cnf_do_inline);
               end;
-            { Check if we can inline the procedure when it references proc/var that
-              are not in the globally available }
+            { The inline body may reference a symbol that is private to its
+              defining unit (a static-symtable staticvarsym/typed const, or a
+              call to an implementation-only procedure): pi_uses_static_symtable.
+              optcall.importglobalsyms rebases those references at the call site
+              (it adds the cross-unit staticvarsym / private procsym to the
+              caller module's imported-symbol list), so on any target whose
+              linker can resolve a reference to another object's UNIT-PRIVATE
+              symbol -- i.e. tf_supports_hidden_symbols, which the defining unit
+              honours by emitting the symbol as a hidden (DSO-local) rather than
+              truly static symbol -- such a body splices and links correctly
+              (verified: private var mutation, typed const and private-proc call
+              all inline cross-unit).  ONLY on the residual targets WITHOUT hidden
+              symbol support is a unit-private symbol unreferenceable from another
+              object (importing it at the call site does not make it public in the
+              defining unit); reconstructing that would need the defining unit to
+              emit a public alias, so keep those calls out of line there. }
             st:=procdefinition.owner;
             while (st.symtabletype in [ObjectSymtable,recordsymtable]) do
               st:=st.defowner.owner;
@@ -5128,7 +5142,7 @@ implementation
                (st.symtabletype=globalsymtable) and
                (not st.iscurrentunit) then
               begin
-                Comment(V_lineinfo+V_Debug,'Not inlining "'+tprocdef(procdefinition).procsym.realname+'", references private symbols from other unit');
+                Comment(V_lineinfo+V_Debug,'Not inlining "'+tprocdef(procdefinition).procsym.realname+'", references unit-private symbols and target lacks hidden-symbol support');
                 exclude(callnodeflags,cnf_do_inline);
               end;
             para:=tcallparanode(parameters);
