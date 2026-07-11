@@ -41,7 +41,7 @@ unit optdeadstore;
       nutils,
       nbas,nld,nmem,ncal,
       defutil,
-      optbase,optpure,optutils,
+      optbase,optpure,optmodref,optutils,
       symtype,symdef,symsym,symconst;
 
 
@@ -234,54 +234,53 @@ unit optdeadstore;
           );
       end;
 
-    { --- pure/const call barrier relaxation (-OoPURE consumer) --------------
+    { --- pure/const/mod-ref call barrier relaxation (-OoPURE / -OoMODREF) ----
 
       The field-store scan above treats every call as a hard barrier: it may
       read the pending store's memory (keeping it live) or write memory (an
-      aliasing effect). A call whose target -OoPURE proved PURE or CONST is far
-      weaker and need not flush the whole pending set:
+      aliasing effect). A call whose memory effect at THIS call site is known is
+      far weaker and need not flush the whole pending set:
 
-        * a CONST routine reads and writes NO memory at all -- it can neither
-          observe nor clobber a pending store, so it is a complete non-barrier
-          (only its argument expressions, scanned normally, perform reads);
+        * a call that neither reads nor writes any globally-reachable memory
+          (an -OoPURE CONST routine, or -- via -OoMODREF -- an impure routine
+          whose reads/writes at this site are confined to non-global actuals,
+          e.g. a helper writing only its out parameter bound to a caller local)
+          is a complete non-barrier: only its argument expressions, scanned
+          normally, perform reads;
 
-        * a PURE routine writes no memory but MAY read global/heap state, so it
-          is a potential *reader*: a pending store to a globally reachable slot
-          (a static var, or a by-reference const parameter) could be observed
-          and must be kept live, but a store to a non-address-taken local or a
+        * a call that may read and/or write globally-reachable memory (an
+          -OoPURE PURE routine, or an -OoMODREF routine that reads/writes a
+          static or a by-reference-parameter actual at this site) is treated as
+          a potential observer/clobberer of every globally reachable pending
+          slot (a static var, or a by-reference const parameter), which is
+          therefore kept live -- but a store to a non-address-taken local or a
           by-value parameter is invisible to any callee (no pointer to it can
-          exist) and therefore survives the pure call.
+          exist) and survives the call.
 
-      Indirect / procvar / virtual / aggregate-returning calls stay full
-      barriers, as do deref and asm nodes. }
+      Indirect / procvar / virtual / external / aggregate-returning calls stay
+      full barriers (modref_call_effect returns no information), as do deref and
+      asm nodes.  modref_call_effect consults the -OoPURE verdict first, so this
+      subsumes and generalizes the former pure/const-only relaxation. }
 
     type
       tcallkind = (elc_barrier, elc_pure, elc_const);
 
     function el_classify_call(cn: tcallnode): tcallkind;
       var
-        pd : tprocdef;
+        readsglobal,writesglobal : boolean;
       begin
         result:=elc_barrier;
-        if not(cs_opt_pure in current_settings.optimizerswitches) then
+        if ([cs_opt_pure,cs_opt_modref]*current_settings.optimizerswitches)=[] then
           exit;
-        { resolved direct call only (excludes indirect / procvar targets) }
-        if not assigned(cn.procdefinition) or not(cn.procdefinition is tprocdef) then
-          exit;
-        pd:=tprocdef(cn.procdefinition);
-        { a method call must dispatch to a statically known body }
-        if assigned(cn.methodpointer) and
-           ((po_virtualmethod in pd.procoptions) or
-            (po_abstractmethod in pd.procoptions)) then
-          exit;
-        { aggregate return machinery performs hidden stores -> stay a barrier }
-        if assigned(cn.funcretnode) or assigned(cn.callinitblock) or
-           assigned(cn.callcleanupblock) then
-          exit;
-        if proc_is_const(pd) then
-          result:=elc_const
-        else if proc_is_pure(pd) then
-          result:=elc_pure;
+        if modref_call_effect(cn,readsglobal,writesglobal) then
+          begin
+            if not readsglobal and not writesglobal then
+              result:=elc_const
+            else
+              { reads and/or writes some globally reachable location: keep every
+                globally reachable pending store live (local ones still survive) }
+              result:=elc_pure;
+          end;
       end;
 
     { true if a pure callee could read this pending-store base's memory. The

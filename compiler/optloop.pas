@@ -75,7 +75,7 @@ unit optloop;
       nadd,nbas,nflw,ncon,ninl,ncal,nld,nmem,ncnv,nmat,
       ncgmem,
       pass_1,
-      optbase,optutils,optpure,
+      optbase,optutils,optpure,optmodref,
       procinfo;
 
     function number_unrolls(node : tnode) : cardinal;
@@ -138,7 +138,9 @@ unit optloop;
         pd : tprocdef;
       begin
         result:=nil;
-        if not(cs_opt_pure in current_settings.optimizerswitches) then
+        { both -OoPURE and -OoMODREF run the purity analysis these helpers
+          consult (see psub); either switch enables the loop-call relaxations }
+        if ([cs_opt_pure,cs_opt_modref]*current_settings.optimizerswitches)=[] then
           exit;
         if not assigned(n) or (n.nodetype<>calln) then
           exit;
@@ -9019,6 +9021,36 @@ unit optloop;
           not is_managed_type(n.resultdef);
       end;
 
+    { a call the store-motion pass may keep inside a promoted-global loop body.
+      Store motion holds each promoted global in a register across the whole
+      loop and writes it back once afterwards, so a call in the body is safe
+      only if it neither READS nor WRITES any globally-reachable memory (a
+      global read would see the stale in-memory copy; a global write would be
+      lost) and provably cannot TRAP/RAISE (an exception would skip the
+      post-loop write-back, leaving the global stale).
+
+      An -OoPURE CONST call qualifies (no memory access, non-trapping).
+      -OoMODREF additionally admits an IMPURE routine whose reads/writes at THIS
+      call site are confined to non-global actuals -- the motivating case being
+      a helper that writes only its own out parameter bound to a caller local --
+      provided its summary proves it cannot trap. }
+    function sm_call_transparent(n: tnode): boolean;
+      var
+        pd : tprocdef;
+        readsglobal,writesglobal : boolean;
+      begin
+        result:=loop_is_const_call(n);
+        if result then
+          exit;
+        if not(cs_opt_modref in current_settings.optimizerswitches) then
+          exit;
+        pd:=loop_call_target(n);
+        result:=assigned(pd) and
+                modref_call_effect(tcallnode(n),readsglobal,writesglobal) and
+                not readsglobal and not writesglobal and
+                not modref_pd_can_trap(pd);
+      end;
+
     { Recursive whitelist over statements *and* expressions: true only if every
       node in the subtree is provably call-free, non-trapping and alias-safe as
       described in the pass header. }
@@ -9083,7 +9115,7 @@ unit optloop;
               register temp.  The argument subtrees must themselves be safe
               (recursed below), which also keeps them non-trapping. }
             begin
-              result:=loop_is_const_call(n);
+              result:=sm_call_transparent(n);
               if result then
                 result:=sm_node_safe(tcallnode(n).left);
             end;
@@ -9097,11 +9129,11 @@ unit optloop;
         end;
       end;
 
-    { detects a proven-CONST call kept in the loop body by the relaxed whitelist,
-      for an accurate -OoREPORT remark }
+    { detects a proven-CONST / mod-ref-transparent call kept in the loop body by
+      the relaxed whitelist, for an accurate -OoREPORT remark }
     function sm_has_constcall_cb(var n: tnode; arg: pointer): foreachnoderesult;
       begin
-        if (n.nodetype=calln) and loop_is_const_call(n) then
+        if (n.nodetype=calln) and sm_call_transparent(n) then
           begin
             pboolean(arg)^:=true;
             result:=fen_norecurse_true;
@@ -9283,7 +9315,7 @@ unit optloop;
               foreachnodestatic(pm_postprocess,NewCopy,@sm_has_constcall_cb,@hasconstcall);
               if hasconstcall then
                 OptRemark(n.fileinfo,'storemotion',
-                  'promoted '+tostr(data.Vars.Count)+' invariant-address global(s) to register temps across a loop body containing a proven-const call (-OoPURE)')
+                  'promoted '+tostr(data.Vars.Count)+' invariant-address global(s) to register temps across a loop body containing a call proven not to touch global memory (-OoPURE/-OoMODREF)')
               else
                 OptRemark(n.fileinfo,'storemotion',
                   'promoted '+tostr(data.Vars.Count)+' invariant-address global(s) to register temps for the loop');

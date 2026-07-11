@@ -1061,6 +1061,28 @@ interface
           icf_addrtaken : boolean;
           icf_hash_valid : boolean;
           icf_hash : array[0..1] of qword;
+          { interprocedural mod/ref memory-access summary (-OoMODREF, see
+            optmodref.pas). Refines the binary -OoPURE verdict: instead of only
+            "pure/const vs impure" it records, conservatively, what the routine
+            READS and what it WRITES, each as one of 0=nothing / 1=only through
+            its own by-reference parameters / 2=unknown-global, plus whether the
+            body can trap or raise. Unlike the pure_* raw facts these fields ARE
+            the final derived summary (no query-time fixpoint: a callee's effect
+            is folded in eagerly when this routine is analysed, and a forward /
+            recursive / unanalysed callee degrades to unknown), so they are both
+            usable directly and serialized verbatim.
+              modref_analyzed : the summary was computed in THIS unit
+              modref_ppu_valid: the summary was loaded from a used unit's ppu
+                                (optsum_modref); either flag means the three
+                                fields below are meaningful.
+              modref_reads / modref_writes : the read / write class (0/1/2 above)
+              modref_can_trap : the routine may raise or trap (a consumer that
+                                reorders/duplicates/hoists the call must decline) }
+          modref_analyzed : boolean;
+          modref_ppu_valid : boolean;
+          modref_reads : byte;
+          modref_writes : byte;
+          modref_can_trap : boolean;
           constructor create(level:byte;doregister:boolean);virtual;
           constructor ppuload(ppufile:tcompilerppufile);
           destructor  destroy;override;
@@ -7080,6 +7102,11 @@ implementation
          icf_hash_valid:=false;
          icf_hash[0]:=0;
          icf_hash[1]:=0;
+         modref_analyzed:=false;
+         modref_ppu_valid:=false;
+         modref_reads:=0;
+         modref_writes:=0;
+         modref_can_trap:=false;
       end;
 
 
@@ -7094,6 +7121,11 @@ implementation
          icf_hash_valid:=false;
          icf_hash[0]:=0;
          icf_hash[1]:=0;
+         modref_analyzed:=false;
+         modref_ppu_valid:=false;
+         modref_reads:=0;
+         modref_writes:=0;
+         modref_can_trap:=false;
 {$ifdef symansistr}
          if po_has_mangledname in procoptions then
            _mangledname:=ppufile.getansistring
@@ -7466,6 +7498,21 @@ implementation
             ppufile.putstring(icfname);
           end;
 
+        { -OoMODREF: persist the interprocedural mod/ref memory-access summary as
+          a single flag byte (reads in bits 0..1, writes in bits 2..3, can_trap
+          in bit 4). Only emitted when this routine was actually analysed in this
+          unit (=> -OoMODREF was on). No target/ABI guard is needed: the summary
+          is expressed in terms of source-level parameters/globals, not physical
+          registers, so it is valid for any target. }
+        if modref_analyzed then
+          begin
+            ppufile.putbyte(optsum_modref);
+            ppufile.putword(1);
+            ppufile.putbyte((modref_reads and 3) or
+                            ((modref_writes and 3) shl 2) or
+                            (ord(modref_can_trap) shl 4));
+          end;
+
         { terminator }
         ppufile.putbyte(optsum_end);
       end;
@@ -7485,6 +7532,10 @@ implementation
         pure_ppu_is_pure:=false;
         pure_ppu_is_const:=false;
         icf_hash_valid:=false;
+        modref_ppu_valid:=false;
+        modref_reads:=0;
+        modref_writes:=0;
+        modref_can_trap:=false;
         repeat
           tag:=ppufile.getbyte;
           if tag=optsum_end then
@@ -7497,6 +7548,14 @@ implementation
                 pure_ppu_valid:=true;
                 pure_ppu_is_pure:=(pureflags and 1)<>0;
                 pure_ppu_is_const:=(pureflags and 2)<>0;
+              end;
+            optsum_modref:
+              begin
+                pureflags:=ppufile.getbyte;
+                modref_ppu_valid:=true;
+                modref_reads:=pureflags and 3;
+                modref_writes:=(pureflags shr 2) and 3;
+                modref_can_trap:=(pureflags and 16)<>0;
               end;
             optsum_ipara:
               begin

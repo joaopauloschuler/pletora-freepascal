@@ -2612,7 +2612,8 @@ const
          'cs_opt_devirt',
          'cs_opt_ipacp',
          'cs_opt_vect256',
-         'cs_opt_consteval'
+         'cs_opt_consteval',
+         'cs_opt_modref'
        );
     var
          globalswitch  : tglobalswitch;
@@ -4631,6 +4632,11 @@ begin
                    begin
                      b:=ppufile.getbyte;
                      writeln([space,' Optimizer summary : PURE  is_pure=',ord((b and 1)<>0),' is_const=',ord((b and 2)<>0)]);
+                   end;
+                 optsum_modref:
+                   begin
+                     b:=ppufile.getbyte;
+                     writeln([space,' Optimizer summary : MODREF  reads=',b and 3,' writes=',(b shr 2) and 3,' can_trap=',ord((b and 16)<>0),' (0=none 1=byref-params 2=unknown-global)']);
                    end;
                  optsum_ipara:
                    begin

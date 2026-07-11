@@ -852,7 +852,31 @@ interface
            (clones a specialized body but still emits a runtime call) and from
            GVN-PRE (reuses a runtime value, never a literal). Opt-in; NOT part of
            the -O4 defaults -- a wrong fold is a miscompile }
-         cs_opt_consteval
+         cs_opt_consteval,
+         { interprocedural mod/ref analysis (-OoMODREF): a port of gcc's
+           ipa-modref (gcc/ipa-modref.cc, default-on there at -O2 as
+           -fipa-modref) that REFINES the binary pure/const verdict of -OoPURE.
+           For each ordinary routine compiled in the unit a conservative
+           memory-access summary is recorded -- what it READS and what it WRITES,
+           each classified into: nothing / only through its own by-reference
+           (var/out/const/constref) parameters / unknown-global -- plus whether
+           it can trap or raise. The summary is folded bottom-up (a callee's
+           effect is mapped through the actual arguments at each call site into
+           the caller's own frame; a forward/recursive callee whose summary is
+           not yet available and any indirect/procvar/virtual/external/asm callee
+           or write through a dereferenced pointer degrade conservatively to
+           unknown-global) and serialized cross-unit through the established
+           per-procdef PPU optimizer-summary mechanism (the optsum_modref tag,
+           beside optsum_pure). Consumers then relax call fences that today treat
+           every non-pure call as a universal barrier: a call whose summary
+           provably neither reads nor writes the location in question is no
+           barrier even though the callee is impure -- e.g. a helper that writes
+           only its own out parameter (bound to a caller local) no longer kills a
+           caller's pending global store or blocks promoting a global across a
+           loop. The stronger pure/const bits stay authoritative where set.
+           Opt-in (-OoMODREF); NOT part of the -O4 defaults -- a wrong summary is
+           a miscompile }
+         cs_opt_modref
        );
        toptimizerswitches = set of toptimizerswitch;
 
@@ -933,7 +957,7 @@ interface
          'SINK','STOREMOTION','VRP','REFELIDE','SWITCHTABLE','REE',
          'SHRINKWRAP','GVNPRE','PURE','PARTIALINLINE','STACKALLOC','SLP',
          'UNROLLDYN','PREFETCH','ICF','IPARA','FINALVALUE','SIBCALL',
-         'REPORT','DEVIRT','IPACP','VECT256','CONSTEVAL'
+         'REPORT','DEVIRT','IPACP','VECT256','CONSTEVAL','MODREF'
        );
        WPOptimizerSwitchStr : array [twpoptimizerswitch] of string[14] = (
          'DEVIRTCALLS','OPTVMTS','SYMBOLLIVENESS'

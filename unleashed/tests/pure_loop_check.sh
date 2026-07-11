@@ -103,7 +103,7 @@ echo "--- storemotion remarks with -OoPURE ---"
 grep -E 'storemotion: promoted' <<<"$s_on" || true
 
 # exactly one loop (the const-call one) is promoted with a const call in the body
-n_sm_const=$(grep -cE 'storemotion: promoted .* proven-const call' <<<"$s_on" || true)
+n_sm_const=$(grep -cE 'storemotion: promoted .* not to touch global memory' <<<"$s_on" || true)
 # without -OoPURE nothing is promoted (every loop has a call)
 n_sm_off=$(grep -cE 'storemotion: promoted' <<<"$s_off" || true)
 

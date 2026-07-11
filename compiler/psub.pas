@@ -187,6 +187,7 @@ implementation
        optfinalvalue,
        optdevirt,
        optpure,
+       optmodref,
        optpartialinline,
        optipacp,
        optconsteval,
@@ -1931,9 +1932,21 @@ implementation
          optpure. Opt-in via -OoPURE; the flags default to "impure" for routines
          we never analysed (e.g. loaded from other units). -OoCONSTEVAL consumes
          the "const" verdict (and streams it cross-unit via optsum_pure), so it
-         implies running this analysis as well. }
-       if ([cs_opt_pure,cs_opt_consteval]*current_settings.optimizerswitches)<>[] then
+         implies running this analysis as well. -OoMODREF refines the same
+         pure/const verdict, so it implies it too. }
+       if ([cs_opt_pure,cs_opt_consteval,cs_opt_modref]*current_settings.optimizerswitches)<>[] then
          AnalyzeProcPurity(procdef,code);
+
+       { interprocedural mod/ref memory-access summaries (the gcc ipa-modref
+         idea): record, per routine, a conservative summary of what it READS and
+         WRITES, refining -OoPURE's binary verdict so a later-compiled caller can
+         drop a call barrier that provably touches neither the pending store nor
+         the promoted value at issue. Runs here on the final node tree, right
+         after the purity analysis it builds on, so callees compiled earlier in
+         the unit already have their summaries recorded; forward/recursive
+         callees degrade to unknown-global. Opt-in via -OoMODREF. }
+       if cs_opt_modref in current_settings.optimizerswitches then
+         AnalyzeProcModref(procdef,code);
 
        { global value numbering + full-redundancy elimination: number
          side-effect-free scalar expressions across control flow and reuse a

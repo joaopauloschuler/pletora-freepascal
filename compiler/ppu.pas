@@ -64,6 +64,8 @@ const
   optsum_ipara = 2;  { -OoIPARA volatile-register clobber mask }
   optsum_icf   = 3;  { -OoICF 128-bit canonical body digest of a globally-visible
                        fold survivor (target/ABI signature + 16 hash bytes) }
+  optsum_modref = 4; { -OoMODREF interprocedural mod/ref memory-access summary
+                       (1 flag byte: reads<<0 | writes<<2 | can_trap<<4) }
 
 { unit flags }
   uf_big_endian          = $000004;
