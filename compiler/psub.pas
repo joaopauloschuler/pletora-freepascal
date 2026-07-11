@@ -404,19 +404,27 @@ implementation
                 exit;
               end;
           end;
+        { pio_nested_access is set on THIS procdef whenever a nested routine
+          reads its frame -- a parent local or parameter, a non-local exit/goto
+          target, or its address taken as a nested procvar (tprocinfo.
+          set_needs_parentfp).  Such a routine cannot be node-inlined: the nested
+          routine is compiled exactly once against this frame's fixed offsets,
+          and inlining relocates the captured locals into arbitrary caller frames
+          the already-emitted nested routine cannot follow.  Refuse it. }
         if pio_nested_access in procdef.implprocoptions then
          begin
            _no_inline('access to local from nested scope');
            exit;
          end;
-        { We can't support inlining for procedures that have nested
-          procedures because the nested procedures use a fixed offset
-          for accessing locals in the parent procedure (PFV) }
-        if current_procinfo.has_nestedprocs then
-          begin
-            _no_inline('nested procedures');
-            exit;
-          end;
+        { FPC Unleashed: a routine merely CONTAINING nested procedures used to be
+          refused too.  But when pio_nested_access is NOT set (checked above),
+          none of those nested routines reads this routine's frame -- they are
+          independent functions that only happen to be lexically nested.  This
+          routine's frame is then dead, so node-inlining it (its locals become
+          caller temps that no nested routine reads) is sound: the nested
+          routines stay emitted with the out-of-line copy and the spliced body's
+          calls to them pass a dummy/unused parentfp (ncal handles the unused
+          parentfp).  So has_nestedprocs alone no longer blocks inlining. }
 
         if pi_uses_get_frame in current_procinfo.flags then
           begin
