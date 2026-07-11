@@ -357,7 +357,7 @@ implementation
     uses
       systems,
       verbose,globals,fmodule,ppu,
-      aasmbase,aasmtai,aasmdata,
+      aasmbase,aasmdata,
       symconst,defutil,defcmp,
       htypechk,pass_1,
       ncnv,nflw,nld,ninl,nadd,ncon,nmem,nset,nobjc,
@@ -5049,41 +5049,10 @@ implementation
       end;
 
 
-    { FPC Unleashed (Task B): true when the inline body contains an asm block
-      with a top_local operand (a param/local/result reference). Such blocks can
-      only be spliced into a SAME-UNIT caller: the caller-frame materialisation
-      (optcall.expand_inline_asm_operands) relies on matching the operand's
-      resolved localsym against the call's parasyms, which a body loaded from
-      another unit's ppu does not line up soundly. }
-    function asm_block_references_local(var n: tnode; arg: pointer): foreachnoderesult;
-      var
-        hp : tai;
-        i  : longint;
-      begin
-        result:=fen_false;
-        if (n.nodetype=asmn) and assigned(tasmnode(n).p_asm) then
-          begin
-            hp:=tai(tasmnode(n).p_asm.first);
-            while assigned(hp) do
-              begin
-                if hp.typ=ait_instruction then
-                  for i:=0 to tai_cpu_abstract(hp).ops-1 do
-                    if tai_cpu_abstract(hp).oper[i]^.typ=top_local then
-                      begin
-                        pboolean(arg)^:=true;
-                        exit(fen_norecurse_true);
-                      end;
-                hp:=tai(hp.next);
-              end;
-          end;
-      end;
-
-
     procedure tcallnode.check_inlining;
       var
         st   : tsymtable;
         para : tcallparanode;
-        asmlocal : boolean;
       begin
         { Can we inline the procedure? }
         if (po_inline in procdefinition.procoptions) and
@@ -5092,18 +5061,23 @@ implementation
            heuristics_favors_inlining then
           begin
             include(callnodeflags,cnf_do_inline);
-            { asm blocks referencing a local/param/result can only be spliced
-              into a same-unit caller (see asm_block_references_local) }
+            { An inline body containing ANY asm STATEMENT block can only be
+              spliced into a SAME-UNIT caller.  The block's tai operands survive
+              a ppu round trip incompletely: tcompilerppufile.getasmsymbol always
+              returns nil (asm symbols are module-local and never serialized), so
+              a top_ref to a GLOBAL loses its symbol and a top_local param/local/
+              result operand cannot be matched against the call's parasyms.  The
+              operand size (`ot`) and effective 2-operand order are likewise not
+              reconstructed.  A previous guard only excluded top_local-referencing
+              bodies, which let a GLOBAL-only asm block inline cross-unit and
+              miscompile (null-symbol store -> SIGSEGV / assembler size error).
+              Refuse every asm-block body loaded from another unit -- it stays
+              out-of-line and runs correctly. }
             if not procdefinition.in_currentunit and
                (pi_has_assembler_block in tprocdef(procdefinition).inlininginfo^.flags) then
               begin
-                asmlocal:=false;
-                foreachnodestatic(tprocdef(procdefinition).inlininginfo^.code,@asm_block_references_local,@asmlocal);
-                if asmlocal then
-                  begin
-                    Comment(V_lineinfo+V_Debug,'Not inlining "'+tprocdef(procdefinition).procsym.realname+'", asm block references a local/parameter/result across units');
-                    exclude(callnodeflags,cnf_do_inline);
-                  end;
+                Comment(V_lineinfo+V_Debug,'Not inlining "'+tprocdef(procdefinition).procsym.realname+'", body contains an asm block loaded from another unit');
+                exclude(callnodeflags,cnf_do_inline);
               end;
             { An `inherited` call in the body (only class methods reach here --
               psub.checknodeinlining refuses every other self shape) rebinds its

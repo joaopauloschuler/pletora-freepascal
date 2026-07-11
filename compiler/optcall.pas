@@ -47,7 +47,7 @@ unit optcall;
       fmodule,
       pass_1,
       aasmbase,aasmtai,aasmdata,
-      nbas,ncal,nld;
+      nbas,ncal,nld,nmem;
 
     { this procedure removes the user code flag because it prevents optimizations }
     function removeusercodeflag(var n : tnode; arg : pointer) : foreachnoderesult;
@@ -212,16 +212,40 @@ unit optcall;
         var
           m        : longint;
           para     : tcallparanode;
+          byref    : boolean;
+          localdef : tdef;
+          paddr    : taddrnode;
         begin
           for m:=0 to high(mapkeys) do
             if mapkeys[m]=pointer(sym) then
               exit(mapvals[m]);
+          { a by-reference parameter (var/out/constref) is passed as a hidden
+            pointer: its top_local operand resolves to that pointer SLOT (the asm
+            author loads it and dereferences manually, exactly as out-of-line).
+            So we back it with a caller local of POINTER type holding @actual --
+            relocating only the address, which is sound for any referenced type
+            and lets the spliced asm read AND write the caller's actual. }
+          byref:=(sym.typ=paravarsym) and
+                 (tparavarsym(sym).varspez in [vs_var,vs_out,vs_constref]);
+          if byref then
+            localdef:=cpointerdef.getreusable(sym.vardef)
+          else
+            localdef:=sym.vardef;
           inc(inlineasmlocalseq);
-          result:=clocalvarsym.create('$inlasm$'+tostr(inlineasmlocalseq),vs_value,sym.vardef,[]);
+          result:=clocalvarsym.create('$inlasm$'+tostr(inlineasmlocalseq),vs_value,localdef,[]);
           { compiler-generated: the asm read/write is invisible to the node DFA,
             so mark it internal to suppress the spurious "assigned but never
             used" / "not initialised" diagnostics (fatal under -Sew) }
           include(result.symoptions,sp_internal);
+          { the spliced asm reaches this local through a top_local operand that
+            tcgasmnode.ResolveRef materialises as a MEMORY reference off the
+            frame pointer -- so the local must live in memory, never a register.
+            clocalvarsym.create defaults varregable from the def (vr_intreg for
+            an ordinal/pointer), which would let the register allocator place it
+            in a register whose (uninitialised) registerhi then trips
+            translate_register (IE 200602021) once the caller carries an
+            exception frame.  Force it to memory. }
+          result.varregable:=vr_none;
           result.register_sym;
           current_procinfo.procdef.localst.insertsym(result);
           result.varstate:=vs_initialised;
@@ -229,7 +253,7 @@ unit optcall;
           setlength(mapvals,length(mapvals)+1);
           mapkeys[high(mapkeys)]:=pointer(sym);
           mapvals[high(mapvals)]:=result;
-          if (sym.typ=localvarsym) and (vo_is_funcret in sym.varoptions) then
+          if (not byref) and (sym.typ=localvarsym) and (vo_is_funcret in sym.varoptions) then
             begin
               { function result: connect the new local back to funcretnode after
                 the body has run (only when the result is actually consumed) }
@@ -241,17 +265,30 @@ unit optcall;
             end
           else if sym.typ=paravarsym then
             begin
-              { value parameter: `newlocal := actual-argument-value`.  After
-                createinlineparas, para.left is the (possibly temp-wrapped)
-                evaluated actual, so a plain copy is the callee's value copy. }
               para:=tcallparanode(callnode.left);
               while assigned(para) and (para.parasym<>tparavarsym(sym)) do
                 para:=tcallparanode(para.right);
               if assigned(para) and assigned(para.left) then
-                addstatement(callnode.inlineinitstatement,
-                  cassignmentnode.create(
-                    cloadnode.create(result,current_procinfo.procdef.localst),
-                    para.left.getcopy));
+                if byref then
+                  begin
+                    { by-reference parameter: `newptrlocal := @actual`.  The
+                      actual (para.left) is the l-value the caller passes by
+                      reference; a typed address-of matches the pointer local. }
+                    paddr:=caddrnode.create_internal(para.left.getcopy);
+                    include(paddr.addrnodeflags,anf_typedaddr);
+                    addstatement(callnode.inlineinitstatement,
+                      cassignmentnode.create(
+                        cloadnode.create(result,current_procinfo.procdef.localst),
+                        paddr));
+                  end
+                else
+                  { value parameter: `newlocal := actual-argument-value`.  After
+                    createinlineparas, para.left is the (possibly temp-wrapped)
+                    evaluated actual, so a plain copy is the callee's value copy. }
+                  addstatement(callnode.inlineinitstatement,
+                    cassignmentnode.create(
+                      cloadnode.create(result,current_procinfo.procdef.localst),
+                      para.left.getcopy));
             end;
           { a plain local needs no init (it starts uninitialised, as in the callee) }
         end;

@@ -236,19 +236,25 @@ implementation
         vs:=tabstractnormalvarsym(p);
         if not(vs.typ in [paravarsym,localvarsym]) then
           exit;
-        { by-reference / var / out / const-ref params carry a pointer, not a
-          plain value -- the caller-local rebinding would copy the pointer }
-        if (vs.typ=paravarsym) and (tparavarsym(vs).varspez<>vs_value) then
-          exit;
         if not assigned(vs.vardef) then
           exit;
-        { managed types need refcount/init-final traffic the asm splice omits;
-          aggregates (records/arrays/sets) are not covered by the value copy }
+        { managed types need refcount/init-final traffic the asm splice omits,
+          whatever way they are passed -- refused (document-only case (c)) }
         if is_managed_type(vs.vardef) then
           exit;
-        if not(is_ordinal(vs.vardef) or is_pointer(vs.vardef)) then
-          exit;
-        result:=true;
+        if (vs.typ=paravarsym) and
+           (tparavarsym(vs).varspez in [vs_var,vs_out,vs_constref]) then
+          { by-reference parameter: the operand resolves to the hidden pointer
+            SLOT, so expand_inline_asm_operands backs it with a caller pointer
+            local initialised to @actual. Only the address is relocated, which
+            is sound for any (non-managed) referenced type -- ordinal, pointer
+            or aggregate -- because the asm accesses it exactly as out-of-line. }
+          result:=true
+        else
+          { by-value parameter / plain local / ordinal-or-pointer result: the
+            value is copied into a caller local, so keep it a simple scalar (a
+            by-value aggregate is not covered by the plain value copy). }
+          result:=is_ordinal(vs.vardef) or is_pointer(vs.vardef);
       end;
 
     { returns '' when the block is inline-safe, otherwise the reason it is not }
@@ -268,7 +274,7 @@ implementation
                 for i:=0 to tai_cpu_abstract(hp).ops-1 do
                   if (tai_cpu_abstract(hp).oper[i]^.typ=top_local) and
                      not inline_asm_local_operand_ok(tai_cpu_abstract(hp).oper[i]^.localoper^.localsym) then
-                    exit('assembler block referencing a by-reference parameter, managed or aggregate operand');
+                    exit('assembler block referencing a managed operand or a by-value aggregate parameter/local');
               ait_const :
                 if assigned(tai_const(hp).sym) and
                    (tai_const(hp).sym.bind=AB_NONE) then
