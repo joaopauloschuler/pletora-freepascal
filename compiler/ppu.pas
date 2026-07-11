@@ -76,6 +76,18 @@ const
                        fold survivor (target/ABI signature + 16 hash bytes) }
   optsum_modref = 4; { -OoMODREF interprocedural mod/ref memory-access summary
                        (1 flag byte: reads<<0 | writes<<2 | can_trap<<4) }
+  optsum_deadpara = 5; { -OoDEADPARA per-formal reference bitmap (one dword):
+                       bit N set = paras[N] is REFERENCED in the body (or the
+                       routine was disqualified, in which case every bit is set);
+                       a clear bit for an in-range by-value scalar formal means the
+                       callee provably never reads it, so a caller may elide the
+                       evaluation of a side-effect-free actual bound to it. No
+                       target/ABI guard: the mask is expressed in source-level
+                       parameter indices, valid for any target. A new tag adds no
+                       framing change (self-describing tag,len,payload), so per the
+                       policy above CurrentPPULongVersion is NOT bumped; -OoDEADPARA
+                       is opt-in and off in the defaults, so ordinary ppus emit no
+                       payload and keep their existing interface CRC. }
 
 { unit flags }
   uf_big_endian          = $000004;

@@ -936,7 +936,24 @@ interface
            of j (real reuse across both tiled loops).  Rectangular nest, all
            counters dead outside, unit ascending step, no range/overflow checking.
            Opt-in; NOT part of the -O4 defaults in this landing }
-         cs_opt_looptile
+         cs_opt_looptile,
+         { interprocedural dead-parameter elimination (-OoDEADPARA): part (a) of
+           the gcc -fipa-sra port. For a routine whose body provably never READS a
+           given by-value scalar parameter (a bottom-up per-formal reference mask
+           computed at the callee's codegen and serialized cross-unit via the
+           optsum_deadpara PPU tag), a later-compiled CALLER at a resolved DIRECT
+           call site stops EVALUATING that argument's side-effect-free, non-trapping
+           actual and passes a cheap constant instead -- the expensive dead
+           computation disappears without any signature change (Design 2:
+           caller-side argument-evaluation elision, sound cross-unit and even for
+           virtual/exported/address-taken callees since the callee is untouched;
+           opaque procvar/indirect/aggregate-return call sites are never rewritten).
+           Never elides var/out/const-by-ref, managed, hidden (self/parentfp/high/
+           result) or non-ordinal parameters, and never an actual that may trap or
+           have side effects (a call, a div, a deref, an overflow/range-checked or
+           float op). The record-splitting half (part (b)) and the WPO-wide variant
+           remain open. Opt-in; NOT part of the -O4 defaults }
+         cs_opt_dead_para
        );
        toptimizerswitches = set of toptimizerswitch;
 
@@ -1018,7 +1035,7 @@ interface
          'SHRINKWRAP','GVNPRE','PURE','PARTIALINLINE','STACKALLOC','SLP',
          'UNROLLDYN','PREFETCH','ICF','IPARA','FINALVALUE','SIBCALL',
          'REPORT','DEVIRT','IPACP','VECT256','CONSTEVAL','MODREF',
-         'APPROXTRANS','LOOPINTERCHANGE','LOOPTILE'
+         'APPROXTRANS','LOOPINTERCHANGE','LOOPTILE','DEADPARA'
        );
        WPOptimizerSwitchStr : array [twpoptimizerswitch] of string[14] = (
          'DEVIRTCALLS','OPTVMTS','SYMBOLLIVENESS'

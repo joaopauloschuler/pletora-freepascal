@@ -188,6 +188,7 @@ implementation
        optdevirt,
        optpure,
        optmodref,
+       optdeadpara,
        optpartialinline,
        optipacp,
        optconsteval,
@@ -2066,6 +2067,21 @@ implementation
          callees degrade to unknown-global. Opt-in via -OoMODREF. }
        if cs_opt_modref in current_settings.optimizerswitches then
          AnalyzeProcModref(procdef,code);
+
+       { interprocedural dead-parameter elimination (the gcc -fipa-sra idea,
+         part (a)): first REWRITE this routine's own resolved direct call sites --
+         eliding the evaluation of any side-effect-free actual bound to a formal a
+         callee (compiled earlier in this unit, or loaded from a used unit's ppu)
+         provably never reads -- THEN compute and record this routine's own
+         per-formal reference bitmap so later-compiled callers can do the same to
+         calls of this routine. Rewriting first lets a parameter that only fed an
+         elided actual cascade to dead in this routine too. Opt-in via -OoDEADPARA;
+         signature-preserving (caller-side elision), so sound cross-unit. }
+       if cs_opt_dead_para in current_settings.optimizerswitches then
+         begin
+           RewriteDeadParaCalls(procdef,code);
+           AnalyzeProcDeadPara(procdef,code,has_nestedprocs,flags);
+         end;
 
        { global value numbering + full-redundancy elimination: number
          side-effect-free scalar expressions across control flow and reuse a

@@ -2616,7 +2616,8 @@ const
          'cs_opt_modref',
          'cs_opt_approxtrans',
          'cs_opt_loopinterchange',
-         'cs_opt_looptile'
+         'cs_opt_looptile',
+         'cs_opt_dead_para'
        );
     var
          globalswitch  : tglobalswitch;
@@ -4665,6 +4666,8 @@ begin
                        end;
                      writeln;
                    end;
+                 optsum_deadpara:
+                   writeln([space,' Optimizer summary : DEADPARA  ref_mask=$',hexstr(ppufile.getdword,8),' (bit N set = paras[N] referenced; clear = provably never read)']);
                  else
                    begin
                      writeln([space,' Optimizer summary : unknown tag ',optsumtag,' (',optsumlen,' bytes)']);

@@ -1132,6 +1132,19 @@ interface
           modref_writes_pmask : dword;
           modref_reads_statics : array of ansistring;
           modref_writes_statics : array of ansistring;
+          { -OoDEADPARA (interprocedural dead-parameter elimination, part (a) of
+            the gcc -fipa-sra port): a per-formal REFERENCE bitmap over paras.
+              deadpara_analyzed : the mask was computed in THIS unit
+              deadpara_ppu_valid: the mask was loaded from a used unit's ppu
+              deadpara_ref_mask : bit N set = paras[N] is referenced (loaded) in
+                the body, or the routine was DISQUALIFIED (virtual/message/
+                external/asm/exported/nested/... -> every bit set). A CLEAR bit
+                for an in-range by-value scalar formal means the callee provably
+                never reads that parameter, so a resolved direct caller may elide
+                evaluating a side-effect-free actual bound to it (optdeadpara). }
+          deadpara_analyzed : boolean;
+          deadpara_ppu_valid : boolean;
+          deadpara_ref_mask : dword;
           constructor create(level:byte;doregister:boolean);virtual;
           constructor ppuload(ppufile:tcompilerppufile);
           destructor  destroy;override;
@@ -7164,6 +7177,9 @@ implementation
          modref_writes_pmask:=0;
          modref_reads_statics:=nil;
          modref_writes_statics:=nil;
+         deadpara_analyzed:=false;
+         deadpara_ppu_valid:=false;
+         deadpara_ref_mask:=high(dword);
       end;
 
 
@@ -7189,6 +7205,9 @@ implementation
          modref_writes_pmask:=0;
          modref_reads_statics:=nil;
          modref_writes_statics:=nil;
+         deadpara_analyzed:=false;
+         deadpara_ppu_valid:=false;
+         deadpara_ref_mask:=high(dword);
 {$ifdef symansistr}
          if po_has_mangledname in procoptions then
            _mangledname:=ppufile.getansistring
@@ -7601,6 +7620,19 @@ implementation
               ppufile.putansistring(modref_writes_statics[i]);
           end;
 
+        { -OoDEADPARA: persist the per-formal reference bitmap (one dword) so a
+          caller in another unit can elide the evaluation of an actual bound to a
+          provably-never-read by-value scalar formal. Only emitted when this
+          routine was actually analysed in this unit (=> -OoDEADPARA was on). No
+          target/ABI guard: the mask is expressed in source-level parameter
+          indices. }
+        if deadpara_analyzed then
+          begin
+            ppufile.putbyte(optsum_deadpara);
+            ppufile.putword(sizeof(dword));
+            ppufile.putdword(deadpara_ref_mask);
+          end;
+
         { terminator }
         ppufile.putbyte(optsum_end);
       end;
@@ -7632,6 +7664,8 @@ implementation
         modref_writes_pmask:=0;
         modref_reads_statics:=nil;
         modref_writes_statics:=nil;
+        deadpara_ppu_valid:=false;
+        deadpara_ref_mask:=high(dword);
         repeat
           tag:=ppufile.getbyte;
           if tag=optsum_end then
@@ -7664,6 +7698,11 @@ implementation
                 setlength(modref_writes_statics,ppufile.getbyte);
                 for i:=0 to high(modref_writes_statics) do
                   modref_writes_statics[i]:=ppufile.getansistring;
+              end;
+            optsum_deadpara:
+              begin
+                deadpara_ref_mask:=ppufile.getdword;
+                deadpara_ppu_valid:=true;
               end;
             optsum_ipara:
               begin
