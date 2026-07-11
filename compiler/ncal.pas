@@ -277,7 +277,7 @@ interface
           { on some targets, value parameters that are passed by reference must
             be copied to a temp location by the caller (and then a reference to
             this temp location must be passed) }
-          procedure copy_value_by_ref_para;
+          procedure copy_value_by_ref_para(forinline: boolean);
        public
           { in case of copy-out parameters: initialization code, and the code to
             copy back the parameter value after the call (including any required
@@ -789,18 +789,24 @@ implementation
       end;
 
 
-    procedure tcallparanode.copy_value_by_ref_para;
+    procedure tcallparanode.copy_value_by_ref_para(forinline: boolean);
       var
         initstat,
         finistat: tstatementnode;
         finiblock: tblocknode;
         paratemp: ttempcreatenode;
         arraysize,
-        arraybegin: tnode;
-        lefttemp: ttempcreatenode;
+        arraybegin,
+        arraycount: tnode;
+        lefttemp,
+        counttemp: ttempcreatenode;
+        highpara: tcallparanode;
+        elementdef,
         vardatatype,
         temparraydef: tdef;
       begin
+        arraycount:=nil;
+        elementdef:=nil;
         { this routine is for targets where by-reference value parameters need
           to be copied by the caller. It's basically the node-level equivalent
           of thlcgobj.g_copyvalueparas }
@@ -826,6 +832,14 @@ implementation
                 is_open_array(parasym.vardef)) then
               begin
                  paratemp:=ctempcreatenode.create(voidpointertype,voidpointertype.size,tt_persistent,true);
+                 { FPC Unleashed (tasklist L251): for an inlined call there is no
+                   separate callee to ref-count / finalize the managed elements of
+                   the private copy, so arraycount (the element count) is captured
+                   below in each branch and used to addref/finalize them here. }
+                 if forinline and
+                    (is_open_array(parasym.vardef) or is_array_of_const(parasym.vardef)) and
+                    is_managed_type(tarraydef(parasym.vardef).elementdef) then
+                   elementdef:=tarraydef(parasym.vardef).elementdef;
                  if is_dynamic_array(left.resultdef) then
                    begin
                       { note that in insert_typeconv, this dynamic array was
@@ -860,13 +874,35 @@ implementation
                        ),
                        genintconstnode(tarraydef(temparraydef).elementdef.size)
                      );
+                     if assigned(elementdef) then
+                       arraycount:=geninlinenode(in_length_x,false,
+                         ctypeconvnode.create_explicit(ctemprefnode.create(lefttemp),
+                           temparraydef));
                    end
                  else
                    begin
                      { no problem here that left is used multiple times, as
                        sizeof() will simply evaluate to the high parameter }
                      arraybegin:=left.getcopy;
+                     { element count = high + 1 (via the hidden high parameter);
+                       capture it before sizeof() consumes left below }
+                     if assigned(elementdef) then
+                       arraycount:=caddnode.create(addn,
+                         geninlinenode(in_high_x,false,left.getcopy),
+                         genintconstnode(1));
                      arraysize:=geninlinenode(in_sizeof_x,false,left);
+                   end;
+                 { latch the element count into its own temp: the dynamic-array
+                   count reads lefttemp, which is released in the cleanup block
+                   before the finalize below would reference it }
+                 counttemp:=nil;
+                 if assigned(arraycount) then
+                   begin
+                     counttemp:=ctempcreatenode.create(sizesinttype,sizesinttype.size,tt_persistent,false);
+                     addstatement(initstat,counttemp);
+                     addstatement(initstat,
+                       cassignmentnode.create(ctemprefnode.create(counttemp),arraycount));
+                     arraycount:=nil;
                    end;
                  addstatement(initstat,paratemp);
                  { paratemp:=getmem(sizeof(para)) }
@@ -909,6 +945,38 @@ implementation
                    assember functions (and we can't know that 100% certain here,
                    e.g. in case of external declarations) (*) }
 
+                 { FPC Unleashed (tasklist L251): for an inlined call the copy has
+                   no callee to adopt the references, so ref-count the managed
+                   elements of the fresh block now (copy-on-write: the caller's
+                   originals keep their own count) and finalize them before the
+                   block is freed (heaptrc-clean). }
+                 if assigned(counttemp) then
+                   begin
+                     addstatement(initstat,
+                       cifnode.create_internal(
+                         caddnode.create_internal(unequaln,ctemprefnode.create(counttemp),genintconstnode(0)),
+                         ccallnode.createintern('fpc_addref_array',
+                           ccallparanode.create(
+                             ctemprefnode.create(counttemp),
+                             ccallparanode.create(
+                               caddrnode.create_internal(crttinode.create(tstoreddef(elementdef),initrtti,rdt_normal)),
+                               ccallparanode.create(
+                                 ctypeconvnode.create_internal(ctemprefnode.create(paratemp),voidpointertype),nil)))),
+                         nil));
+                     addstatement(finistat,
+                       cifnode.create_internal(
+                         caddnode.create_internal(unequaln,ctemprefnode.create(counttemp),genintconstnode(0)),
+                         ccallnode.createintern('fpc_finalize_array',
+                           ccallparanode.create(
+                             ctemprefnode.create(counttemp),
+                             ccallparanode.create(
+                               caddrnode.create_internal(crttinode.create(tstoreddef(elementdef),initrtti,rdt_normal)),
+                               ccallparanode.create(
+                                 ctypeconvnode.create_internal(ctemprefnode.create(paratemp),voidpointertype),nil)))),
+                         nil));
+                     addstatement(finistat,ctempdeletenode.create(counttemp));
+                   end;
+
                  { free the memory again after the call: freemem(paratemp) }
                  addstatement(finistat,
                    ccallnode.createintern('fpc_freemem',
@@ -923,6 +991,96 @@ implementation
                  left:=ctypeconvnode.create_internal(
                    cderefnode.create(ctemprefnode.create(paratemp)),
                    left.resultdef);
+              end
+            { FPC Unleashed (tasklist L251): an INLINED by-value open-array
+              parameter whose actual does NOT present as an array here -- a
+              plain static array (Array[lo..hi]) or a SLICE (a[i..j], which the
+              boundary conversion lowers to a single-element-typed reference at
+              the slice start) -- must still be copied as a runtime-length open
+              array.  The generic managed/else branches below would copy it as a
+              single element (slice) or without element ref-counting (static
+              managed base), so handle it here: element count = high + 1 (the
+              hidden high parameter, located as the sibling callparanode that
+              precedes this one), data start = @left (the first element), the
+              managed elements ref-counted for copy-on-write and finalized so
+              heaptrc stays clean. }
+            else if forinline and
+                    (is_open_array(parasym.vardef) or is_array_of_const(parasym.vardef)) then
+              begin
+                elementdef:=tarraydef(parasym.vardef).elementdef;
+                { locate the hidden high parameter (the callparanode whose right
+                  link is this array parameter) }
+                arraybegin:=nil;
+                highpara:=tcallparanode(callnode.left);
+                while assigned(highpara) and (highpara.right<>self) do
+                  highpara:=tcallparanode(highpara.right);
+                if assigned(highpara) and assigned(highpara.parasym) and
+                   (vo_is_high_para in highpara.parasym.varoptions) then
+                  arraybegin:=highpara.left.getcopy
+                else
+                  internalerror(2026071101);
+                { counttemp := high + 1 }
+                counttemp:=ctempcreatenode.create(sizesinttype,sizesinttype.size,tt_persistent,false);
+                addstatement(initstat,counttemp);
+                addstatement(initstat,
+                  cassignmentnode.create(ctemprefnode.create(counttemp),
+                    caddnode.create(addn,arraybegin,genintconstnode(1))));
+                { paratemp := getmem(count * elesize) }
+                paratemp:=ctempcreatenode.create(voidpointertype,voidpointertype.size,tt_persistent,true);
+                addstatement(initstat,paratemp);
+                addstatement(initstat,
+                  cassignmentnode.create(ctemprefnode.create(paratemp),
+                    ccallnode.createintern('fpc_getmem',
+                      ccallparanode.create(
+                        caddnode.create(muln,ctemprefnode.create(counttemp),
+                          genintconstnode(elementdef.size)),nil))));
+                { if count<>0: MOVE(left, paratemp^, count*elesize) -- @left is the
+                  first element, i.e. the contiguous data start }
+                addstatement(initstat,
+                  cifnode.create_internal(
+                    caddnode.create_internal(unequaln,ctemprefnode.create(counttemp),genintconstnode(0)),
+                    ccallnode.createintern('MOVE',
+                      ccallparanode.create(
+                        caddnode.create(muln,ctemprefnode.create(counttemp),
+                          genintconstnode(elementdef.size)),
+                        ccallparanode.create(
+                          cderefnode.create(ctemprefnode.create(paratemp)),
+                          ccallparanode.create(left,nil)))),
+                    nil));
+                { managed base: ref-count the fresh copy's elements, finalize
+                  them before the block is freed }
+                if is_managed_type(elementdef) then
+                  begin
+                    addstatement(initstat,
+                      cifnode.create_internal(
+                        caddnode.create_internal(unequaln,ctemprefnode.create(counttemp),genintconstnode(0)),
+                        ccallnode.createintern('fpc_addref_array',
+                          ccallparanode.create(
+                            ctemprefnode.create(counttemp),
+                            ccallparanode.create(
+                              caddrnode.create_internal(crttinode.create(tstoreddef(elementdef),initrtti,rdt_normal)),
+                              ccallparanode.create(
+                                ctypeconvnode.create_internal(ctemprefnode.create(paratemp),voidpointertype),nil)))),
+                        nil));
+                    addstatement(finistat,
+                      cifnode.create_internal(
+                        caddnode.create_internal(unequaln,ctemprefnode.create(counttemp),genintconstnode(0)),
+                        ccallnode.createintern('fpc_finalize_array',
+                          ccallparanode.create(
+                            ctemprefnode.create(counttemp),
+                            ccallparanode.create(
+                              caddrnode.create_internal(crttinode.create(tstoreddef(elementdef),initrtti,rdt_normal)),
+                              ccallparanode.create(
+                                ctypeconvnode.create_internal(ctemprefnode.create(paratemp),voidpointertype),nil)))),
+                        nil));
+                  end;
+                addstatement(finistat,
+                  ccallnode.createintern('fpc_freemem',
+                    ccallparanode.create(ctemprefnode.create(paratemp),nil)));
+                addstatement(finistat,ctempdeletenode.create(counttemp));
+                { view the copy as the callee's open array (parasym.vardef) }
+                left:=ctypeconvnode.create_internal(
+                  cderefnode.create(ctemprefnode.create(paratemp)),parasym.vardef);
               end
             else if is_shortstring(parasym.vardef) then
               begin
@@ -993,8 +1151,27 @@ implementation
             addstatement(finistat,ctempdeletenode.create(paratemp));
             callnode.add_done_statement(finiblock);
 
-            firstpass(fparainit);
-            firstpass(left);
+            { arraycount is only ever used through getcopy above }
+            arraycount.free;
+
+            { FPC Unleashed (tasklist L251): for an inlined call the whole call
+              node (with its callinitblock/callcleanupblock) is spliced by
+              getcopy, but fparainit is NOT part of that copy -- leaving the
+              paratemp's create in fparainit while its delete rides
+              callcleanupblock double-frees the temp (internalerror 200108234).
+              Route the setup through the call's own init block (like
+              handlemanagedbyrefpara) so create and delete are copied together. }
+            if forinline then
+              begin
+                callnode.add_init_statement(fparainit);
+                fparainit:=nil;
+                firstpass(left);
+              end
+            else
+              begin
+                firstpass(fparainit);
+                firstpass(left);
+              end;
           end;
       end;
 
@@ -1155,7 +1332,20 @@ implementation
            paramanager.push_addr_param(vs_value,parasym.vardef,
                       callnode.procdefinition.proccalloption) and
            not(cnf_do_inline in callnode.callnodeflags) then
-          copy_value_by_ref_para;
+          copy_value_by_ref_para(false)
+        { FPC Unleashed (tasklist L251): an INLINED call passing an array to a
+          BY-VALUE open-array / array-of-const parameter needs the same private
+          runtime-length copy, but the callee is spliced in (no callee-side copy
+          at codegen), so build it here on every target with element ref-counting
+          + finalization folded in (forinline=true).  An array constructor actual
+          is already a fresh temp, so copy_value_by_ref_para leaves it untouched. }
+        else if assigned(callnode) and
+           (cnf_do_inline in callnode.callnodeflags) and
+           assigned(parasym) and (parasym.varspez=vs_value) and
+           (left.nodetype<>nothingn) and
+           not(vo_has_local_copy in parasym.varoptions) and
+           (is_open_array(parasym.vardef) or is_array_of_const(parasym.vardef)) then
+          copy_value_by_ref_para(true);
 
         if assigned(fparainit) then
           firstpass(fparainit);
@@ -5771,6 +5961,21 @@ implementation
         { check if we have to create a temp, assign the parameter's
           contents to that temp and then substitute the parameter
           with the temp everywhere in the function                  }
+        { FPC Unleashed (tasklist L251): a BY-VALUE open-array / array-of-const
+          parameter has no compile-time size for the generic temp path below
+          (tarraydef.size internalerrors 99080501 on an open array).  The private
+          runtime-length copy the callee needs was already built target-neutrally
+          by copy_value_by_ref_para(forinline=true) in firstcallparan (a getmem'd
+          block, element-wise MOVE, managed elements ref-counted and finalized so
+          copy-on-write and heaptrc stay correct); para.left is now a dereference
+          of that copy (an array constructor actual is a fresh temp and needs no
+          copy).  Either way the actual is already a private value, so insert it
+          directly -- replaceparaload re-views it as the callee's 0-based open
+          array and the hidden high parameter still carries the length. }
+        if (para.parasym.varspez=vs_value) and
+           (is_open_array(para.parasym.vardef) or is_array_of_const(para.parasym.vardef)) then
+          exit(true);
+
         if paraneedsinlinetemp(para,pushconstaddr,complexpara) then
           begin
             tempnode:=ctempcreatenode.create(para.parasym.vardef,para.parasym.vardef.size,

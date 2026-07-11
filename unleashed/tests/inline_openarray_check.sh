@@ -12,9 +12,12 @@
 # Static arrays (any base), array constructors, slices, open strings and
 # passed-through open arrays all inline correctly.
 #
-# A DYNAMIC array actual is itself a pointer to its data and the spliced access
-# derefs the param location once more (one indirection too many); those calls
-# STAY out of line (a precise note) and run correctly.
+# A DYNAMIC array actual has the dynarray->openarray boundary rebuilt in the
+# splice (ncal.replaceparaload) and inlines too.  A BY-VALUE open array / array
+# of const also inlines: its private runtime-length copy is built at the call
+# boundary (copy_value_by_ref_para, forinline=true) -- element count from the
+# hidden high parameter, element-wise copy, managed elements ref-counted and
+# finalized so copy-on-write and heaptrc stay correct.
 #
 # Usage: unleashed/tests/inline_openarray_check.sh [path-to-ppcx64]
 set -uo pipefail
@@ -203,38 +206,86 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# Part D3: a BY-VALUE open array of a managed base keeps copy-on-write correct.
-# The inline copy-temp machinery cannot size an open array (tarraydef.size
-# internalerror 99080501), so a by-value open-array parameter stays out of line;
-# its callee-local copy must be mutated without disturbing the caller's array.
+# Part D3: a BY-VALUE open array now INLINES.  The private runtime-length copy
+# is built target-neutrally at the call boundary (copy_value_by_ref_para with
+# forinline=true): element count from the hidden high parameter, an element-wise
+# copy, and -- for a managed base (array of AnsiString) -- the copied elements
+# ref-counted and finalized.  Assert, for STATIC, DYNAMIC and SLICE actuals:
+#   * the call disappears (no `call` to the routine),
+#   * output is bit-identical to the out-of-line (-dNOINL) reference,
+#   * mutating the callee-local copy does NOT leak back to the caller's array
+#     (value semantics), and
+#   * a managed base leaves no leaks under -gh (heaptrc reports 0 unfreed).
 # ---------------------------------------------------------------------------
 cat > "$tmp/d3.pp" <<'EOF'
-{$mode objfpc}{$H+}
+{$mode objfpc}{$H+}{$ifdef NOINL}{$inline off}{$endif}
 program d3;
-function Wrap(a: array of ansistring): ansistring; inline;   { by-value, mutated }
+{ managed base, by-value, mutated }
+function Wrap(a: array of ansistring): ansistring; inline;
 var i: longint;
 begin
   for i := 0 to high(a) do a[i] := '<'+a[i]+'>';
   Wrap := '';
   for i := 0 to high(a) do Wrap := Wrap + a[i];
 end;
-var d: array of ansistring;
+{ non-managed base, by-value, mutated }
+function DSum(a: array of longint): longint; inline;
+var i: longint;
+begin DSum := 0; for i := 0 to high(a) do begin a[i] := a[i]*2; DSum := DSum + a[i]; end; end;
+var
+  ms: array[0..2] of ansistring = ('foo','bar','baz');   { static managed }
+  md: array of ansistring;                               { dynamic managed }
+  ls: array[1..3] of longint = (5,6,7);                  { static non-zero base }
+  ld: array of longint;                                  { dynamic }
 begin
-  setlength(d, 3); d[0]:='foo'; d[1]:='bar'; d[2]:='baz';
-  writeln(Wrap(d));               { <foo><bar><baz> }
-  writeln(d[0], d[1], d[2]);      { foobarbaz -- originals untouched (COW) }
+  setlength(md, 3); md[0]:='aa'; md[1]:='bb'; md[2]:='cc';
+  setlength(ld, 3); ld[0]:=10; ld[1]:=20; ld[2]:=30;
+  { static / dynamic / slice actuals, managed and non-managed }
+  writeln(Wrap(ms), ' | ', ms[0], ms[1], ms[2]);          { copy mutated, originals intact }
+  writeln(Wrap(md), ' | ', md[0], md[1], md[2]);
+  writeln(Wrap(md[0..1]), ' | ', md[0], md[1], md[2]);
+  writeln(DSum(ls), ' | ', ls[1], ' ', ls[2], ' ', ls[3]);
+  writeln(DSum(ld), ' | ', ld[0], ' ', ld[1], ' ', ld[2]);
+  writeln(DSum(ls[1..2]), ' | ', ls[1], ' ', ls[2], ' ', ls[3]);
 end.
 EOF
-noteD3="$(run "$CC" -Fu"$RTL" -vd -O3 -al -FE"$tmp" "$tmp/d3.pp" 2>&1)"
-if [ -f "$tmp/d3.s" ]; then
-  echo "$noteD3" | grep -Eq 'by-value open array' \
-    || fail "Part D3: by-value open-array refusal note missing"
-  [ "$(ncalls WRAP "$tmp/d3.s")" -ge 1 ] || fail "Part D3: Wrap unexpectedly inlined"
+# out-of-line reference
+if run "$CC" -Fu"$RTL" -dNOINL -O3 -FE"$tmp" "$tmp/d3.pp" >/dev/null 2>&1; then
+  cp "$tmp/d3" "$tmp/d3_ref"; refD3="$(run "$tmp/d3_ref" 2>&1)"
+else fail "Part D3: reference (no-inline) compile failed"; refD3="?"; fi
+if run "$CC" -Fu"$RTL" -O3 -al -FE"$tmp" "$tmp/d3.pp" >/dev/null 2>&1; then
+  [ "$(ncalls WRAP "$tmp/d3.s")" = 0 ] || fail "Part D3: Wrap (by-value) NOT inlined (call present)"
+  [ "$(ncalls DSUM "$tmp/d3.s")" = 0 ] || fail "Part D3: DSum (by-value) NOT inlined (call present)"
   out="$(run "$tmp/d3" 2>&1)"
-  [ "$out" = "$(printf '<foo><bar><baz>\nfoobarbaz')" ] \
-    || fail "Part D3: wrong output / COW violated [$out]"
+  exp="$(printf '<foo><bar><baz> | foobarbaz\n<aa><bb><cc> | aabbcc\n<aa><bb> | aabbcc\n36 | 5 6 7\n120 | 10 20 30\n22 | 5 6 7')"
+  [ "$out" = "$exp" ] || fail "Part D3: wrong output / value semantics violated [$out]"
+  [ "$out" = "$refD3" ] || fail "Part D3: inlined output != out-of-line reference"
 else
-  fail "Part D3: compile failed"
+  fail "Part D3: inline compile failed"
+fi
+# managed base leaves no leaks under -gh (heaptrc)
+cat > "$tmp/d3h.pp" <<'EOF'
+{$mode objfpc}{$H+}
+program d3h;
+function Wrap(a: array of ansistring): ansistring; inline;
+var i: longint;
+begin
+  for i := 0 to high(a) do a[i] := '<'+a[i]+'>';
+  Wrap := '';
+  for i := 0 to high(a) do Wrap := Wrap + a[i];
+end;
+var ms: array[0..2] of ansistring = ('foo','bar','baz'); md, e: array of ansistring;
+begin
+  setlength(md, 3); md[0]:='aa'; md[1]:='bb'; md[2]:='cc';
+  writeln(Wrap(ms), Wrap(md), Wrap(md[0..1]), '[', Wrap(e), ']');  { incl empty/nil }
+end.
+EOF
+if run "$CC" -Fu"$RTL" -O3 -gh -FE"$tmp" "$tmp/d3h.pp" >/dev/null 2>&1; then
+  ghout="$(run "$tmp/d3h" 2>&1)"
+  echo "$ghout" | grep -Eq '(^|[^0-9])0 unfreed memory blocks' \
+    || fail "Part D3: heaptrc reports leaks for a managed by-value copy [$(echo "$ghout" | grep -i unfreed)]"
+else
+  fail "Part D3: -gh compile failed"
 fi
 
 # ---------------------------------------------------------------------------
@@ -261,6 +312,6 @@ else
 fi
 
 if [ "$rc" -eq 0 ]; then
-  echo "PASS: open-array/array-of-const params inline at -O3 (static any-base re-based, constructor/slice/open-string/pass-through/var all correct, array of const inlines); dynamic-array actuals (incl. managed base and empty/nil) now inline and match the out-of-line reference; by-value open arrays stay out of line with copy-on-write intact"
+  echo "PASS: open-array/array-of-const params inline at -O3 (static any-base re-based, constructor/slice/open-string/pass-through/var all correct, array of const inlines); dynamic-array actuals (incl. managed base and empty/nil) inline and match the out-of-line reference; by-value open arrays now inline too (static/dynamic/slice, managed and non-managed) with a runtime-length private copy -- value semantics preserved, bit-identical to the out-of-line reference, heaptrc-clean under -gh"
 fi
 exit "$rc"

@@ -453,32 +453,23 @@ implementation
           (ncal.replaceparaload).  `array of const` actuals are always `[...]`
           constructors (0-based), so those inline unconditionally.
 
-          Two shapes still keep a refusal:
-            - `array of variant` is NOT covered by the open-array re-basing path
-              (is_open_array is false for it) and can take a differently-based
-              static actual;
-            - a BY-VALUE (vs_value) open array / array of const needs a private
-              copy of the array inside the callee, but the inline copy-temp
-              machinery (tcallnode.maybecreateinlineparatemp) creates that temp
-              from the parameter's own vardef and asks for its .size -- which an
-              open array does not have (tarraydef.size internalerrors 99080501).
-              Out-of-line these are copied by copy_value_by_ref_para with a
-              runtime-sized heap block; reproducing that in the splice is not done,
-              so keep them out of line (this also keeps copy-on-write of a managed
-              base trivially correct).  const/var/out open arrays are passed by
-              reference and need no such copy, so they inline. }
+          `array of variant` keeps a refusal: it is NOT covered by the
+          open-array re-basing path (is_open_array is false for it) and can take
+          a differently-based static actual.
+
+          A BY-VALUE (vs_value) open array / array of const needs a private copy
+          of the array inside the callee.  The generic inline copy-temp machinery
+          cannot size such a temp (an open array has no compile-time size --
+          tarraydef.size internalerrors 99080501), so the copy is instead built
+          target-neutrally at the call boundary by copy_value_by_ref_para
+          (forinline=true, in ncal.firstcallparan): a runtime-sized heap block,
+          element-wise MOVE, with managed elements ref-counted and finalized so
+          copy-on-write and heaptrc stay correct.  These now inline. }
         for i:=0 to procdef.paras.count-1 do
           begin
             if is_variant_array(tparavarsym(procdef.paras[i]).vardef) then
               begin
                 _no_inline('array of variant');
-                exit;
-              end;
-            if (tparavarsym(procdef.paras[i]).varspez=vs_value) and
-               (is_open_array(tparavarsym(procdef.paras[i]).vardef) or
-                is_array_of_const(tparavarsym(procdef.paras[i]).vardef)) then
-              begin
-                _no_inline('by-value open array / array of const parameter');
                 exit;
               end;
           end;
