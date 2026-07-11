@@ -438,6 +438,8 @@ implementation
                 addn: v:=lv+rv;
                 subn: v:=lv-rv;
                 muln: v:=lv*rv;
+                else
+                  ; { unreachable: outer case matched add/sub/mul }
               end;
               v:=trunc_to(v,n.resultdef);
               result:=true;
@@ -463,6 +465,8 @@ implementation
                 lten:     b:=lv<=rv;
                 gtn:      b:=lv>rv;
                 gten:     b:=lv>=rv;
+                else
+                  begin b:=false; { unreachable: outer case matched a relop } end;
               end;
               v:=make_cei(ord(b),false);
               result:=true;
@@ -478,6 +482,8 @@ implementation
                     andn: b:=(lv.uvalue<>0) and (rv.uvalue<>0);
                     orn:  b:=(lv.uvalue<>0) or (rv.uvalue<>0);
                     xorn: b:=(lv.uvalue<>0) xor (rv.uvalue<>0);
+                    else
+                      begin b:=false; { unreachable: outer case matched and/or/xor } end;
                   end;
                   v:=make_cei(ord(b),false);
                 end
@@ -487,6 +493,8 @@ implementation
                     andn: v:=lv and rv;
                     orn:  v:=lv or rv;
                     xorn: v:=lv xor rv;
+                    else
+                      ; { unreachable: outer case matched and/or/xor }
                   end;
                   v:=trunc_to(v,n.resultdef);
                 end;
