@@ -645,9 +645,10 @@ implementation
                     end;
                   resreg:=regc;
                 end;
-              else
-                internalerror(2026071102);
             end;
+            { every ttranscfunc value (tf_exp/tf_tanh/tf_sigmoid) assigns resreg
+              above, so the case is exhaustive; an added enum value would surface
+              as an uninitialised-resreg use here rather than a dead else branch. }
 
             { store resreg to a[i..i+VL-1] }
             secondpass(left);
