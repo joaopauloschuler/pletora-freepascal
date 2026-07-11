@@ -6883,6 +6883,47 @@ unit optloop;
       end;
 
 
+    function ujam_bound_variant_cb(var n : tnode; arg : pointer) : foreachnoderesult;
+      { Flags anything in an inner-loop bound expression that makes it NOT
+        provably invariant across the K consecutive outer iterations the jam
+        collapses into one inner loop.  Unroll-and-jam drives all K unrolled
+        inner-body copies with a SINGLE inner loop, so the shared bound must
+        have the same value for outer iterations i, i+1, ..., i+K-1.  Reject:
+          * a read of the outer counter i or the inner counter j (varies with
+            the outer iteration, resp. self-referential);
+          * a read of a renamed scalar accumulator (the body writes it);
+          * ANY memory indirection -- an array element (vecn, e.g.
+            msgidxmax[i]), a pointer target (derefn), a record/object field
+            (subscriptn) -- because the outer body may write it and/or it may
+            vary with the outer counter;
+          * a call or inline intrinsic (side effects / unknown value).
+        Only compile-time constants and reads of simple scalar variables the
+        body never writes survive, which is exactly the classic rectangular
+        nest (constant or outer-invariant inner bounds). }
+      var
+        ps : pujam_scan;
+        a : longint;
+      begin
+        result:=fen_false;
+        ps:=pujam_scan(arg);
+        case n.nodetype of
+          vecn,derefn,addrn,subscriptn,calln,inlinen:
+            exit(fen_norecurse_true);
+          loadn:
+            begin
+              if (tloadnode(n).symtableentry=ps^.counter_i) or
+                 (tloadnode(n).symtableentry=ps^.counter_j) then
+                exit(fen_norecurse_true);
+              for a:=0 to ps^.naccums-1 do
+                if tloadnode(n).symtableentry=ps^.accsyms[a] then
+                  exit(fen_norecurse_true);
+            end;
+          else
+            ;
+        end;
+      end;
+
+
     function ujam_body_cb(var n : tnode; arg : pointer) : foreachnoderesult;
       { validates every construct in the outer-loop body against the legality rule
         above and, as a side effect, records the (single) inner counter, the set
@@ -7244,6 +7285,24 @@ unit optloop;
           if idx<0 then
             exit('the nested loop is not a direct statement of the outer body');
           innerfor:=tfornode(tmparr[idx]);
+
+          { The jam collapses the K per-outer-iteration inner loops into ONE
+            loop, driven by a single copy of the inner bounds.  That is only
+            sound when the inner bounds have the same value for the K
+            consecutive outer iterations i..i+K-1, i.e. are invariant w.r.t.
+            the outer counter.  A bound that reads the outer counter, a renamed
+            accumulator, or memory the outer body may write (an array element
+            such as msgidxmax[i], a pointer target, a field, a call) can differ
+            per outer row -- jamming it would drive the K different-length inner
+            bodies with one wrong trip count and write out of each row's range.
+            Note the iload_total=iload_subscript rule above does NOT cover this:
+            msgidxmax[i] is a "bare array subscript" of i, so it passes there. }
+          if foreachnodestatic(innerfor.right,@ujam_bound_variant_cb,@scan) or
+             foreachnodestatic(innerfor.t1,@ujam_bound_variant_cb,@scan) or
+             (assigned(innerfor.loopstep) and
+              foreachnodestatic(innerfor.loopstep,@ujam_bound_variant_cb,@scan)) then
+            exit('inner loop bounds are not invariant across the unrolled outer iterations (depend on the outer counter or memory the body may write)');
+
           SetLength(prologue,idx);
           nprologue:=idx;
           for i2:=0 to idx-1 do
