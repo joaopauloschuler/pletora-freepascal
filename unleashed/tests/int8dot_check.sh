@@ -88,7 +88,9 @@ imul_re='(^|[^[:alnum:]])imul[lq]?[[:space:]]'
 rc=0
 
 # ---- baseline WITHOUT INT8DOT: stays scalar (its imul count is the reference) ----
-compile k8.pp -Cfsse64
+# -OoINT8DOT is now in the -O4 default set (compile() uses -O4), so the OFF case
+# disables it explicitly with the -OoNOINT8DOT negative switch.
+compile k8.pp -OoNOINT8DOT -Cfsse64
 s="$tmp/k8.s"
 mac_off=$(grep -cE '(^|[^v])pmaddwd' "$s" || true)
 imul_off=$(grep -cE "$imul_re" "$s" || true)

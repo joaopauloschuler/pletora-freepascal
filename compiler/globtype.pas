@@ -974,8 +974,12 @@ interface
            (a 64-bit accumulator would not wrap at 32 bits per lane) and refuses
            under -Co/-Cr (a checked reduction is left scalar).  128-bit xmm baseline
            (VF=8); 256-bit ymm (VF=16) under -OoVECT256 on an AVX2 fputype; scalar
-           remainder tail.  Opt-in; NOT part of the -O4 defaults.  AVX-512 VNNI
-           (vpdpbusd) and the neural-api int8-storage adaptation remain open }
+           remainder tail.  Part of the -O4 default optimizer set (promoted after
+           the forced-suite/self-host/torture/pf-bench evaluation; the widening
+           MAC is bit-identical to the wrapping scalar reference for all inputs).
+           128-bit xmm at plain -O4; 256-bit ymm still gated behind opt-in
+           -OoVECT256.  AVX-512 VNNI (vpdpbusd) and the neural-api int8-storage
+           adaptation remain open }
          cs_opt_int8dot
        );
        toptimizerswitches = set of toptimizerswitch;
@@ -1093,7 +1097,7 @@ interface
        genericlevel3optimizerswitches = [cs_opt_level3,cs_opt_constant_propagate,cs_opt_nodedfa,cs_opt_loopstrength
                                          {$ifndef llvm},cs_opt_use_load_modify_store{$endif},
                                          cs_opt_loopunroll,cs_opt_forloop];
-       genericlevel4optimizerswitches = [cs_opt_level4,cs_opt_reorder_fields,cs_opt_dead_values,cs_opt_fastmath,cs_opt_loopmotion,cs_opt_loopunswitch,cs_opt_bitidiom,cs_opt_rangecheckelim,cs_opt_jumpthread,cs_opt_loopdistpat,cs_opt_looppeel,cs_opt_loopsplit,cs_opt_loopfuse,cs_opt_ifconvert,cs_opt_reassoc,cs_opt_unrolljam,cs_opt_predcom,cs_opt_sra,cs_opt_storemerge,cs_opt_casecluster,cs_opt_crossjump,cs_opt_blockorder,cs_opt_sink,cs_opt_storemotion,cs_opt_vrp,cs_opt_switchtable,cs_opt_ree,cs_opt_vectorize,cs_opt_devirt,cs_opt_dead_para];
+       genericlevel4optimizerswitches = [cs_opt_level4,cs_opt_reorder_fields,cs_opt_dead_values,cs_opt_fastmath,cs_opt_loopmotion,cs_opt_loopunswitch,cs_opt_bitidiom,cs_opt_rangecheckelim,cs_opt_jumpthread,cs_opt_loopdistpat,cs_opt_looppeel,cs_opt_loopsplit,cs_opt_loopfuse,cs_opt_ifconvert,cs_opt_reassoc,cs_opt_unrolljam,cs_opt_predcom,cs_opt_sra,cs_opt_storemerge,cs_opt_casecluster,cs_opt_crossjump,cs_opt_blockorder,cs_opt_sink,cs_opt_storemotion,cs_opt_vrp,cs_opt_switchtable,cs_opt_ree,cs_opt_vectorize,cs_opt_devirt,cs_opt_dead_para,cs_opt_int8dot];
 
        { whole program optimizations whose information generation requires
          information from all loaded units
