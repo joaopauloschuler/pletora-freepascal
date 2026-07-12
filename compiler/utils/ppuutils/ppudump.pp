@@ -2618,7 +2618,8 @@ const
          'cs_opt_loopinterchange',
          'cs_opt_looptile',
          'cs_opt_dead_para',
-         'cs_opt_int8dot'
+         'cs_opt_int8dot',
+         'cs_opt_gather'
        );
     var
          globalswitch  : tglobalswitch;

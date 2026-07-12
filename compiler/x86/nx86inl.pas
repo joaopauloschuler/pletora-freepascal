@@ -351,7 +351,7 @@ implementation
         (scalarleft=true), matching the source's non-commutative order. }
       var
         regb, regc, regs, resreg, regacc, regt : tregister;
-        regacc_x, regs_x, reghi, rega16, regb16, hreg : tregister;
+        regacc_x, regs_x, reghi, rega16, regb16, hreg, gbase, regmask : tregister;
         opps, movop, addop, mulop, xorop, movsop, fmaop : tasmop;
         refb, refc, refa, refsplat, refacc : treference;
         avx, dbl, use_packed_fma, use256, isint8, has_sxbw : boolean;
@@ -536,6 +536,69 @@ implementation
               current_asmdata.CurrAsmList.concat(taicpu.op_reg_reg_reg(addop,S_NO,regb,regacc,regacc))
             else
               current_asmdata.CurrAsmList.concat(taicpu.op_reg_reg(addop,S_NO,regb,regacc));
+            location_reset(location,LOC_VOID,OS_NO);
+            exit;
+          end;
+
+        { --- gather reduction body (-OoGATHER): accreg := accreg + a[idx[i..i+VF-1]]
+          via an AVX2 vgatherdps.  The VF consecutive int32 indices are loaded
+          contiguously from &idx[i] (left) into a vector register; the gathered
+          array's base &a[0] (right) is loaded into a GP register to form the VSIB
+          reference [base + indexreg*4]; an all-ones mask (re-created each iteration,
+          since the gather zeroes it) gathers every lane; the gathered single window
+          is added into the register-resident float accumulator.  AVX2-only: use256
+          selects ymm (VF=8) vs xmm (VF=4) exactly like the plain float sum body. --- }
+        if kind=vok_gather_body then
+          begin
+            if not (assigned(redctx) and redctx^.seeded) then
+              internalerror(2026071110);
+            regacc:=redctx^.accreg;
+            { load the VF contiguous int32 index window from &idx[i] (left) }
+            secondpass(left);
+            if not (left.location.loc in [LOC_REFERENCE,LOC_CREFERENCE]) then
+              internalerror(2026071111);
+            refb:=left.location.reference;
+            tcgx86(cg).make_simple_ref(current_asmdata.CurrAsmList,refb);
+            regb:=cg.getmmregister(current_asmdata.CurrAsmList,mmsize);
+            current_asmdata.CurrAsmList.concat(taicpu.op_ref_reg(A_VMOVDQU,S_NO,refb,regb));
+            { VSIB base &a[0] (right) into a GP register, so [gbase + regb*4] indexes
+              a[idx] lane by lane }
+            secondpass(right);
+            if not (right.location.loc in [LOC_REFERENCE,LOC_CREFERENCE]) then
+              internalerror(2026071112);
+            refc:=right.location.reference;
+            gbase:=cg.getaddressregister(current_asmdata.CurrAsmList);
+            cg.a_loadaddr_ref_reg(current_asmdata.CurrAsmList,refc,gbase);
+            reference_reset_base(refa,gbase,0,refc.temppos,4,refc.volatility);
+            refa.index:=regb;
+            refa.scalefactor:=4;
+            { all-ones gather mask -- vpcmpeqd r,r,r sets every bit regardless of the
+              register's prior contents, so it is a correct re-materialisation each
+              iteration (vgatherdps consumes/zeroes the mask register) }
+            regmask:=cg.getmmregister(current_asmdata.CurrAsmList,mmsize);
+            current_asmdata.CurrAsmList.concat(taicpu.op_reg_reg_reg(A_VPCMPEQD,S_NO,regmask,regmask,regmask));
+            { gather a[idx[i..i+VF-1]] -> regc.  vgatherdps requires its destination,
+              index and mask to be three DISTINCT physical registers (else #UD).  The
+              instruction table models the gather DESTINATION as read (its masked
+              lanes are architecturally preserved), so the allocator would not, on its
+              own, make the destination interfere with the index register (two reads
+              do not interfere) and could colour them the same.  Pre-define the
+              destination with a vxorps so its live range starts before -- and thus
+              overlaps -- the index/mask reads at the gather: it then interferes with
+              both and is coloured distinctly.  The all-ones mask makes the gather
+              overwrite every lane, so the zero seed is discarded (result unaffected). }
+            regc:=cg.getmmregister(current_asmdata.CurrAsmList,mmsize);
+            current_asmdata.CurrAsmList.concat(taicpu.op_reg_reg_reg(A_VXORPS,S_NO,regc,regc,regc));
+            { operand order is AT&T (as the FPC x86 tables expect): op1 is the mask
+              (encoded into VEX.vvvv), op2 the VSIB memory, op3 the gather destination
+              (encoded into ModRM.reg).  The instruction reads+writes both the mask
+              (predicate in, zeroed out) and the destination (masked-preserve in,
+              gathered out) -- reflected in the RWop1/RWop3 change-flags for the two
+              gather opcodes -- so the pre-loaded mask and the pre-zeroed destination
+              stay live and are coloured distinctly from each other and the index. }
+            current_asmdata.CurrAsmList.concat(taicpu.op_reg_ref_reg(A_VGATHERDPS,S_NO,regmask,refa,regc));
+            { accreg := accreg + gathered window }
+            current_asmdata.CurrAsmList.concat(taicpu.op_reg_reg_reg(A_VADDPS,S_NO,regc,regacc,regacc));
             location_reset(location,LOC_VOID,OS_NO);
             exit;
           end;

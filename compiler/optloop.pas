@@ -3592,6 +3592,77 @@ unit optloop;
         vec:=tvecnode(vn);
       end;
 
+    function vect_gather_avx2 : boolean;
+      { -OoGATHER requires an AVX2 fputype: there is no SSE gather, so an indexed
+        load stays scalar unless the target has the vgatherdps/vpgatherdd unit.
+        This gates the whole shape (unlike VECT256, which only picks 128 vs 256). }
+      begin
+{$if defined(i386) or defined(x86_64)}
+        vect_gather_avx2:=(FPUX86_HAS_AVX2 in fpu_capabilities[current_settings.fputype]);
+{$else}
+        vect_gather_avx2:=false;
+{$endif}
+      end;
+
+    function vect_gather_elem_reason(n : tnode; counter : tabstractvarsym; out gvec : tvecnode; out ivec : tvecnode) : string;
+      { -OoGATHER: returns '' and sets gvec if n (after peeling typeconv wrappers)
+        is  a[idx[i]]  where a is a simple non-aliased dynamic array of single, idx
+        is a simple non-aliased dynamic array of signed 32-bit int, and the INNER
+        subscript idx[..] is exactly a plain read of the loop counter (unit stride).
+        The outer subscript idx[i] is a computed value, so this is the non-unit-
+        stride indexed load a plain vmovups cannot widen -- exactly what needs the
+        gather.  A contiguous a[i] (index = the plain counter) is deliberately NOT
+        matched here (it is the ordinary vok_reduce_sum shape). }
+      var
+        vn, idxaccess, inneridx : tnode;
+        aele, iele : tdef;
+      begin
+        result:='';
+        gvec:=nil;
+        ivec:=nil;
+        vn:=rangeelim_skip_typeconv(n);
+        if not assigned(vn) or (vn.nodetype<>vecn) then
+          exit('is not an array-element access');
+        if not assigned(tvecnode(vn).left) or not assigned(tvecnode(vn).left.resultdef) then
+          exit('gathered array base has no known type');
+        { gathered array a: simple non-aliased dynamic array of single }
+        if not assigned(rangeelim_simple_var(tvecnode(vn).left)) then
+          exit('gathered array base is not a simple non-aliased variable (possible aliasing)');
+        if not is_dynamic_array(tvecnode(vn).left.resultdef) then
+          exit('gathered array is not a dynamic array');
+        aele:=tarraydef(tvecnode(vn).left.resultdef).elementdef;
+        if not is_single(aele) then
+          exit('gathered array element type is not single-precision float');
+        { the subscript must itself be an indexed load idx[i], NOT the plain counter }
+        idxaccess:=rangeelim_skip_typeconv(tvecnode(vn).right);
+        if not assigned(idxaccess) or (idxaccess.nodetype<>vecn) then
+          exit('subscript is not an indexed array read (a unit-stride load needs no gather)');
+        if not assigned(tvecnode(idxaccess).left) or not assigned(tvecnode(idxaccess).left.resultdef) then
+          exit('gather index array has no known type');
+        { index array idx: simple non-aliased dynamic array of signed 32-bit int }
+        if not assigned(rangeelim_simple_var(tvecnode(idxaccess).left)) then
+          exit('gather index array is not a simple non-aliased variable (possible aliasing)');
+        if not is_dynamic_array(tvecnode(idxaccess).left.resultdef) then
+          exit('gather index array is not a dynamic array');
+        iele:=tarraydef(tvecnode(idxaccess).left.resultdef).elementdef;
+        if not assigned(iele) or (iele.typ<>orddef) or (torddef(iele).ordtype<>s32bit) then
+          exit('gather index array element type is not longint (signed 32-bit)');
+        { the inner subscript must be exactly a plain read of the loop counter }
+        inneridx:=rangeelim_skip_typeconv(tvecnode(idxaccess).right);
+        if not assigned(inneridx) or (inneridx.nodetype<>loadn) then
+          exit('gather index subscript is not a plain variable read');
+        if ([nf_write,nf_modify]*inneridx.flags)<>[] then
+          exit('gather index subscript has side effects');
+        if tloadnode(inneridx).symtableentry<>tsym(counter) then
+          exit('gather index subscript is not the loop counter (non-unit stride or offset)');
+        gvec:=tvecnode(vn);
+        { the bare (typeconv-stripped) idx[i] vecn: the build needs its plain
+          reference &idx[i] to load the VF contiguous int32 index window, so it must
+          NOT be the typeconv-wrapped subscript of the outer a[...] node (that would
+          secondpass to a register value, not a memory reference) }
+        ivec:=tvecnode(idxaccess);
+      end;
+
     function vect_widthtag : string;
       { -OoREPORT width suffix: appended to the vectorize remark ONLY when the
         256-bit ymm width was chosen (-OoVECT256 on an AVX fputype). The default
@@ -3768,6 +3839,8 @@ unit optloop;
         stmt, rhs : tnode;
         assign : tassignmentnode;
         avec, bvec, cvec : tvecnode;
+        gvec : tvecnode;       { -OoGATHER: the recognized a[idx[i]] indexed load }
+        ivec : tvecnode;       { -OoGATHER: the bare idx[i] index-array element access }
         vecop : TOpCG;
         vshape : tvectoropkind;
         vecdouble : boolean;   { false: single (VL=4); true: double (VL=2) }
@@ -4239,8 +4312,21 @@ unit optloop;
                         exit('dot-product mixes single- and double-precision arrays');
                       vshape:=vok_reduce_dot;
                     end
+                  else if (cs_opt_gather in current_settings.optimizerswitches) and
+                          (not vecdouble) and vect_gather_avx2 and
+                          (vect_gather_elem_reason(redexpr,counter,gvec,ivec)='') then
+                    { -OoGATHER:  s := s + a[idx[i]]  -- a single-precision sum
+                      reduction whose element comes through a computed int32 index.
+                      Same register-resident partial-sum accumulator as vok_reduce_sum
+                      (and the same fast-math reorder license granted above), but the
+                      body widens the indexed load with an AVX2 vgatherdps instead of
+                      a contiguous vmovups.  Only on an AVX2 fputype (there is no SSE
+                      gather); the shape is skipped otherwise so the loop stays
+                      scalar.  -Co/-Cr already bailed above (a checked indexed load
+                      must stay scalar). }
+                    vshape:=vok_gather
                   else
-                    exit('reduction addend is neither an array element nor a product of two array elements of the loop counter');
+                    exit('reduction addend is neither an array element, a product of two array elements, nor an indexed (gather) load of the loop counter');
                 end;
               { leave provably tiny constant-trip loops to the scalar path }
               { (matches REASSOC: below 2*VL there is no packed win) }
@@ -4680,6 +4766,85 @@ unit optloop;
             do_firstpass(block);
             MessagePos1(forn.fileinfo,cg_n_loop_reduction_vectorized,tostr(elewidth));
             OptRemark(forn.fileinfo,'vectorize','reduction loop vectorized, VF='+tostr(elewidth)+', tail=scalar'+vect_widthtag);
+            forn.free;
+            n:=block;
+            changed:=true;
+            exit;
+          end;
+
+        { ---- GATHER build (-OoGATHER): single-precision indexed sum reduction
+          s := s + a[idx[i]].  Structurally identical to the float sum reduction
+          above -- the SAME register-resident float accumulator seeded by
+          vok_reduce_init and horizontally summed by vok_reduce_finish -- but the
+          body is a vok_gather_body node that widens the indexed load with an AVX2
+          vgatherdps over the VF contiguous int32 indices idx[i..i+VF-1]. }
+        if vshape=vok_gather then
+          begin
+            { acc := [s,0,..]  (lane 0 keeps the incoming s), seeded from a memory
+              temp via a plain assignment so the incoming def of s stays live -- the
+              exact discipline the float sum reduction uses above. }
+            seedtemp:=ctempcreatenode.create(eletype,eletype.size,tt_persistent,false);
+            addstatement(stat,seedtemp);
+            addstatement(stat,cassignmentnode.create(
+              ctemprefnode.create(seedtemp),
+              cloadnode.create(tsym(accsym),accsym.owner)));
+            redinit:=cvectoropnode.create_reduce_init(
+              ctemprefnode.create(seedtemp),elewidth,false);
+            redctx:=redinit.new_redctx;
+            addstatement(stat,redinit);
+
+            { vector loop:  while i<=hi-(VL-1) do begin acc:=acc+a[idx[i..]]; i:=i+VL end
+                left  = idx[i]  (source of the VF contiguous int32 index window)
+                right = a[0]    (VSIB base of the gathered single array) }
+            vecbody:=internalstatements(vstat);
+            redbody:=cvectoropnode.create_gather(
+              ivec.getcopy,
+              cvecnode.create(tvecnode(gvec).left.getcopy,
+                cordconstnode.create(0,sizesinttype,false)),
+              elewidth);
+            redbody.attach_redctx(redctx);
+            addstatement(vstat,redbody);
+            addstatement(vstat,cassignmentnode.create(
+              cloadnode.create(tsym(counter),counter.owner),
+              caddnode.create(addn,cloadnode.create(tsym(counter),counter.owner),
+                cordconstnode.create(elewidth,ctype,false))));
+            addstatement(stat,cwhilerepeatnode.create(
+              caddnode.create(lten,cloadnode.create(tsym(counter),counter.owner),
+                caddnode.create(subn,ctemprefnode.create(hitemp),
+                  cordconstnode.create(elewidth-1,ctype,false))),
+              vecbody,true,false));
+
+            { finish:  s := horizontal-sum(acc) via a memory-backed scalar temp }
+            splattemp:=ctempcreatenode.create(eletype,eletype.size,tt_persistent,false);
+            addstatement(stat,splattemp);
+            redfin:=cvectoropnode.create_reduce_finish(
+              ctemprefnode.create(splattemp),elewidth,false);
+            redfin.attach_redctx(redctx);
+            addstatement(stat,redfin);
+            addstatement(stat,cassignmentnode.create(
+              cloadnode.create(tsym(accsym),accsym.owner),
+              ctemprefnode.create(splattemp)));
+
+            { scalar remainder:  while i<=hi do begin <original body>; i:=i+1 end }
+            scalbody:=internalstatements(sstat);
+            addstatement(sstat,forn.t2.getcopy);
+            addstatement(sstat,cassignmentnode.create(
+              cloadnode.create(tsym(counter),counter.owner),
+              caddnode.create(addn,cloadnode.create(tsym(counter),counter.owner),
+                cordconstnode.create(1,ctype,false))));
+            addstatement(stat,cwhilerepeatnode.create(
+              caddnode.create(lten,cloadnode.create(tsym(counter),counter.owner),
+                ctemprefnode.create(hitemp)),
+              scalbody,true,false));
+
+            addstatement(stat,ctempdeletenode.create(lotemp));
+            addstatement(stat,ctempdeletenode.create(hitemp));
+            addstatement(stat,ctempdeletenode.create(seedtemp));
+            addstatement(stat,ctempdeletenode.create(splattemp));
+
+            do_firstpass(block);
+            MessagePos1(forn.fileinfo,cg_n_loop_reduction_vectorized,tostr(elewidth));
+            OptRemark(forn.fileinfo,'gather','indexed-load sum reduction vectorized to AVX2 vgatherdps, VF='+tostr(elewidth)+', tail=scalar'+vect_widthtag);
             forn.free;
             n:=block;
             changed:=true;

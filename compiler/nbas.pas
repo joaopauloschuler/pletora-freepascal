@@ -469,7 +469,25 @@ interface
                           8 (128-bit xmm, 4 int32 lanes) or 16 (256-bit ymm, 8 int32
                           lanes under AVX2). isdouble is unused (always false). }
                         vok_int8dot,
-                        vok_int8dot_init, vok_int8dot_body, vok_int8dot_finish);
+                        vok_int8dot_init, vok_int8dot_body, vok_int8dot_finish,
+                        { Indexed-gather single-precision sum reduction (-OoGATHER):
+                          s := s + a[idx[i]] where a is a dynamic array of single and
+                          idx a dynamic array of signed 32-bit ints.  The register-
+                          resident float accumulator is seeded/horizontally-summed by
+                          the ordinary vok_reduce_init / vok_reduce_finish trio (a
+                          gather sum is a plain float sum reduction whose element is
+                          gathered rather than contiguously loaded); only the body is
+                          special.  vok_gather is the recognizer's shape tag;
+                          vok_gather_body is the codegen node:
+                            left  = idx[i]  (the index-array element access: its
+                                    address gives the base of the VF contiguous int32
+                                    index window, loaded with vmovdqu)
+                            right = a[0]    (the gathered array's element 0: its
+                                    address is the VSIB base for vgatherdps)
+                          vecwidth = VF (4 xmm / 8 ymm).  Emits vgatherdps with an
+                          all-ones mask re-materialised each iteration and adds the
+                          gathered window into redctx^.accreg.  AVX2-only. }
+                        vok_gather, vok_gather_body);
 
        { the approximate transcendental a vok_transc node evaluates per lane }
        ttranscfunc = (tf_exp, tf_tanh, tf_sigmoid);
@@ -534,6 +552,9 @@ interface
           constructor create_int8dot_init(seed : tnode; _vecwidth : longint);
           constructor create_int8dot(b,c : tnode; _vecwidth : longint);
           constructor create_int8dot_finish(target : tnode; _vecwidth : longint);
+          { -OoGATHER body: idxelem = idx[i] (index window source), abase = a[0]
+            (VSIB base of the gathered single array). }
+          constructor create_gather(idxelem,abase : tnode; _vecwidth : longint);
           { allocate a fresh shared reduction context and attach it to self }
           function new_redctx : pvecreducectx;
           { attach an existing shared reduction context to self (bumps its share count) }
@@ -850,6 +871,17 @@ implementation
         op:=OP_ADD;
         vecwidth:=_vecwidth;
         kind:=vok_int8dot_finish;
+        scalarleft:=false;
+        isdouble:=false;
+      end;
+
+
+    constructor tvectoropnode.create_gather(idxelem,abase : tnode; _vecwidth : longint);
+      begin
+        inherited create(vectoropn,idxelem,abase,nil);
+        op:=OP_ADD;
+        vecwidth:=_vecwidth;
+        kind:=vok_gather_body;
         scalarleft:=false;
         isdouble:=false;
       end;

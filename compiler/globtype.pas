@@ -983,7 +983,28 @@ interface
            128-bit xmm at plain -O4; 256-bit ymm still gated behind opt-in
            -OoVECT256.  AVX-512 VNNI (vpdpbusd) and the neural-api int8-storage
            adaptation remain open }
-         cs_opt_int8dot
+         cs_opt_int8dot,
+         { Gather vectorization for indexed (non-unit-stride) loads (-OoGATHER):
+           recognize an otherwise-vectorizable single-precision sum reduction whose
+           element is read through a computed int32 index array --
+           s := s + a[idx[i]]  with a : array of single and idx : array of longint
+           (signed 32-bit) -- and widen the indexed load with the AVX2 gather
+           instruction vgatherdps (float32) instead of falling back to scalar
+           loads.  The VF consecutive indices idx[i..i+VF-1] are loaded contiguously
+           (vmovdqu), an all-ones mask is re-materialized each iteration (the gather
+           clobbers its mask), and vgatherdps reads a[idx[i..i+VF-1]] lane-by-lane
+           into a packed register that is added into the register-resident partial
+           sum -- exactly the same addresses the scalar loop would touch (full mask,
+           no speculative extra reads; scalar remainder tail).  Opt-in, NOT in the
+           -O4 defaults for this first landing.  Requires an AVX2 fputype (there is
+           no SSE gather; the loop stays scalar without AVX2); 128-bit xmm VF=4
+           baseline, 256-bit ymm VF=8 under -OoVECT256.  Shares the float reduction's
+           fast-math gate (the packed partial-sum reorders the adds identically to
+           -OoREASSOC).  Refused under -Co/-Cr (a checked indexed load would raise on
+           an out-of-range idx that the unchecked gather silently reads).  AVX-512
+           scatter (vscatterdps) and the neural-api im2col/conv adaptation remain
+           open }
+         cs_opt_gather
        );
        toptimizerswitches = set of toptimizerswitch;
 
@@ -1065,7 +1086,7 @@ interface
          'SHRINKWRAP','GVNPRE','PURE','PARTIALINLINE','STACKALLOC','SLP',
          'UNROLLDYN','PREFETCH','ICF','IPARA','FINALVALUE','SIBCALL',
          'REPORT','DEVIRT','IPACP','VECT256','CONSTEVAL','MODREF',
-         'APPROXTRANS','LOOPINTERCHANGE','LOOPTILE','DEADPARA','INT8DOT'
+         'APPROXTRANS','LOOPINTERCHANGE','LOOPTILE','DEADPARA','INT8DOT','GATHER'
        );
        WPOptimizerSwitchStr : array [twpoptimizerswitch] of string[14] = (
          'DEVIRTCALLS','OPTVMTS','SYMBOLLIVENESS'
