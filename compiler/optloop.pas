@@ -215,6 +215,54 @@ unit optloop;
         result:=true;
       end;
 
+    { -OoMODREF write-disjoint generalisation of loop_is_modref_writefree_call for
+      -OoREASSOC: a resolved direct call whose mod/ref summary is EXACT (both the
+      per-formal by-ref mask and the per-static set are complete) and that CANNOT
+      TRAP, admitted even when it WRITES memory.
+
+      Soundness rests on the exact shape of the reassociation transform (see
+      treassoccontext.processloop): the reduction addend is copied as an
+      INDIVISIBLE BLOB into K partial accumulators, and the copies are evaluated
+      in COUNTER ORDER within each unrolled body ( expr(i); expr(i+1); ...;
+      expr(i+K-1); i+=K ), so across the whole loop the addend evaluations occur
+      in exactly the original order 0,1,2,... and exactly as many times.  The
+      transform therefore preserves the COUNT and ORDER of every side effect and
+      never reorders any memory access relative to another WITHIN or ACROSS
+      addend copies; the only thing it regroups is the summation of the (bit-
+      identical) addend VALUES.  Consequently a call's write in one copy feeds a
+      later copy's read at precisely the same point it would in the original loop
+      -- the "cross-addend interference" hazard a value-splitting reassociator
+      would face does not arise here.  The reduction's own state (the accumulator
+      and the loop counter) is a non-address-taken local no callee can name, and
+      the loop bounds are captured into temps once (as the for-loop itself
+      evaluates them), so a writing addend call cannot corrupt the control state.
+      Non-trapping is still required: a mid-loop trap would expose the scattered
+      partial sums (not yet combined) to an outer handler, a state the original
+      loop never has.  The exact-summary requirement is the conservative gate --
+      only calls whose full footprint (d)/(e) characterise are admitted.
+
+      NOTE (recorded in the tasklist MODREF entry): because order/count are
+      preserved, DISJOINTNESS of the write footprint is not actually the operative
+      safety condition here -- non-trapping is.  This function is the conservative
+      exact-summary subset of the sound set; it is validated adversarially by
+      unleashed/tests/reassoc_modref_check.sh (a call that writes AND reads the
+      same globals, and a two-call addend where one call writes what the other
+      reads, both split bit-exactly against the serial reference). }
+    function loop_is_modref_reorderable_call(n : tnode) : boolean;
+      var
+        pd : tprocdef;
+      begin
+        result:=false;
+        if not(cs_opt_modref in current_settings.optimizerswitches) then
+          exit;
+        pd:=loop_call_target(n);
+        if not(assigned(pd) and modref_summary_available(pd) and
+               pd.modref_pmask_exact and pd.modref_smask_exact and
+               not modref_pd_can_trap(pd)) then
+          exit;
+        result:=true;
+      end;
+
     type
       treplaceinfo = record
         node : tnode;
@@ -7264,10 +7312,16 @@ unit optloop;
               memory and cannot trap (loop_is_modref_writefree_call): same
               argument, but it reaches routines -OoPURE could not prove pure
               (e.g. an open-array/hidden-parameter signature that only reads).
-              Keep recursing into the argument subtrees so an accumulator
-              reference or other unsafe construct inside an argument is still
-              caught. }
-            if not loop_is_pure_call(n) and not loop_is_modref_writefree_call(n) then
+              -OoMODREF widens it FURTHER to an exact-summary non-trapping call
+              that WRITES memory (loop_is_modref_reorderable_call): the transform
+              copies the addend as an indivisible blob and evaluates the copies in
+              counter order, preserving the count and order of every side effect,
+              so a writing addend call is as reorderable as a pure one here (see
+              that function's soundness note).  Keep recursing into the argument
+              subtrees so an accumulator reference or other unsafe construct
+              inside an argument is still caught. }
+            if not loop_is_pure_call(n) and not loop_is_modref_writefree_call(n) and
+               not loop_is_modref_reorderable_call(n) then
               begin
                 preassoc_safety(arg)^.bad:=true;
                 result:=fen_norecurse_true;
@@ -7320,6 +7374,21 @@ unit optloop;
       begin
         if (n.nodetype=calln) and loop_is_modref_writefree_call(n) and
            not loop_is_pure_call(n) then
+          begin
+            pboolean(arg)^:=true;
+            result:=fen_norecurse_true;
+          end
+        else
+          result:=fen_false;
+      end;
+
+    function reassoc_note_reorder_cb(var n : tnode; arg : pointer) : foreachnoderesult;
+      { detects a WRITING call admitted into the reduction addend by the -OoMODREF
+        write-disjoint (exact-summary, non-trapping) relaxation -- i.e. one that is
+        neither pure nor write-free -- for an accurate -OoREPORT remark }
+      begin
+        if (n.nodetype=calln) and loop_is_modref_reorderable_call(n) and
+           not loop_is_modref_writefree_call(n) and not loop_is_pure_call(n) then
           begin
             pboolean(arg)^:=true;
             result:=fen_norecurse_true;
@@ -7442,6 +7511,7 @@ unit optloop;
         lo, hi : tconstexprint;
         hasrelaxedcall : boolean;
         hasmodrefcall : boolean;
+        hasreordercall : boolean;
 
       function reassoc_reason : string;
         begin
@@ -7648,9 +7718,13 @@ unit optloop;
           begin
             hasrelaxedcall:=false;
             hasmodrefcall:=false;
+            hasreordercall:=false;
             foreachnodestatic(pm_postprocess,exprnode,@reassoc_note_call_cb,@hasrelaxedcall);
             foreachnodestatic(pm_postprocess,exprnode,@reassoc_note_modref_cb,@hasmodrefcall);
-            if hasmodrefcall then
+            foreachnodestatic(pm_postprocess,exprnode,@reassoc_note_reorder_cb,@hasreordercall);
+            if hasreordercall then
+              OptRemark(forn.fileinfo,'reassoc','reduction loop split into '+tostr(reassoc_k)+' partial accumulators (addend contains a mod/ref EXACT-summary non-trapping WRITING call kept in the body via -OoMODREF)')
+            else if hasmodrefcall then
               OptRemark(forn.fileinfo,'reassoc','reduction loop split into '+tostr(reassoc_k)+' partial accumulators (addend contains a mod/ref write-free non-trapping call kept in the body via -OoMODREF)')
             else if hasrelaxedcall then
               OptRemark(forn.fileinfo,'reassoc','reduction loop split into '+tostr(reassoc_k)+' partial accumulators (addend contains a proven pure/const call kept in the body via -OoPURE)')
