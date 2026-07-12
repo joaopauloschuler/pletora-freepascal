@@ -9715,8 +9715,8 @@ unit optloop;
           if lhs.nodetype<>vecn then
             exit('inner body does not write an array element (not a C[..]:=... reduction)');
           base:=rangeelim_skip_typeconv(tvecnode(lhs).left);
-          if not assigned(base) or (base.nodetype<>loadn) or not assigned(rangeelim_simple_var(base)) then
-            exit('the accumulator array is not a simple single-dimension array variable');
+          if not assigned(base) or not assigned(ic_write_base_sym(base)) then
+            exit('the accumulator array is not a simple single-dimension array variable or invariant object field');
           if not ic_elem_ok(lhs.resultdef) then
             exit('the accumulated element is not an unmanaged scalar');
           if rhs.nodetype<>addn then
@@ -9745,7 +9745,7 @@ unit optloop;
             call/deref, collect the read indices for the reuse cost model }
           sc.iout:=iout;
           sc.iin:=jmid;
-          sc.wsym:=tloadnode(base).symtableentry;
+          sc.wsym:=ic_write_base_sym(base);
           sc.accum:=nil;
           sc.idxproto:=nil;
           sc.subset_r:=false;
@@ -9776,6 +9776,9 @@ unit optloop;
             end;
           if not(reuse_i and reuse_j) then
             exit('no operand is reused across both tiled loops (tiling would not improve locality)');
+
+          { any object-field array base (Self.FData-style) must be loop-invariant }
+          result:=ic_fieldbase_gate(outerfor.t2);
         end;
 
       begin
