@@ -3512,6 +3512,11 @@ unit optloop;
     const
       vect_vecwidth = 4;   { single lanes per 128-bit SSE packed op }
 
+    var
+      { fresh-name counter for the field-base snapshot temps created by the
+        element-wise vectorizer (see vect_field_base / the builder hoist) }
+      vect_fieldbase_seq : longint;
+
     function vect_want_ymm : boolean;
       { true when the AVX-256 (ymm) autovectorization width is requested
         (-OoVECT256) AND the target fputype actually has an AVX unit, so the
@@ -3675,6 +3680,80 @@ unit optloop;
           vect_widthtag:='';
       end;
 
+    function vect_stable_ref_sym(n : tnode) : tabstractvarsym;
+      { the sym referenced if n is a plain load of a provably-stable object/class
+        reference through which an INVARIANT field may be hoisted: the implicit
+        Self parameter, or a simple non-aliased (non-address-taken, non-different-
+        scope, non-volatile) local variable / value-parameter.  nil otherwise.
+        The reference is the *handle* (Self, or a local class/object reference);
+        the caller additionally proves the loop reassigns neither the handle nor
+        (via the no-call gate) the field it names, so the field load is loop-
+        invariant and may be snapshotted once into the preheader. }
+      var
+        sym : tsym;
+        avs : tabstractvarsym;
+      begin
+        result:=nil;
+        if not assigned(n) or (n.nodetype<>loadn) then
+          exit;
+        sym:=tloadnode(n).symtableentry;
+        if not(sym is tabstractvarsym) then
+          exit;
+        avs:=tabstractvarsym(sym);
+        if avs.addr_taken or avs.different_scope then
+          exit;
+        if (vo_volatile in avs.varoptions) or (vo_is_thread_var in avs.varoptions) then
+          exit;
+        { the implicit Self parameter (a class pointer / object reference) }
+        if is_self_node(n) then
+          begin
+            result:=avs;
+            exit;
+          end;
+        { or a simple non-aliased local / value-parameter object|class reference }
+        if not(avs.typ in [localvarsym,paravarsym]) then
+          exit;
+        if (avs.typ=paravarsym) and (tparavarsym(avs).varspez<>vs_value) then
+          exit;
+        result:=avs;
+      end;
+
+
+    function vect_field_base(base : tnode; out refsym : tabstractvarsym) : tfieldvarsym;
+      { if base is  <stable-ref>.<field>  -- a subscript of a dynamic-array field
+        through a provably-stable reference (Self or a simple local/value-param,
+        per vect_stable_ref_sym) -- return that field sym and set refsym to the
+        reference's sym; otherwise nil.  This is the  Self.FData -style object-
+        field dynamic-array base the plain rangeelim_simple_var rule rejects. }
+      begin
+        result:=nil;
+        refsym:=nil;
+        if not assigned(base) or (base.nodetype<>subscriptn) then
+          exit;
+        if not assigned(base.resultdef) or not is_dynamic_array(base.resultdef) then
+          exit;
+        refsym:=vect_stable_ref_sym(tsubscriptnode(base).left);
+        if not assigned(refsym) then
+          exit;
+        result:=tsubscriptnode(base).vs;
+      end;
+
+
+    function vect_array_base_ok(base : tnode) : boolean;
+      { the array base is acceptable to the element-wise vectorizer if it is a
+        simple non-aliased local/param variable (rangeelim_simple_var) OR a
+        provably-invariant object-field access (vect_field_base) which the builder
+        pre-hoists into a preheader temp so the recognizer's simple-var machinery
+        applies unchanged.  The field case is only sound under the extra whole-loop
+        gates (no call, reference not reassigned) checked once in vectorize_reason. }
+      var
+        rsym : tabstractvarsym;
+      begin
+        vect_array_base_ok:=assigned(rangeelim_simple_var(base)) or
+                            assigned(vect_field_base(base,rsym));
+      end;
+
+
     function vect_elem_reason(n : tnode; counter : tabstractvarsym; out vec : tvecnode) : string;
       { returns '' and sets vec to the vecn if n (after peeling typeconv wrappers)
         is  A[i]  where A is a simple non-aliased dynamic array of single and the
@@ -3691,9 +3770,11 @@ unit optloop;
           exit('operand is not an array-element access');
         if not assigned(tvecnode(vn).left) or not assigned(tvecnode(vn).left.resultdef) then
           exit('array base has no known type');
-        { the array must be a simple non-aliased dynamic array of single }
-        if not assigned(rangeelim_simple_var(tvecnode(vn).left)) then
-          exit('array base is not a simple non-aliased variable (possible aliasing)');
+        { the array must be a simple non-aliased dynamic array of single, OR a
+          provably-invariant object-field dynamic array (Self.FData-style), which
+          the builder snapshots into a preheader temp under the whole-loop gates }
+        if not vect_array_base_ok(tvecnode(vn).left) then
+          exit('array base is not a simple non-aliased variable or invariant object field (possible aliasing)');
         if not is_dynamic_array(tvecnode(vn).left.resultdef) then
           exit('array is not a dynamic array');
         if not is_single(tarraydef(tvecnode(vn).left.resultdef).elementdef) and
@@ -3817,6 +3898,22 @@ unit optloop;
       begin
         result:=fen_false;
         if ([cs_check_range,cs_check_overflow]*n.localswitches)<>[] then
+          begin
+            pboolean(arg)^:=true;
+            result:=fen_norecurse_true;
+          end;
+      end;
+
+
+    function vect_call_cb(var n : tnode; arg : pointer) : foreachnoderesult;
+      { flags a real call node anywhere in the body: a method call could reassign
+        an object field, so an invariant-field array base cannot be hoisted past
+        one.  Only calln matters -- the field-base shapes never legitimately
+        contain a call, whereas inline nodes (min/max, fma) do not reassign
+        fields and are handled by the other shapes. }
+      begin
+        result:=fen_false;
+        if n.nodetype=calln then
           begin
             pboolean(arg)^:=true;
             result:=fen_norecurse_true;
@@ -4076,6 +4173,66 @@ unit optloop;
             end;
         end;
 
+      { Whole-loop gate for an object-field array base (Self.FData-style, accepted
+        by vect_array_base_ok / hoisted by the builder).  Returns '' when either no
+        recognized base is a field access, or every field base is provably loop-
+        invariant: the body makes NO call (a method could reassign the field) and
+        the base reference itself is never reassigned in the body (DFA).  Since the
+        body is exactly one assignment whose only write is the recognized target
+        (an array element or the scalar accumulator, never the field handle), the
+        reference-reassignment check is belt-and-suspenders; the no-call gate is
+        the load-bearing one.  Runs on the ORIGINAL (un-hoisted) tree. }
+      function field_base_gate : string;
+        var
+          hascall : boolean;
+          defsum : tdfaset;
+
+        function base_ref_stable(vec : tvecnode) : boolean;
+          { true unless vec's base is a field access whose handle is reassigned in
+            the loop body }
+          var
+            rsym : tabstractvarsym;
+            refload : tnode;
+          begin
+            base_ref_stable:=true;
+            if not assigned(vec) then
+              exit;
+            if not assigned(vect_field_base(vec.left,rsym)) then
+              exit;
+            refload:=tsubscriptnode(vec.left).left;
+            if assigned(refload.optinfo) and DynSetIn(defsum,refload.optinfo^.index) then
+              base_ref_stable:=false;
+          end;
+
+        function is_field(vec : tvecnode) : boolean;
+          var rsym : tabstractvarsym;
+          begin
+            is_field:=assigned(vec) and assigned(vect_field_base(vec.left,rsym));
+          end;
+
+        begin
+          field_base_gate:='';
+          { nothing to gate unless some recognized base is an object field }
+          if not(is_field(avec) or is_field(bvec) or is_field(cvec) or
+                 is_field(mmA_vec) or is_field(mmB_vec) or
+                 is_field(gvec) or is_field(ivec)) then
+            exit;
+          { a call could reassign the field between iterations }
+          hascall:=false;
+          foreachnodestatic(pm_postprocess,forn.t2,@vect_call_cb,@hascall);
+          if hascall then
+            exit('array base is an object field but the loop body makes a call that could reassign it');
+          { the field handle (Self / the object reference) must not be reassigned }
+          CalcDefSum(forn.t2);
+          if not assigned(forn.t2.optinfo) then
+            exit('data-flow information is unavailable for the loop body');
+          defsum:=forn.t2.optinfo^.defsum;
+          if not(base_ref_stable(avec) and base_ref_stable(bvec) and base_ref_stable(cvec) and
+                 base_ref_stable(mmA_vec) and base_ref_stable(mmB_vec) and
+                 base_ref_stable(gvec) and base_ref_stable(ivec)) then
+            exit('object-field array base reference is reassigned in the loop');
+        end;
+
       { Runs the full OptimizeVectorize recognizer over the current for-loop and
         returns '' when the loop can be vectorized (also filling in counter,
         ctype, assign, avec/bvec/cvec and vecop for the builder below), or a
@@ -4202,7 +4359,7 @@ unit optloop;
                 exit('data-flow information is unavailable for the loop body');
               if DynSetIn(forn.t2.optinfo^.defsum,forn.left.optinfo^.index) then
                 exit('loop counter is modified inside the loop body');
-              exit('');
+              exit(field_base_gate);
             end;
 
           if assigned(redlhs) and (redlhs.nodetype=loadn) and
@@ -4336,7 +4493,7 @@ unit optloop;
                 exit('data-flow information is unavailable for the loop body');
               if DynSetIn(forn.t2.optinfo^.defsum,forn.left.optinfo^.index) then
                 exit('loop counter is modified inside the loop body');
-              exit('');
+              exit(field_base_gate);
             end;
 
           { LHS: a single- or double-precision dynamic-array element  a[i] ; its
@@ -4490,6 +4647,98 @@ unit optloop;
             exit('data-flow information is unavailable for the loop body');
           if DynSetIn(forn.t2.optinfo^.defsum,forn.left.optinfo^.index) then
             exit('loop counter is modified inside the loop body');
+
+          { object-field array bases (if any) must be provably loop-invariant }
+          result:=field_base_gate;
+        end;
+
+      { Pre-hoist every object-field array base (Self.FData-style) recognized on a
+        vector node into a fresh local, snapshotted once in the loop preheader, and
+        repoint the in-loop access at that local.  Runs on the SUCCESS path only,
+        after the lo/hi/i-preamble is emitted into `stat`; vectorize_reason has
+        already proved (field_base_gate) the field is loop-invariant, so reading it
+        once before the loop is bit-identical.  The vec nodes are the very nodes
+        inside forn.t2, so both the packed body (avec.getcopy ...) and the scalar
+        remainder (forn.t2.getcopy) pick up the repointed base automatically.  A
+        distinct temp per (reference,field) pair -- so  a[i]:=a[i]+b[i]  over the
+        same field shares one snapshot. }
+      procedure hoist_field_bases;
+        var
+          nsnap : longint;
+          snaprefs : array[0..15] of tabstractvarsym;
+          snapfields : array[0..15] of tfieldvarsym;
+          snaptemps : array[0..15] of tabstractvarsym;
+
+        procedure hoist_one(vec : tvecnode);
+          var
+            rsym : tabstractvarsym;
+            fsym : tfieldvarsym;
+            i, slot : longint;
+            tsymp : tlocalvarsym;
+            arrdef : tdef;
+            newbase : tnode;
+          begin
+            if not assigned(vec) then
+              exit;
+            fsym:=vect_field_base(vec.left,rsym);
+            if not assigned(fsym) then
+              exit;
+            arrdef:=vec.left.resultdef;   { the field's dynamic-array def }
+            slot:=-1;
+            for i:=0 to nsnap-1 do
+              if (snaprefs[i]=rsym) and (snapfields[i]=fsym) then
+                begin
+                  slot:=i;
+                  break;
+                end;
+            if (slot<0) and (nsnap<=high(snaprefs)) then
+              begin
+                { The snapshot local holds the raw dynamic-array data POINTER, not
+                  a managed dynamic-array value: a fresh managed local cannot be
+                  introduced this late (its implicit-finally frame was already
+                  decided), and the field is proven loop-invariant and outlives the
+                  loop, so a borrowed non-owning pointer copy needs no reference
+                  counting or finalization.  In-loop accesses reinterpret the
+                  pointer back to the array def; with range checks off (required to
+                  vectorize) indexing is just base+i*elesize. }
+                inc(vect_fieldbase_seq);
+                tsymp:=clocalvarsym.create('$vfld$'+tostr(vect_fieldbase_seq),
+                  vs_value,voidpointertype,[]);
+                tsymp.register_sym;
+                current_procinfo.procdef.localst.insertsym(tsymp);
+                slot:=nsnap;
+                snaprefs[slot]:=rsym;
+                snapfields[slot]:=fsym;
+                snaptemps[slot]:=tsymp;
+                inc(nsnap);
+                { preheader:  temp := pointer(<ref>.<field>)   (evaluated once) }
+                addstatement(stat,cassignmentnode.create(
+                  cloadnode.create(tsym(tsymp),tsymp.owner),
+                  ctypeconvnode.create_internal(vec.left.getcopy,voidpointertype)));
+              end;
+            if slot<0 then
+              exit;
+            { repoint this access's base at the reinterpreted snapshot pointer.
+              The parent vecn is already typed (from the initial firstpass), so the
+              builder's do_firstpass(block) will not re-descend into this fresh
+              child -- type it explicitly here so its resultdef/convtype are set for
+              codegen. }
+            newbase:=ctypeconvnode.create_internal(
+              cloadnode.create(tsym(snaptemps[slot]),snaptemps[slot].owner),arrdef);
+            firstpass(newbase);
+            vec.left.free;
+            vec.left:=newbase;
+          end;
+
+        begin
+          nsnap:=0;
+          hoist_one(avec);
+          hoist_one(bvec);
+          hoist_one(cvec);
+          hoist_one(mmA_vec);
+          hoist_one(mmB_vec);
+          hoist_one(gvec);
+          hoist_one(ivec);
         end;
 
       begin
@@ -4507,6 +4756,8 @@ unit optloop;
         avec:=nil;
         bvec:=nil;
         cvec:=nil;
+        gvec:=nil;
+        ivec:=nil;
         scalarnode:=nil;
         scalarleft:=false;
         vecop:=OP_NONE;
@@ -4601,6 +4852,9 @@ unit optloop;
         addstatement(stat,cassignmentnode.create(
           cloadnode.create(tsym(counter),counter.owner),
           ctemprefnode.create(lotemp)));
+
+        { snapshot any invariant object-field array base into a preheader local }
+        hoist_field_bases;
 
         { ---- INT8DOT build (integer widening MAC dot product) ----
           Structurally identical to the float reduction below (register-resident
