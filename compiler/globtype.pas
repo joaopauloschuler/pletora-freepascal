@@ -755,8 +755,9 @@ interface
            result is bit-identical, hence DISABLED under -Co/-Cr (where the
            loop would trap on the overflowing iteration). Any body that is not
            exactly the single accumulator update (calls, stores, control flow,
-           break/continue/exit, nested loops) never matches. Opt-in; NOT part
-           of the -O4 defaults }
+           break/continue/exit, nested loops) never matches. Part of the -O4
+           default optimizer set (promoted after the forced-suite/self-host/
+           torture evaluation) }
          cs_opt_finalvalue,
          { sibling-call optimization (-OoSIBCALL): the gcc
            -foptimize-sibling-calls tail-call pass ported to FPC and applied at
@@ -1167,7 +1168,7 @@ interface
        genericlevel3optimizerswitches = [cs_opt_level3,cs_opt_constant_propagate,cs_opt_nodedfa,cs_opt_loopstrength
                                          {$ifndef llvm},cs_opt_use_load_modify_store{$endif},
                                          cs_opt_loopunroll,cs_opt_forloop];
-       genericlevel4optimizerswitches = [cs_opt_level4,cs_opt_reorder_fields,cs_opt_dead_values,cs_opt_fastmath,cs_opt_loopmotion,cs_opt_loopunswitch,cs_opt_bitidiom,cs_opt_rangecheckelim,cs_opt_jumpthread,cs_opt_loopdistpat,cs_opt_looppeel,cs_opt_loopsplit,cs_opt_loopfuse,cs_opt_ifconvert,cs_opt_reassoc,cs_opt_unrolljam,cs_opt_predcom,cs_opt_sra,cs_opt_storemerge,cs_opt_casecluster,cs_opt_crossjump,cs_opt_blockorder,cs_opt_sink,cs_opt_storemotion,cs_opt_vrp,cs_opt_switchtable,cs_opt_ree,cs_opt_vectorize,cs_opt_devirt,cs_opt_dead_para,cs_opt_int8dot,cs_opt_loopinterchange,cs_opt_looptile,cs_opt_modref,cs_opt_pure,cs_opt_ipara,cs_opt_sibcall,cs_opt_gvnpre,cs_opt_shrinkwrap];
+       genericlevel4optimizerswitches = [cs_opt_level4,cs_opt_reorder_fields,cs_opt_dead_values,cs_opt_fastmath,cs_opt_loopmotion,cs_opt_loopunswitch,cs_opt_bitidiom,cs_opt_rangecheckelim,cs_opt_jumpthread,cs_opt_loopdistpat,cs_opt_looppeel,cs_opt_loopsplit,cs_opt_loopfuse,cs_opt_ifconvert,cs_opt_reassoc,cs_opt_unrolljam,cs_opt_predcom,cs_opt_sra,cs_opt_storemerge,cs_opt_casecluster,cs_opt_crossjump,cs_opt_blockorder,cs_opt_sink,cs_opt_storemotion,cs_opt_vrp,cs_opt_switchtable,cs_opt_ree,cs_opt_vectorize,cs_opt_devirt,cs_opt_dead_para,cs_opt_int8dot,cs_opt_loopinterchange,cs_opt_looptile,cs_opt_modref,cs_opt_pure,cs_opt_ipara,cs_opt_sibcall,cs_opt_gvnpre,cs_opt_shrinkwrap,cs_opt_finalvalue];
 
        { whole program optimizations whose information generation requires
          information from all loaded units
