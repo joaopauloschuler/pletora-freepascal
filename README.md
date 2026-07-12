@@ -1405,6 +1405,20 @@ Full descriptions, edge cases, and limitations in [unleashed/docs/extra-improvem
 
 ---
 
+### Measuring the `-O4` Optimizer Passes
+
+`-O4` enables 39 custom optimization passes (the `-Oo*` switches listed in `genericlevel4optimizerswitches` in [compiler/globtype.pas](compiler/globtype.pas)). To measure what each pass contributes **on its own**, the repository ships a "leave-one-in" benchmark driver:
+
+```bash
+unleashed/tests/o4_pass_speedup_bench.sh /tmp/o4matrix [path-to-ppcx64]
+```
+
+For every pass `P` it benchmarks `-O3` (a baseline with **no** custom passes) against `-O3 -OoP` (exactly one pass enabled) over every benchmark fixture, interleaving the timed runs so thermal drift cancels and asserting both builds print identical checksums before trusting any speed number. The result is a pass × benchmark speedup table in `matrix.tsv`.
+
+Two caveats: it needs the `pf-bench` harness from the enclosing monorepo (auto-detected, or point `PF_BENCH_BIN` / `PF_BENCH_ROOT` at it), and the analysis passes `MODREF` / `PURE` / `IPARA` measure ~1.00x by design in this setup — they only relax fences for *other* passes, so their contribution shows in a leave-one-out comparison (`-O4` vs `-O4 -OoNOMODREF`) instead. A full run takes a few hours.
+
+---
+
 ### Detailed Documentation
 
 Each feature has a dedicated reference page in [unleashed/docs/](unleashed/docs/) with the full grammar, semantics, edge cases, and IDE notes. Start at the index: [unleashed/docs/README.md](unleashed/docs/README.md).
