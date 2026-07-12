@@ -3597,89 +3597,6 @@ unit optloop;
         vec:=tvecnode(vn);
       end;
 
-    function vect_gather_avx2 : boolean;
-      { -OoGATHER requires an AVX2 fputype: there is no SSE gather, so an indexed
-        load stays scalar unless the target has the vgatherdps/vpgatherdd unit.
-        This gates the whole shape (unlike VECT256, which only picks 128 vs 256). }
-      begin
-{$if defined(i386) or defined(x86_64)}
-        vect_gather_avx2:=(FPUX86_HAS_AVX2 in fpu_capabilities[current_settings.fputype]);
-{$else}
-        vect_gather_avx2:=false;
-{$endif}
-      end;
-
-    function vect_gather_elem_reason(n : tnode; counter : tabstractvarsym; out gvec : tvecnode; out ivec : tvecnode) : string;
-      { -OoGATHER: returns '' and sets gvec if n (after peeling typeconv wrappers)
-        is  a[idx[i]]  where a is a simple non-aliased dynamic array of single, idx
-        is a simple non-aliased dynamic array of signed 32-bit int, and the INNER
-        subscript idx[..] is exactly a plain read of the loop counter (unit stride).
-        The outer subscript idx[i] is a computed value, so this is the non-unit-
-        stride indexed load a plain vmovups cannot widen -- exactly what needs the
-        gather.  A contiguous a[i] (index = the plain counter) is deliberately NOT
-        matched here (it is the ordinary vok_reduce_sum shape). }
-      var
-        vn, idxaccess, inneridx : tnode;
-        aele, iele : tdef;
-      begin
-        result:='';
-        gvec:=nil;
-        ivec:=nil;
-        vn:=rangeelim_skip_typeconv(n);
-        if not assigned(vn) or (vn.nodetype<>vecn) then
-          exit('is not an array-element access');
-        if not assigned(tvecnode(vn).left) or not assigned(tvecnode(vn).left.resultdef) then
-          exit('gathered array base has no known type');
-        { gathered array a: simple non-aliased dynamic array of single }
-        if not assigned(rangeelim_simple_var(tvecnode(vn).left)) then
-          exit('gathered array base is not a simple non-aliased variable (possible aliasing)');
-        if not is_dynamic_array(tvecnode(vn).left.resultdef) then
-          exit('gathered array is not a dynamic array');
-        aele:=tarraydef(tvecnode(vn).left.resultdef).elementdef;
-        if not is_single(aele) then
-          exit('gathered array element type is not single-precision float');
-        { the subscript must itself be an indexed load idx[i], NOT the plain counter }
-        idxaccess:=rangeelim_skip_typeconv(tvecnode(vn).right);
-        if not assigned(idxaccess) or (idxaccess.nodetype<>vecn) then
-          exit('subscript is not an indexed array read (a unit-stride load needs no gather)');
-        if not assigned(tvecnode(idxaccess).left) or not assigned(tvecnode(idxaccess).left.resultdef) then
-          exit('gather index array has no known type');
-        { index array idx: simple non-aliased dynamic array of signed 32-bit int }
-        if not assigned(rangeelim_simple_var(tvecnode(idxaccess).left)) then
-          exit('gather index array is not a simple non-aliased variable (possible aliasing)');
-        if not is_dynamic_array(tvecnode(idxaccess).left.resultdef) then
-          exit('gather index array is not a dynamic array');
-        iele:=tarraydef(tvecnode(idxaccess).left.resultdef).elementdef;
-        if not assigned(iele) or (iele.typ<>orddef) or (torddef(iele).ordtype<>s32bit) then
-          exit('gather index array element type is not longint (signed 32-bit)');
-        { the inner subscript must be exactly a plain read of the loop counter }
-        inneridx:=rangeelim_skip_typeconv(tvecnode(idxaccess).right);
-        if not assigned(inneridx) or (inneridx.nodetype<>loadn) then
-          exit('gather index subscript is not a plain variable read');
-        if ([nf_write,nf_modify]*inneridx.flags)<>[] then
-          exit('gather index subscript has side effects');
-        if tloadnode(inneridx).symtableentry<>tsym(counter) then
-          exit('gather index subscript is not the loop counter (non-unit stride or offset)');
-        gvec:=tvecnode(vn);
-        { the bare (typeconv-stripped) idx[i] vecn: the build needs its plain
-          reference &idx[i] to load the VF contiguous int32 index window, so it must
-          NOT be the typeconv-wrapped subscript of the outer a[...] node (that would
-          secondpass to a register value, not a memory reference) }
-        ivec:=tvecnode(idxaccess);
-      end;
-
-    function vect_widthtag : string;
-      { -OoREPORT width suffix: appended to the vectorize remark ONLY when the
-        256-bit ymm width was chosen (-OoVECT256 on an AVX fputype). The default
-        128-bit path appends nothing, so its remark stays byte-identical to the
-        pre-AVX-256 wording other tooling greps. }
-      begin
-        if vect_want_ymm then
-          vect_widthtag:=' width=ymm256'
-        else
-          vect_widthtag:='';
-      end;
-
     function vect_stable_ref_sym(n : tnode) : tabstractvarsym;
       { the sym referenced if n is a plain load of a provably-stable object/class
         reference through which an INVARIANT field may be hoisted: the implicit
@@ -3740,8 +3657,8 @@ unit optloop;
 
 
     function vect_array_base_ok(base : tnode) : boolean;
-      { the array base is acceptable to the element-wise vectorizer if it is a
-        simple non-aliased local/param variable (rangeelim_simple_var) OR a
+      { the array base is acceptable to the element-wise vectorizer / gather if it
+        is a simple non-aliased local/param variable (rangeelim_simple_var) OR a
         provably-invariant object-field access (vect_field_base) which the builder
         pre-hoists into a preheader temp so the recognizer's simple-var machinery
         applies unchanged.  The field case is only sound under the extra whole-loop
@@ -3753,6 +3670,93 @@ unit optloop;
                             assigned(vect_field_base(base,rsym));
       end;
 
+
+    function vect_gather_avx2 : boolean;
+      { -OoGATHER requires an AVX2 fputype: there is no SSE gather, so an indexed
+        load stays scalar unless the target has the vgatherdps/vpgatherdd unit.
+        This gates the whole shape (unlike VECT256, which only picks 128 vs 256). }
+      begin
+{$if defined(i386) or defined(x86_64)}
+        vect_gather_avx2:=(FPUX86_HAS_AVX2 in fpu_capabilities[current_settings.fputype]);
+{$else}
+        vect_gather_avx2:=false;
+{$endif}
+      end;
+
+    function vect_gather_elem_reason(n : tnode; counter : tabstractvarsym; out gvec : tvecnode; out ivec : tvecnode) : string;
+      { -OoGATHER: returns '' and sets gvec if n (after peeling typeconv wrappers)
+        is  a[idx[i]]  where a is a simple non-aliased dynamic array of single, idx
+        is a simple non-aliased dynamic array of signed 32-bit int, and the INNER
+        subscript idx[..] is exactly a plain read of the loop counter (unit stride).
+        The outer subscript idx[i] is a computed value, so this is the non-unit-
+        stride indexed load a plain vmovups cannot widen -- exactly what needs the
+        gather.  A contiguous a[i] (index = the plain counter) is deliberately NOT
+        matched here (it is the ordinary vok_reduce_sum shape). }
+      var
+        vn, idxaccess, inneridx : tnode;
+        aele, iele : tdef;
+      begin
+        result:='';
+        gvec:=nil;
+        ivec:=nil;
+        vn:=rangeelim_skip_typeconv(n);
+        if not assigned(vn) or (vn.nodetype<>vecn) then
+          exit('is not an array-element access');
+        if not assigned(tvecnode(vn).left) or not assigned(tvecnode(vn).left.resultdef) then
+          exit('gathered array base has no known type');
+        { gathered array a: simple non-aliased dynamic array of single, OR a
+          provably-invariant object-field dynamic array (Self.FData-style), which
+          the builder snapshots into a preheader temp under the whole-loop gates }
+        if not vect_array_base_ok(tvecnode(vn).left) then
+          exit('gathered array base is not a simple non-aliased variable or invariant object field (possible aliasing)');
+        if not is_dynamic_array(tvecnode(vn).left.resultdef) then
+          exit('gathered array is not a dynamic array');
+        aele:=tarraydef(tvecnode(vn).left.resultdef).elementdef;
+        if not is_single(aele) then
+          exit('gathered array element type is not single-precision float');
+        { the subscript must itself be an indexed load idx[i], NOT the plain counter }
+        idxaccess:=rangeelim_skip_typeconv(tvecnode(vn).right);
+        if not assigned(idxaccess) or (idxaccess.nodetype<>vecn) then
+          exit('subscript is not an indexed array read (a unit-stride load needs no gather)');
+        if not assigned(tvecnode(idxaccess).left) or not assigned(tvecnode(idxaccess).left.resultdef) then
+          exit('gather index array has no known type');
+        { index array idx: simple non-aliased dynamic array of signed 32-bit int,
+          OR a provably-invariant object-field dynamic array (Self.FData-style),
+          snapshotted into a preheader temp under the whole-loop gates }
+        if not vect_array_base_ok(tvecnode(idxaccess).left) then
+          exit('gather index array is not a simple non-aliased variable or invariant object field (possible aliasing)');
+        if not is_dynamic_array(tvecnode(idxaccess).left.resultdef) then
+          exit('gather index array is not a dynamic array');
+        iele:=tarraydef(tvecnode(idxaccess).left.resultdef).elementdef;
+        if not assigned(iele) or (iele.typ<>orddef) or (torddef(iele).ordtype<>s32bit) then
+          exit('gather index array element type is not longint (signed 32-bit)');
+        { the inner subscript must be exactly a plain read of the loop counter }
+        inneridx:=rangeelim_skip_typeconv(tvecnode(idxaccess).right);
+        if not assigned(inneridx) or (inneridx.nodetype<>loadn) then
+          exit('gather index subscript is not a plain variable read');
+        if ([nf_write,nf_modify]*inneridx.flags)<>[] then
+          exit('gather index subscript has side effects');
+        if tloadnode(inneridx).symtableentry<>tsym(counter) then
+          exit('gather index subscript is not the loop counter (non-unit stride or offset)');
+        gvec:=tvecnode(vn);
+        { the bare (typeconv-stripped) idx[i] vecn: the build needs its plain
+          reference &idx[i] to load the VF contiguous int32 index window, so it must
+          NOT be the typeconv-wrapped subscript of the outer a[...] node (that would
+          secondpass to a register value, not a memory reference) }
+        ivec:=tvecnode(idxaccess);
+      end;
+
+    function vect_widthtag : string;
+      { -OoREPORT width suffix: appended to the vectorize remark ONLY when the
+        256-bit ymm width was chosen (-OoVECT256 on an AVX fputype). The default
+        128-bit path appends nothing, so its remark stays byte-identical to the
+        pre-AVX-256 wording other tooling greps. }
+      begin
+        if vect_want_ymm then
+          vect_widthtag:=' width=ymm256'
+        else
+          vect_widthtag:='';
+      end;
 
     function vect_elem_reason(n : tnode; counter : tabstractvarsym; out vec : tvecnode) : string;
       { returns '' and sets vec to the vecn if n (after peeling typeconv wrappers)
