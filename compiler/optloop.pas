@@ -8926,6 +8926,111 @@ unit optloop;
       A cost model on the affine subscript coefficients fires the transform only
       when the interchanged order is strictly more cache-contiguous. }
 
+    { ---- shared object-field array-base recognition for the loop-reordering
+      passes (interchange / tiling).  These passes copy the loop body VERBATIM and
+      only reorder the iteration space, so unlike the vectorizer they need not
+      hoist the field load -- the invariant  Self.FData[idx]  access stays exactly
+      where it was, executed in a different order.  Soundness therefore needs only
+      that the field is loop-invariant, which ic_fieldbase_gate proves (no call in
+      the nest that could reassign the field; the field-handle reference not
+      reassigned in the body).  Array IDENTITY of a field base is its FIELD sym
+      ALONE (never distinguished by which object reference names it), so two
+      accesses to the same field are conservatively treated as the same array --
+      keeping the write/read disjointness sound without assuming two object
+      references denote distinct objects. }
+
+    function ic_write_base_sym(base : tnode) : tsym;
+      { the identifying sym of an accepted WRITE array base (already typeconv-
+        stripped): a simple non-aliased local/value-param VAR sym, or (Self.FData-
+        style) a dynamic-array FIELD sym.  nil if neither. }
+      var
+        v : tabstractvarsym;
+        f : tfieldvarsym;
+        r : tabstractvarsym;
+      begin
+        ic_write_base_sym:=nil;
+        v:=rangeelim_simple_var(base);
+        if assigned(v) then
+          exit(tsym(v));
+        f:=vect_field_base(base,r);
+        if assigned(f) then
+          ic_write_base_sym:=tsym(f);
+      end;
+
+    type
+      tic_fieldscan = record
+        hascall : boolean;
+        reflds  : array of tnode;   { field-base handle loads (Self / obj ref) }
+        nrefs   : longint;
+      end;
+      pic_fieldscan = ^tic_fieldscan;
+
+    function ic_fieldscan_cb(var n : tnode; arg : pointer) : foreachnoderesult;
+      { collects, over a nest body, every object-field array-base handle load and
+        flags any real call (a method could reassign a field). }
+      var
+        fs : pic_fieldscan;
+        base : tnode;
+        r : tabstractvarsym;
+      begin
+        result:=fen_false;
+        fs:=pic_fieldscan(arg);
+        if n.nodetype=calln then
+          begin
+            fs^.hascall:=true;
+            exit;
+          end;
+        if n.nodetype=vecn then
+          begin
+            base:=rangeelim_skip_typeconv(tvecnode(n).left);
+            if assigned(base) and (base.nodetype=subscriptn) and
+               assigned(vect_field_base(base,r)) then
+              begin
+                if fs^.nrefs>=length(fs^.reflds) then
+                  setlength(fs^.reflds,2*fs^.nrefs+4);
+                fs^.reflds[fs^.nrefs]:=tsubscriptnode(base).left;
+                inc(fs^.nrefs);
+              end;
+          end;
+      end;
+
+    function ic_fieldbase_gate(nestbody : tnode) : string;
+      { '' when either no accepted array base in the nest is an object field, or
+        every field base is provably loop-invariant: the body makes NO call (a
+        method could reassign the field) and no field-handle reference is
+        reassigned in the body (DFA).  The single-assignment recognized shape
+        already guarantees the only in-loop write is the array element / scalar
+        accumulator, never a field handle, so the reference-reassignment check is
+        belt-and-suspenders; the no-call gate is the load-bearing one.  Runs on the
+        ORIGINAL nest before the reorder copy. }
+      var
+        fs : tic_fieldscan;
+        i : longint;
+        defsum : tdfaset;
+        refld : tnode;
+      begin
+        result:='';
+        fs.hascall:=false;
+        setlength(fs.reflds,0);
+        fs.nrefs:=0;
+        foreachnodestatic(pm_postprocess,nestbody,@ic_fieldscan_cb,@fs);
+        if fs.nrefs=0 then
+          exit;   { no object-field base -> nothing extra to gate }
+        if fs.hascall then
+          exit('array base is an object field but the nest body makes a call that could reassign it');
+        CalcDefSum(nestbody);
+        if not assigned(nestbody.optinfo) then
+          exit('data-flow information is unavailable for the loop body');
+        defsum:=nestbody.optinfo^.defsum;
+        for i:=0 to fs.nrefs-1 do
+          begin
+            refld:=fs.reflds[i];
+            if assigned(refld) and assigned(refld.optinfo) and
+               DynSetIn(defsum,refld.optinfo^.index) then
+              exit('object-field array base reference is reassigned in the loop');
+          end;
+      end;
+
     type
       tic_scan = record
         iout, iin : tabstractvarsym;  { current outer / inner loop counters }
@@ -9024,6 +9129,7 @@ unit optloop;
       var
         s, bsym : tsym;
         base : tnode;
+        fldref : tabstractvarsym;
       begin
         if sc.bad then
           exit;
@@ -9051,13 +9157,20 @@ unit optloop;
           vecn:
             begin
               base:=rangeelim_skip_typeconv(tvecnode(n).left);
-              if not assigned(base) or (base.nodetype<>loadn) then
+              if assigned(base) and (base.nodetype=loadn) then
+                bsym:=tloadnode(base).symtableentry
+              else if assigned(base) and (base.nodetype=subscriptn) and
+                      assigned(vect_field_base(base,fldref)) then
+                { a  Self.FData -style object-field dynamic-array base, identified
+                  by its field sym (the reorder passes leave the access in place; a
+                  field is loop-invariant per ic_fieldbase_gate) }
+                bsym:=tsym(vect_field_base(base,fldref))
+              else
                 begin
                   sc.bad:=true;
                   sc.badreason:='a multi-dimensional or computed array base is not supported';
                   exit;
                 end;
-              bsym:=tloadnode(base).symtableentry;
               if sc.subset_r then
                 begin
                   if bsym=sc.wsym then
@@ -9251,12 +9364,12 @@ unit optloop;
             begin
               { subset R: W[idx] := f(...) }
               base:=rangeelim_skip_typeconv(tvecnode(lhs).left);
-              if not assigned(base) or (base.nodetype<>loadn) or not assigned(rangeelim_simple_var(base)) then
-                exit('the written array is not a simple single-dimension array variable');
+              if not assigned(base) or not assigned(ic_write_base_sym(base)) then
+                exit('the written array is not a simple single-dimension array variable or invariant object field');
               if not ic_elem_ok(lhs.resultdef) then
                 exit('the written element is not an unmanaged scalar');
               sc.subset_r:=true;
-              sc.wsym:=tloadnode(base).symtableentry;
+              sc.wsym:=ic_write_base_sym(base);
               if (sc.wsym=tsym(iout)) or (sc.wsym=tsym(iin)) then
                 exit('the write target is a loop counter');
               sc.idxproto:=tvecnode(lhs).right;
@@ -9318,6 +9431,9 @@ unit optloop;
             end;
           if not(any_in_scaled and (cont_out>cont_in)) then
             exit('interchange is not more cache-contiguous than the current order');
+
+          { any object-field array base (Self.FData-style) must be loop-invariant }
+          result:=ic_fieldbase_gate(outerfor.t2);
         end;
 
       begin
