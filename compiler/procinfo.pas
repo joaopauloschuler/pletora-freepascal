@@ -106,6 +106,10 @@ unit procinfo;
           { Amount of stack adjustment after all alignments }
           final_localsize : longint;
 
+          { -OoSTACKGUARD: framepointer-relative offset of the reserved 8-byte
+            stack-canary slot (only meaningful when pi_stackguard is set) }
+          stackguard_offset : longint;
+
           { Labels for TRUE/FALSE condition, BREAK and CONTINUE }
           CurrBreakLabel,
           CurrContinueLabel : tasmlabel;

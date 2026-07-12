@@ -1279,9 +1279,71 @@ implementation
       );
 {$endif}
 
+    { -OoSTACKGUARD: gcc -fstack-protector-strong selection heuristic.  Returns
+      true iff the routine's frame holds an object worth protecting against a
+      linear stack smash: a local array/record aggregate, an address-taken local
+      (or by-value parameter copy thereof), or an inline-asm block.  Pure scalar
+      leaves are skipped so the switch costs virtually nothing where it cannot
+      help.  Assembler routines, the program init frame (whose "locals" are static
+      globals, not stack storage) and explicit nostackframe routines are excluded. }
+    function stackguard_wanted(pi:tcgprocinfo):boolean;
+
+      function st_has_vulnerable(st:tsymtable):boolean;
+        var
+          i : longint;
+          sym : tsym;
+          vs : tabstractvarsym;
+          isframeobj : boolean;
+        begin
+          result:=false;
+          if st=nil then
+            exit;
+          for i:=0 to st.SymList.Count-1 do
+            begin
+              sym:=tsym(st.SymList[i]);
+              if not (sym.typ in [localvarsym,paravarsym]) then
+                continue;
+              vs:=tabstractvarsym(sym);
+              if vs.vardef=nil then
+                continue;
+              { true stack-frame storage: locals always, parameters only when
+                passed by value (a by-ref/var/const param is just a pointer) }
+              isframeobj:=(sym.typ=localvarsym) or
+                          ((sym.typ=paravarsym) and (vs.varspez=vs_value));
+              if not isframeobj then
+                continue;
+              if vs.vardef.typ in [arraydef,recorddef] then
+                exit(true);
+              if vs.addr_taken then
+                exit(true);
+            end;
+        end;
+
+      begin
+        result:=false;
+        if not (cs_opt_stackguard in current_settings.optimizerswitches) then
+          exit;
+        if po_assembler in pi.procdef.procoptions then
+          exit;
+        if po_nostackframe in pi.procdef.procoptions then
+          exit;
+        if pi.procdef.proctypeoption=potype_proginit then
+          exit;
+        if pi_has_assembler_block in pi.flags then
+          exit(true);
+        if st_has_vulnerable(pi.procdef.parast) then
+          exit(true);
+        if st_has_vulnerable(pi.procdef.localst) then
+          exit(true);
+      end;
+
+
     procedure tcgprocinfo.setup_tempgen;
       begin
         tg:=tgobjclass.create;
+
+        if stackguard_wanted(self) then
+          include(flags,pi_stackguard);
 
 {$if defined(i386) or defined(x86_64) or defined(arm) or defined(aarch64) or defined(m68k)}
 {$if defined(arm)}

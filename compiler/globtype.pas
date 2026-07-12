@@ -1004,7 +1004,27 @@ interface
            an out-of-range idx that the unchecked gather silently reads).  AVX-512
            scatter (vscatterdps) and the neural-api im2col/conv adaptation remain
            open }
-         cs_opt_gather
+         cs_opt_gather,
+         { -fstack-protector-strong-style stack canaries (-OoSTACKGUARD): on entry
+           to a routine whose frame contains a local array/record aggregate, an
+           address-taken local, or an inline-asm block (gcc's -strong selection
+           heuristic; pure scalar leaves are skipped so the cost stays near zero),
+           store a secret guard word into a dedicated 8-byte slot reserved at the
+           very top of the local frame -- between the locals and the saved
+           RBP/return address, so a linear overflow of a local buffer hits it
+           first -- and, before every normal return, reload the slot and compare
+           it against the guard; on mismatch call the RTL handler
+           FPC_STACK_CHK_FAIL (prints "stack smashing detected" and aborts with a
+           nonzero exit code).  The guard is NOT the glibc %fs:0x28 TLS canary:
+           the default linux-x86_64 RTL is libc-free (static, no glibc TLS), so
+           the guard lives in an RTL-owned global FPC_STACK_CHK_GUARD seeded once
+           at startup from the getrandom syscall (with a TSC/stack-address mix
+           fallback).  Instrumented routines keep a real RBP frame (the frame
+           pointer is not omitted) so the canary slot has a stable location on
+           every exit path; raise/unwind exits never return through the smashed
+           frame so they safely bypass the check.  Opt-in, NOT in any -O level.
+           x86-64 only. }
+         cs_opt_stackguard
        );
        toptimizerswitches = set of toptimizerswitch;
 
@@ -1086,7 +1106,8 @@ interface
          'SHRINKWRAP','GVNPRE','PURE','PARTIALINLINE','STACKALLOC','SLP',
          'UNROLLDYN','PREFETCH','ICF','IPARA','FINALVALUE','SIBCALL',
          'REPORT','DEVIRT','IPACP','VECT256','CONSTEVAL','MODREF',
-         'APPROXTRANS','LOOPINTERCHANGE','LOOPTILE','DEADPARA','INT8DOT','GATHER'
+         'APPROXTRANS','LOOPINTERCHANGE','LOOPTILE','DEADPARA','INT8DOT','GATHER',
+         'STACKGUARD'
        );
        WPOptimizerSwitchStr : array [twpoptimizerswitch] of string[14] = (
          'DEVIRTCALLS','OPTVMTS','SYMBOLLIVENESS'
@@ -1511,7 +1532,11 @@ interface
          { set if no frame pointer is needed, the rules when this applies is target specific }
          pi_no_framepointer_needed,
          { procedure has been normalized so no expressions contain block nodes }
-         pi_normalized
+         pi_normalized,
+         { procedure is instrumented with a -OoSTACKGUARD stack canary; its frame
+           pointer is kept and an 8-byte guard slot is reserved at the top of the
+           local area (transient codegen flag, never serialized) }
+         pi_stackguard
        );
        tprocinfoflags=set of tprocinfoflag;
 

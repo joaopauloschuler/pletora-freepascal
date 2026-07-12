@@ -243,6 +243,10 @@ unit aoptx86;
           result-forwarded-through-a-callee-saved-register shape the -O4
           post-peephole deliberately punts on. }
         function OptSibCall(var p : tai) : Boolean;
+        { -OoSTACKGUARD: recognise the stack-canary check block an instrumented
+          epilogue emits before its teardown, so a sibling-call transform can hoist
+          it above the tail jump. }
+        function MatchCanaryBlock(hpx : tai; out lastins : tai) : Boolean;
         { Store merging (gcc -fstore-merging): coalesce a run of adjacent narrow
           constant stores off the same base register into one wider store. }
         function TryStoreMerge(var p : tai) : Boolean;
@@ -18294,6 +18298,64 @@ unit aoptx86;
       caller convention (register/cdecl/stdcall -- safecall and the exotic
       conventions rejected); and a direct call to a symbol (indirect/procvar
       calls rejected). }
+    { -OoSTACKGUARD: recognise the stack-canary check block g_proc_exit emits for an
+      instrumented routine, starting at hpx.  As emitted it is
+          mov  FPC_STACK_CHK_GUARD, %gr
+          mov  <framepointer-relative slot>, %r10
+          cmp  %r10, %gr
+          jne  <fail label>
+      but the earlier peephole normally folds the slot load into the compare,
+      leaving the 3-instruction form
+          mov  FPC_STACK_CHK_GUARD, %gr
+          cmp  <slot>, %gr
+          jne  <fail label>
+      (which is what actually reaches the post-peephole passes).  Both are
+      accepted.  On success returns true and sets lastins to the jne. }
+    function TX86AsmOptimizer.MatchCanaryBlock(hpx : tai; out lastins : tai) : Boolean;
+      var
+        m1,m2,m3,m4 : tai;
+        gr : tregister;
+      begin
+        Result:=false;
+        lastins:=nil;
+        m1:=hpx;
+        if not(MatchInstruction(m1,A_MOV,[S_Q])) or
+           (taicpu(m1).oper[0]^.typ<>top_ref) or
+           (taicpu(m1).oper[0]^.ref^.symbol=nil) or
+           (taicpu(m1).oper[0]^.ref^.symbol.name<>'FPC_STACK_CHK_GUARD') or
+           (taicpu(m1).oper[1]^.typ<>top_reg) then
+          exit;
+        gr:=taicpu(m1).oper[1]^.reg;
+        if not GetNextInstruction(m1,m2) then
+          exit;
+        { folded form: cmp <slot>,%gr ; jne }
+        if MatchInstruction(m2,A_CMP,[S_Q]) and
+           (taicpu(m2).oper[0]^.typ=top_ref) and
+           (taicpu(m2).oper[1]^.typ=top_reg) and
+           (getsupreg(taicpu(m2).oper[1]^.reg)=getsupreg(gr)) then
+          begin
+            if GetNextInstruction(m2,m3) and MatchInstruction(m3,A_Jcc,[S_NO]) then
+              begin
+                lastins:=m3;
+                Result:=true;
+              end;
+            exit;
+          end;
+        { unfolded form: mov <slot>,%r10 ; cmp %r10,%gr ; jne }
+        if MatchInstruction(m2,A_MOV,[S_Q]) and
+           (taicpu(m2).oper[0]^.typ=top_ref) and
+           (taicpu(m2).oper[1]^.typ=top_reg) and
+           GetNextInstruction(m2,m3) and MatchInstruction(m3,A_CMP,[S_Q]) and
+           (taicpu(m3).oper[0]^.typ=top_reg) and
+           (taicpu(m3).oper[1]^.typ=top_reg) and
+           GetNextInstruction(m3,m4) and MatchInstruction(m4,A_Jcc,[S_NO]) then
+          begin
+            lastins:=m4;
+            Result:=true;
+          end;
+      end;
+
+
     function TX86AsmOptimizer.OptSibCall(var p : tai) : Boolean;
       const
         { rax + rdx: the two integer function-return registers (a 128-bit
@@ -18314,6 +18376,12 @@ unit aoptx86;
         fwd_done    : array[0..maxfwd-1] of Boolean;         { restored yet }
         fwd_count, restore_count, teardown_count, i : integer;
         crossed_label, walk_ok, matched, distinct : Boolean;
+        { -OoSTACKGUARD: the four-instruction canary check the instrumented
+          epilogue emits before teardown (mov guard; mov slot; cmp; jne), to be
+          hoisted verbatim above the tail jump so it runs while the frame is
+          still live }
+        canary_first, canary_last : tai;
+        has_canary : Boolean;
 
       function reg_is_calleesaved(reg : tregister) : Boolean;
         begin
@@ -18413,6 +18481,9 @@ unit aoptx86;
         walk_ok:=true;
         teardown_count:=0;
         firstlabel:=nil;
+        has_canary:=false;
+        canary_first:=nil;
+        canary_last:=nil;
         hpret:=tai(p.Next);
         while assigned(hpret) and walk_ok do
           begin
@@ -18528,6 +18599,19 @@ unit aoptx86;
                     end;
               end;
 
+            { -OoSTACKGUARD canary check: recognise the four-instruction block once,
+              while the frame is still intact (before any teardown), so it can be
+              hoisted above the tail jump }
+            if (not matched) and (not has_canary) and (teardown_count=0) and
+              (pi_stackguard in current_procinfo.flags) and
+              MatchCanaryBlock(hpret,canary_last) then
+              begin
+                canary_first:=hpret;
+                has_canary:=true;
+                matched:=true;
+                hpret:=canary_last;
+              end;
+
             { teardown }
             if (not matched) and is_teardown(hpret) then
               begin
@@ -18557,6 +18641,30 @@ unit aoptx86;
                assigned(hpret) and (hpret.typ=ait_instruction) and
                MatchInstruction(hpret,A_RET,[S_NO]) and (taicpu(hpret).ops=0)) then
           exit;
+
+        { -OoSTACKGUARD: hoist a verbatim copy of the canary check above the call,
+          before the teardown, so it runs while the frame is still live.  In the
+          single-exit case the original block is removed with the rest of the
+          epilogue below; in the shared-epilogue (crossed_label) case the original
+          stays in place and keeps guarding the other exits (the same way the
+          teardown copy is hoisted while the shared teardown stays).  The jne
+          targets the out-of-line fail label, which sits after the RET untouched. }
+        if has_canary then
+          begin
+            hp:=canary_first;
+            while assigned(hp) do
+              begin
+                if hp.typ=ait_instruction then
+                  begin
+                    hpnew:=tai(hp.getcopy);
+                    taicpu(hpnew).fileinfo:=taicpu(p).fileinfo;
+                    InsertLLItem(p.previous,p,hpnew);
+                  end;
+                if hp=canary_last then
+                  break;
+                hp:=tai(hp.Next);
+              end;
+          end;
 
         { hoist a verbatim copy of the teardown (rsp release + pops only, never
           the result movs) above the call }
@@ -18632,6 +18740,9 @@ unit aoptx86;
         hpteardown,hpret,hpnew : tai;
         crossed_label,teardown_ok : Boolean;
         teardown_count : integer;
+        { -OoSTACKGUARD canary check hoisted above the tail jump }
+        canary_first,canary_last,hpc : tai;
+        has_canary : Boolean;
 {$endif x86_64}
       begin
         Result:=false;
@@ -18800,6 +18911,9 @@ unit aoptx86;
             crossed_label:=false;
             teardown_ok:=true;
             teardown_count:=0;
+            has_canary:=false;
+            canary_first:=nil;
+            canary_last:=nil;
             hpret:=tai(p.Next);
             while assigned(hpret) and teardown_ok do
               begin
@@ -18812,6 +18926,17 @@ unit aoptx86;
                   end;
                 if MatchInstruction(hpret,A_RET,[S_NO]) and (taicpu(hpret).ops=0) then
                   break;
+                { -OoSTACKGUARD canary check, recognised once before the teardown so
+                  it can be hoisted above the tail jump }
+                if (not has_canary) and (teardown_count=0) and
+                  (pi_stackguard in current_procinfo.flags) and
+                  MatchCanaryBlock(hpret,canary_last) then
+                  begin
+                    canary_first:=hpret;
+                    has_canary:=true;
+                    hpret:=tai(canary_last.Next);
+                    continue;
+                  end;
                 { stack release via lea }
                 if MatchInstruction(hpret,A_LEA,[S_Q]) and
                   (taicpu(hpret).oper[1]^.typ=top_reg) and
@@ -18847,8 +18972,32 @@ unit aoptx86;
               assigned(hpret) and (hpret.typ=ait_instruction) and
               MatchInstruction(hpret,A_RET,[S_NO]) and (taicpu(hpret).ops=0) then
               begin
+                { -OoSTACKGUARD: hoist a verbatim copy of the canary check above the
+                  call, before the teardown, so it runs while the frame is still
+                  live (the compare reads a still-valid rsp/rbp-relative slot).  The
+                  original stays for the shared-epilogue exits and is dropped with
+                  the rest of the epilogue in the single-exit case below. }
+                if has_canary then
+                  begin
+                    hpc:=canary_first;
+                    while assigned(hpc) do
+                      begin
+                        if hpc.typ=ait_instruction then
+                          begin
+                            hpnew:=tai(hpc.getcopy);
+                            taicpu(hpnew).fileinfo:=taicpu(p).fileinfo;
+                            InsertLLItem(p.previous,p,hpnew);
+                          end;
+                        if hpc=canary_last then
+                          break;
+                        hpc:=tai(hpc.Next);
+                      end;
+                  end;
                 { duplicate the teardown instructions verbatim, in order, right
-                  before the call }
+                  before the call.  Only the stack-release / callee-saved pop
+                  instructions are teardown; any -OoSTACKGUARD canary instructions
+                  in this range have already been hoisted above and must be skipped
+                  here (else they would be misread as pops). }
                 hpteardown:=tai(p.Next);
                 while hpteardown<>hpret do
                   begin
@@ -18861,11 +19010,16 @@ unit aoptx86;
                           A_ADD:
                             hpnew:=taicpu.op_const_reg(A_ADD,S_Q,
                               taicpu(hpteardown).oper[0]^.val,NR_STACK_POINTER_REG);
-                          else {A_POP}
+                          A_POP:
                             hpnew:=taicpu.op_reg(A_POP,S_Q,taicpu(hpteardown).oper[0]^.reg);
+                          else
+                            hpnew:=nil;
                         end;
+                        if assigned(hpnew) then
+                          begin
                         taicpu(hpnew).fileinfo:=taicpu(p).fileinfo;
                         InsertLLItem(p.previous,p,hpnew);
+                          end;
                       end;
                     hpteardown:=tai(hpteardown.Next);
                   end;

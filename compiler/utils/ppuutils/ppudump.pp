@@ -1726,7 +1726,9 @@ const
          (mask:pi_no_framepointer_needed;
          str:' set if no frame pointer is needed, the rules when this applies is target specific'),
          (mask:pi_normalized;
-         str:'  has been normalized so no expressions contain block nodes ')
+         str:'  has been normalized so no expressions contain block nodes '),
+         (mask:pi_stackguard;
+         str:'  is instrumented with a -OoSTACKGUARD stack canary ')
   );
 var
   procinfooptions : tprocinfoflags;
@@ -2619,7 +2621,8 @@ const
          'cs_opt_looptile',
          'cs_opt_dead_para',
          'cs_opt_int8dot',
-         'cs_opt_gather'
+         'cs_opt_gather',
+         'cs_opt_stackguard'
        );
     var
          globalswitch  : tglobalswitch;
