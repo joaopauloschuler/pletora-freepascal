@@ -141,7 +141,9 @@ fail() { echo "FAIL: $1"; rc=1; }
 
 # 1. float matmul: tiled ON (fast-math at -O4), untouched OFF
 on="$(remarks mmf.pp -O4 -OoLOOPTILE)"
-off="$(remarks mmf.pp -O4)"
+# -OoLOOPTILE is now in the -O4 default set, so the OFF case disables it
+# explicitly with the -OoNOLOOPTILE negative switch.
+off="$(remarks mmf.pp -O4 -OoNOLOOPTILE)"
 [ "$(cnt 'cache-blocked into' "$on")" -ge 1 ] && pass "float matmul tiled with -OoLOOPTILE" \
   || fail "float matmul not tiled with the switch on"
 [ -z "$off" ] && pass "no tiling remark at all without the switch" \
