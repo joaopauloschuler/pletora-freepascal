@@ -730,7 +730,8 @@ interface
            and -- because an exception unwind (longjmp) restores only
            callee-saved registers -- for any call inside a routine that itself
            has exception handling. Both integer and XMM/MM clobbers are tracked.
-           x86_64 only. Opt-in; NOT part of the -O4 defaults }
+           x86_64 only. Part of the -O4 default optimizer set (promoted after
+           the forced-suite/self-host/torture evaluation) }
          cs_opt_ipara,
          { final value replacement + dead loop elimination (-OoFINALVALUE):
            the gcc -ftree-scev-cprop scalar-evolution constant propagation
@@ -1163,7 +1164,7 @@ interface
        genericlevel3optimizerswitches = [cs_opt_level3,cs_opt_constant_propagate,cs_opt_nodedfa,cs_opt_loopstrength
                                          {$ifndef llvm},cs_opt_use_load_modify_store{$endif},
                                          cs_opt_loopunroll,cs_opt_forloop];
-       genericlevel4optimizerswitches = [cs_opt_level4,cs_opt_reorder_fields,cs_opt_dead_values,cs_opt_fastmath,cs_opt_loopmotion,cs_opt_loopunswitch,cs_opt_bitidiom,cs_opt_rangecheckelim,cs_opt_jumpthread,cs_opt_loopdistpat,cs_opt_looppeel,cs_opt_loopsplit,cs_opt_loopfuse,cs_opt_ifconvert,cs_opt_reassoc,cs_opt_unrolljam,cs_opt_predcom,cs_opt_sra,cs_opt_storemerge,cs_opt_casecluster,cs_opt_crossjump,cs_opt_blockorder,cs_opt_sink,cs_opt_storemotion,cs_opt_vrp,cs_opt_switchtable,cs_opt_ree,cs_opt_vectorize,cs_opt_devirt,cs_opt_dead_para,cs_opt_int8dot,cs_opt_loopinterchange,cs_opt_looptile,cs_opt_modref,cs_opt_pure];
+       genericlevel4optimizerswitches = [cs_opt_level4,cs_opt_reorder_fields,cs_opt_dead_values,cs_opt_fastmath,cs_opt_loopmotion,cs_opt_loopunswitch,cs_opt_bitidiom,cs_opt_rangecheckelim,cs_opt_jumpthread,cs_opt_loopdistpat,cs_opt_looppeel,cs_opt_loopsplit,cs_opt_loopfuse,cs_opt_ifconvert,cs_opt_reassoc,cs_opt_unrolljam,cs_opt_predcom,cs_opt_sra,cs_opt_storemerge,cs_opt_casecluster,cs_opt_crossjump,cs_opt_blockorder,cs_opt_sink,cs_opt_storemotion,cs_opt_vrp,cs_opt_switchtable,cs_opt_ree,cs_opt_vectorize,cs_opt_devirt,cs_opt_dead_para,cs_opt_int8dot,cs_opt_loopinterchange,cs_opt_looptile,cs_opt_modref,cs_opt_pure,cs_opt_ipara];
 
        { whole program optimizations whose information generation requires
          information from all loaded units
