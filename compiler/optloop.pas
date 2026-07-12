@@ -1380,8 +1380,12 @@ unit optloop;
           loop its global reads are invariant, and nothrow makes the zero-trip
           speculation into the preheader sound. }
         loopmaywrite : boolean;
+        { the loop body node (tfornode.t2 / twhilerepeatnode.right), stashed for
+          the -OoMODREF per-location hoist scan in modref_call_hoistable }
+        loopbody : tnode;
         function is_pure_invariant(expr : tnode) : boolean;
         function nothrow_call_hoistable(expr : tnode) : boolean;
+        function modref_call_hoistable(expr : tnode) : boolean;
         function find_existing_hoist(n : tnode) : ttempcreatenode;
         function hoistcandidate(var n : tnode) : foreachnoderesult;
         procedure processloop(var n : tnode);
@@ -1603,6 +1607,161 @@ unit optloop;
       end;
 
 
+    { -OoMODREF per-location hoist/sink support -------------------------------
+
+      A resolved direct call proven by -OoMODREF to WRITE NO MEMORY, to be
+      NON-TRAPPING, and to READ only a KNOWN, EXACT set of static variables
+      (never through a by-ref parameter) is a candidate for relocation (LICM
+      speculatively into the preheader; SINK conditionally into an if-arm) even
+      when the surrounding region is NOT globally memory-write-free.  The one
+      remaining obligation -- that the call reads the SAME value at the relocated
+      position as it would in place -- reduces to: no store in the RELEVANT
+      REGION (the loop body for LICM, the intervening if-condition for SINK)
+      writes any static the call reads.  This is exactly the per-static (item
+      (d)) footprint precision: modref_call_may_access_static(cn,s,false) answers
+      "may this call read static s".  So we walk the region and, for every store
+      it performs, reject if the call may read that store's target.
+
+      Store classification per node (over-reporting only DISABLES the relocation,
+      never enables an unsound one, so anything unattributable counts as a
+      conflict):
+        * a store to a plain LOCAL/temp/by-value param  -> no conflict (the call,
+          reading no by-ref actual, cannot name a caller local);
+        * a store to a nameable STATIC S               -> conflict iff the call
+          may read S;
+        * a store to anything else (deref/heap/self/by-ref target, asm, an
+          opaque or non-write-free call, an unknown intrinsic) -> conflict. }
+    type
+      tmodrefregionconflict = record
+        cn : tcallnode;
+        conflict : boolean;
+      end;
+      pmodrefregionconflict = ^tmodrefregionconflict;
+
+    { classify a store l-value's base: 0=local/temp (unnameable by a callee),
+      1=a specific named static (returned in S), 2=other observable memory
+      (deref / self / by-ref param / anything unattributable). Mirrors
+      licm_lvalue_writes_memory but also yields the static base. }
+    function licm_lvalue_static_base(t : tnode; out s : tstaticvarsym) : byte;
+      var
+        sym : tsym;
+      begin
+        result:=2;
+        s:=nil;
+        while assigned(t) do
+          case t.nodetype of
+            typeconvn: t:=ttypeconvnode(t).left;
+            subscriptn: t:=tsubscriptnode(t).left;
+            vecn: t:=tvecnode(t).left;
+            temprefn: exit(0);
+            derefn: exit(2);
+            loadn:
+              begin
+                sym:=tloadnode(t).symtableentry;
+                if sym is tstaticvarsym then
+                  begin
+                    s:=tstaticvarsym(sym);
+                    exit(1);
+                  end
+                else if sym is tparavarsym then
+                  begin
+                    if (vo_is_self in tparavarsym(sym).varoptions) then
+                      exit(2);
+                    if (tparavarsym(sym).varspez in [vs_var,vs_out,vs_constref]) and
+                       not(vo_is_funcret in tparavarsym(sym).varoptions) then
+                      exit(2)
+                    else
+                      exit(0);
+                  end
+                else if sym is tlocalvarsym then
+                  exit(0)
+                else
+                  exit(2);
+              end;
+            else
+              exit(2);
+          end;
+      end;
+
+    { one store target: no conflict for a local/temp, per-static query for a
+      named static, conflict for anything else }
+    procedure modref_region_note_store(pc : pmodrefregionconflict; lval : tnode);
+      var
+        s : tstaticvarsym;
+      begin
+        case licm_lvalue_static_base(lval,s) of
+          0: ; { local/temp/by-value param: unnameable, no conflict }
+          1: if modref_call_may_access_static(pc^.cn,s,false) then
+               pc^.conflict:=true;
+          else
+            pc^.conflict:=true;
+        end;
+      end;
+
+    { region walk: flags conflict:=true iff the region may write a location the
+      call pc^.cn may read (see the block comment above) }
+    function modref_region_conflict_cb(var n : tnode; arg : pointer) : foreachnoderesult;
+      var
+        pc : pmodrefregionconflict;
+        pd : tprocdef;
+        para : tcallparanode;
+      begin
+        result:=fen_false;
+        pc:=pmodrefregionconflict(arg);
+        case n.nodetype of
+          asmn:
+            begin pc^.conflict:=true; result:=fen_norecurse_true; end;
+          calln:
+            begin
+              { a region call writes no memory the outer call could read only if
+                -OoMODREF proved it writes NO memory at all; anything else may
+                store a static cn reads }
+              pd:=loop_call_target(n);
+              if not(assigned(pd) and modref_summary_available(pd) and
+                     (pd.modref_writes=mr_none)) then
+                begin pc^.conflict:=true; result:=fen_norecurse_true; end;
+            end;
+          assignn:
+            modref_region_note_store(pc,tassignmentnode(n).left);
+          derefn:
+            if ([nf_write,nf_modify]*n.flags)<>[] then
+              begin pc^.conflict:=true; result:=fen_norecurse_true; end;
+          inlinen:
+            case tinlinenode(n).inlinenumber of
+              in_inc_x,in_dec_x,in_succ_x,in_pred_x:
+                begin
+                  para:=tcallparanode(tinlinenode(n).left);
+                  while assigned(para) do
+                    begin
+                      if assigned(para.left) and
+                         (([nf_write,nf_modify]*para.left.flags)<>[]) then
+                        modref_region_note_store(pc,para.left);
+                      para:=tcallparanode(para.right);
+                    end;
+                end;
+              else
+                { any other intrinsic (setlength/new/dispose/I/O/...) may write }
+                begin pc^.conflict:=true; result:=fen_norecurse_true; end;
+            end;
+          else
+            ;
+        end;
+        if pc^.conflict then
+          result:=fen_norecurse_true;
+      end;
+
+    { true iff no store in REGION may write any location CN may read }
+    function modref_region_stable_for_call(region : tnode; cn : tcallnode) : boolean;
+      var
+        ctx : tmodrefregionconflict;
+      begin
+        ctx.cn:=cn;
+        ctx.conflict:=false;
+        if assigned(region) then
+          foreachnodestatic(pm_postprocess,region,@modref_region_conflict_cb,@ctx);
+        result:=not ctx.conflict;
+      end;
+
     { -OoPURE nothrow consumer: a resolved DIRECT call to a routine proved
       MEM-PURE (writes no memory; may read globals) AND NOTHROW (cannot raise or
       trap), whose every argument is loop-invariant, is hoistable into the
@@ -1643,6 +1802,60 @@ unit optloop;
       end;
 
 
+    { -OoMODREF per-location consumer: a resolved DIRECT call proved by -OoMODREF
+      to WRITE NO memory, to be NON-TRAPPING and to READ only an EXACT set of
+      static variables (never through a by-ref parameter), whose every argument
+      is loop-invariant, is hoistable into the preheader when the LOOP BODY does
+      not write any static the call reads.  Unlike nothrow_call_hoistable this
+      does NOT require the whole loop to be memory-write-free: the loop may store
+      freely to locals and to statics DISJOINT from the call's read set (item (d)
+      per-static footprint).  It also reaches routines -OoPURE cannot prove
+      mem-pure (e.g. one that takes the address of a local, or calls an impure
+      but write-free helper) but that -OoMODREF summarises as writes=none.  The
+      writes=none + non-trapping combination makes the speculative preheader
+      evaluation -- even for a zero-trip loop -- unobservable. }
+    function tlicmcontext.modref_call_hoistable(expr : tnode) : boolean;
+      var
+        pd : tprocdef;
+        para : tcallparanode;
+      begin
+        result:=false;
+        if not(cs_opt_modref in current_settings.optimizerswitches) then
+          exit;
+        if expr.nodetype<>calln then
+          exit;
+        if not licm_simple_type(expr.resultdef) then
+          exit;
+        if ([nf_write,nf_modify]*expr.flags)<>[] then
+          exit;
+        pd:=loop_call_target(expr);
+        if not assigned(pd) or not modref_summary_available(pd) then
+          exit;
+        { writes nothing, cannot trap, exact per-formal and per-static masks }
+        if (pd.modref_writes<>mr_none) or modref_pd_can_trap(pd) then
+          exit;
+        if not(pd.modref_pmask_exact and pd.modref_smask_exact) then
+          exit;
+        { reads no memory through any by-ref parameter (so its reads are exactly
+          the static set, which the region scan reasons about per location); a
+          by-ref read of a caller local could not be proven stable against the
+          loop's local stores }
+        if pd.modref_reads_pmask<>0 then
+          exit;
+        { every actual is a pure loop-invariant by-value value (a by-ref actual
+          is address-taken and so is rejected here, keeping reads_pmask=0 honest) }
+        para:=tcallparanode(tcallnode(expr).left);
+        while assigned(para) do
+          begin
+            if not licm_is_pure_invariant(loopdefsum,para.paravalue) then
+              exit;
+            para:=tcallparanode(para.nextpara);
+          end;
+        { the loop body must not write any static the call reads }
+        result:=modref_region_stable_for_call(loopbody,tcallnode(expr));
+      end;
+
+
     function tlicmcontext.find_existing_hoist(n : tnode) : ttempcreatenode;
       var
         i : sizeint;
@@ -1678,10 +1891,13 @@ unit optloop;
           exit;
         { is_pure_invariant covers const calls; a strictly weaker MEM-PURE +
           NOTHROW loop-invariant call is also hoistable when the loop writes no
-          memory (nothrow_call_hoistable) }
+          memory (nothrow_call_hoistable); and -OoMODREF hoists a write-free +
+          non-trapping call whose static reads the loop body does not write, even
+          when the loop DOES write other memory (modref_call_hoistable) }
         if not is_pure_invariant(n) then
           if not nothrow_call_hoistable(n) then
-            exit;
+            if not modref_call_hoistable(n) then
+              exit;
 
         { a purely constant arithmetic expression is already folded; require at
           least one variable read so we actually save work. A call is always
@@ -1705,13 +1921,20 @@ unit optloop;
             exit;
           end;
 
-        { -OoREPORT: a mem-pure+nothrow call hoisted via the nothrow relaxation
-          (is_pure_invariant said no, i.e. it is not CONST) -- make the consumer
-          of the independent nothrow attribute observable }
+        { -OoREPORT: a call hoisted via one of the two relaxations
+          (is_pure_invariant said no, i.e. it is not CONST) -- name which
+          consumer admitted it. nothrow_call_hoistable is tried first, so a call
+          it rejects was admitted by the -OoMODREF per-location path. }
         if (cs_opt_report in current_settings.optimizerswitches) and
            (n.nodetype=calln) and not is_pure_invariant(n) then
-          OptRemark(n.fileinfo,'licm',
-            'hoisted a proven mem-pure + NOTHROW loop-invariant call into the preheader (-OoPURE nothrow attribute)');
+          begin
+            if nothrow_call_hoistable(n) then
+              OptRemark(n.fileinfo,'licm',
+                'hoisted a proven mem-pure + NOTHROW loop-invariant call into the preheader (-OoPURE nothrow attribute)')
+            else
+              OptRemark(n.fileinfo,'licm',
+                'hoisted a proven -OoMODREF write-free + non-trapping loop-invariant call into the preheader (its static reads are not written in the loop)');
+          end;
 
         if not assigned(inittemps) then
           begin
@@ -1778,11 +2001,14 @@ unit optloop;
         deletestatements:=nil;
         nhoists:=0;
 
-        { walk the loop body top-down so the largest invariant subtree wins }
+        { stash the loop body for the -OoMODREF per-location hoist scan }
         if n.nodetype=forn then
-          foreachnodestatic(pm_preprocess,tfornode(n).t2,@licm_hoistcandidate_callback,@self)
+          loopbody:=tfornode(n).t2
         else
-          foreachnodestatic(pm_preprocess,twhilerepeatnode(n).right,@licm_hoistcandidate_callback,@self);
+          loopbody:=twhilerepeatnode(n).right;
+
+        { walk the loop body top-down so the largest invariant subtree wins }
+        foreachnodestatic(pm_preprocess,loopbody,@licm_hoistcandidate_callback,@self);
 
         if not assigned(inittemps) then
           exit;
@@ -10402,6 +10628,48 @@ unit optloop;
         end;
       end;
 
+    { -OoMODREF SINK consumer: a resolved DIRECT call proved to WRITE NO memory,
+      be NON-TRAPPING and READ only an EXACT set of statics (never through a
+      by-ref parameter), whose every argument is itself a movable (pure,
+      non-trapping, alias-free, non-address-taken) value, may be sunk into an
+      if-arm PAST the intervening condition COND provided COND does not write any
+      static the call reads.  Sinking makes the read-only non-trapping call
+      execute conditionally (fewer times) -- unobservable -- and the exact-static
+      footprint (item (d)) proves the same value is read at the later position.
+      The movable-argument requirement means the actuals are non-address-taken
+      locals/consts the condition cannot modify, so only the call's own static
+      reads need checking against COND. }
+    function sink_call_movable(cn : tcallnode; cond : tnode) : boolean;
+      var
+        pd : tprocdef;
+        para : tcallparanode;
+      begin
+        result:=false;
+        if not(cs_opt_modref in current_settings.optimizerswitches) then
+          exit;
+        if not licm_simple_type(cn.resultdef) then
+          exit;
+        if ([nf_write,nf_modify]*cn.flags)<>[] then
+          exit;
+        pd:=loop_call_target(cn);
+        if not assigned(pd) or not modref_summary_available(pd) then
+          exit;
+        if (pd.modref_writes<>mr_none) or modref_pd_can_trap(pd) then
+          exit;
+        if not(pd.modref_pmask_exact and pd.modref_smask_exact) then
+          exit;
+        if pd.modref_reads_pmask<>0 then
+          exit;
+        para:=tcallparanode(cn.left);
+        while assigned(para) do
+          begin
+            if not sink_movable_rhs(para.paravalue) then
+              exit;
+            para:=tcallparanode(para.nextpara);
+          end;
+        result:=modref_region_stable_for_call(cond,cn);
+      end;
+
     { attempt to sink the assignment held by statement node sn into the single
       arm of the following if that consumes it; returns true if it did }
     function sink_try(sn : tstatementnode) : boolean;
@@ -10435,9 +10703,13 @@ unit optloop;
           exit;
         idx:=assign.left.optinfo^.index;
 
-        { RHS must be pure, non-trapping and movable }
+        { RHS must be pure, non-trapping and movable: either a plain movable
+          expression, or (-OoMODREF) a write-free non-trapping call whose static
+          reads the intervening condition does not write }
         if not sink_movable_rhs(assign.right) then
-          exit;
+          if not((assign.right.nodetype=calln) and
+                 sink_call_movable(tcallnode(assign.right),ifstmt.left)) then
+            exit;
 
         { the condition must not read V }
         if sink_refs_sym(ifstmt.left,sym) then
