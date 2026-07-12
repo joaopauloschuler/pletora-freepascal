@@ -1024,7 +1024,27 @@ interface
            every exit path; raise/unwind exits never return through the smashed
            frame so they safely bypass the check.  Opt-in, NOT in any -O level.
            x86-64 only. }
-         cs_opt_stackguard
+         cs_opt_stackguard,
+         { interprocedural scalar replacement of aggregates (-OoIPASRA): part (b)
+           of the gcc -fipa-sra port (see optipasra.pas). Splits a `const`/
+           `constref` record parameter whose fields are only READ in the callee
+           into individual by-value scalar parameters, so the callee stops
+           dereferencing through the aggregate reference and the fields land in
+           registers. A single-pass fork cannot rewrite an already-compiled
+           callee's signature, so -- like -OoIPACP -- it CLONES: an eligible
+           routine's pre-firstpass body is stashed, and a later caller passing a
+           side-effect-free record actual for every splittable parameter gets a
+           fresh out-of-line clone whose signature has the record param replaced
+           by N scalar params (one per read field) and whose body reads those
+           params directly; the call is rebuilt to pass `rec.f1 .. rec.fN`. Only
+           const/constref record params every use of which is a direct read of a
+           splittable (ordinal/enum/float/pointer-sized, non-managed) field, at
+           most 4 fields, non-bitpacked record; virtual/exported/external/inline/
+           nested/address-taken callees are never touched (the original routine
+           is untouched -- cloning is additive). Same-unit only for this landing;
+           cross-unit reach and the WPO program-wide variant remain open. Opt-in;
+           NOT part of the -O4 defaults -- a wrong clone is a miscompile }
+         cs_opt_ipasra
        );
        toptimizerswitches = set of toptimizerswitch;
 
@@ -1107,7 +1127,7 @@ interface
          'UNROLLDYN','PREFETCH','ICF','IPARA','FINALVALUE','SIBCALL',
          'REPORT','DEVIRT','IPACP','VECT256','CONSTEVAL','MODREF',
          'APPROXTRANS','LOOPINTERCHANGE','LOOPTILE','DEADPARA','INT8DOT','GATHER',
-         'STACKGUARD'
+         'STACKGUARD','IPASRA'
        );
        WPOptimizerSwitchStr : array [twpoptimizerswitch] of string[14] = (
          'DEVIRTCALLS','OPTVMTS','SYMBOLLIVENESS'

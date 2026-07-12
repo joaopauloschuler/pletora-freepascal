@@ -139,6 +139,12 @@ interface
       generate_code_tree, with the module static symtable on the symtablestack. }
     procedure ipacp_process_main_body(mainpi:tcgprocinfo);
 
+    { -OoIPASRA: scan the already-parsed main program body for call sites that
+      pass a side-effect-free record actual to every splittable parameter of a
+      stashed routine, rebuild them to split-parameter clones, and compile those
+      clones.  Same timing contract as ipacp_process_main_body. }
+    procedure ipasra_process_main_body(mainpi:tcgprocinfo);
+
     { -OoCONSTEVAL: fold const-routine calls with all-constant arguments in the
       main program body into literals.  Must be called after MAINPI.parse_body
       and before its generate_code_tree. }
@@ -191,6 +197,7 @@ implementation
        optdeadpara,
        optpartialinline,
        optipacp,
+       optipasra,
        optconsteval,
        optipara,
        opticf,
@@ -4003,6 +4010,35 @@ implementation
       end;
 
 
+    procedure ipasra_process_main_body(mainpi:tcgprocinfo);
+      var
+        ipasra_pending : TFPObjectList;
+        ipasra_code    : tnode;
+        i              : longint;
+      begin
+        if not (cs_opt_ipasra in current_settings.optimizerswitches) then
+          exit;
+        if not assigned(mainpi) or not assigned(mainpi.procdef) or
+           not assigned(mainpi.code) then
+          exit;
+        if mainpi.procdef.proctypeoption<>potype_proginit then
+          exit;
+        ipasra_pending:=TFPObjectList.create(true);
+        try
+          ipasra_code:=mainpi.code;
+          mainpi.add_to_symtablestack;
+          ipasra_process_calls(mainpi.procdef,ipasra_code,ipasra_pending);
+          mainpi.remove_from_symtablestack;
+          mainpi.code:=ipasra_code;
+          for i:=0 to ipasra_pending.count-1 do
+            compile_ipacp_clone(tipasraclone(ipasra_pending[i]).clonepd,
+              tipasraclone(ipasra_pending[i]).clonecode);
+        finally
+          ipasra_pending.free;
+        end;
+      end;
+
+
     procedure consteval_process_main_body(mainpi:tcgprocinfo);
       var
         cecode : tnode;
@@ -4040,6 +4076,7 @@ implementation
         ipacp_pending    : TFPObjectList;
         ipacp_code       : tnode;
         ipacp_i          : longint;
+        ipasra_pending   : TFPObjectList;
       begin
         Message1(parser_d_procedure_start,pd.fullprocname(false));
         oldfailtokenmode:=[];
@@ -4047,6 +4084,7 @@ implementation
         pi_headerpd:=nil;
         pi_headercode:=nil;
         ipacp_pending:=nil;
+        ipasra_pending:=nil;
 
         { create a new procedure }
         current_procinfo:=cprocinfo.create(old_current_procinfo);
@@ -4125,6 +4163,27 @@ implementation
             tcgprocinfo(current_procinfo).code:=ipacp_code;
           end;
 
+        { -OoIPASRA: stash this routine's pre-codegen body as a split-clone
+          template, then scan its own body for direct calls to an already-stashed
+          routine that pass a side-effect-free record actual to every splittable
+          parameter and rebuild them to a split-parameter clone (compiled below,
+          after this routine's generate_code_tree). }
+        if (cs_opt_ipasra in current_settings.optimizerswitches) and
+           (not isnestedproc) and
+           (not(df_generic in pd.defoptions)) then
+          begin
+            ipasra_pending:=TFPObjectList.create(true);
+            ipasra_stash_candidate(pd,
+              tcgprocinfo(current_procinfo).code,
+              current_procinfo.flags,
+              assigned(current_procinfo.get_first_nestedproc));
+            ipacp_code:=tcgprocinfo(current_procinfo).code;
+            tcgprocinfo(current_procinfo).add_to_symtablestack;
+            ipasra_process_calls(pd,ipacp_code,ipasra_pending);
+            tcgprocinfo(current_procinfo).remove_from_symtablestack;
+            tcgprocinfo(current_procinfo).code:=ipacp_code;
+          end;
+
         { -OoCONSTEVAL: stash this routine's pre-codegen body as a template for
           later callers, then scan its own body for direct calls to an
           already-compiled proven-const routine whose arguments are all
@@ -4179,6 +4238,18 @@ implementation
               compile_ipacp_clone(tipacpclone(ipacp_pending[ipacp_i]).clonepd,
                 tipacpclone(ipacp_pending[ipacp_i]).clonecode);
             freeandnil(ipacp_pending);
+          end;
+
+        { -OoIPASRA: now that the caller has been code-generated (its call sites
+          already rebuilt to the split-clone symbols), compile the synthesised
+          split-parameter clone bodies (a split clone is an ordinary out-of-line
+          routine, so the IPACP clone-compiler applies unchanged). }
+        if assigned(ipasra_pending) then
+          begin
+            for ipacp_i:=0 to ipasra_pending.count-1 do
+              compile_ipacp_clone(tipasraclone(ipasra_pending[ipacp_i]).clonepd,
+                tipasraclone(ipasra_pending[ipacp_i]).clonecode);
+            freeandnil(ipasra_pending);
           end;
 
         { release procinfo }

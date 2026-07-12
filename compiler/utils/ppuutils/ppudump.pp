@@ -2622,7 +2622,8 @@ const
          'cs_opt_dead_para',
          'cs_opt_int8dot',
          'cs_opt_gather',
-         'cs_opt_stackguard'
+         'cs_opt_stackguard',
+         'cs_opt_ipasra'
        );
     var
          globalswitch  : tglobalswitch;
