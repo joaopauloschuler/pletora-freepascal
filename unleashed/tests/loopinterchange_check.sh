@@ -128,7 +128,9 @@ fail() { echo "FAIL: $1"; rc=1; }
 
 # 1. map: interchanged ON, untouched OFF
 on="$(remarks kmap.pp -O4 -OoLOOPINTERCHANGE)"
-off="$(remarks kmap.pp -O4)"
+# -OoLOOPINTERCHANGE is now in the -O4 default set, so the OFF case disables it
+# explicitly with the -OoNOLOOPINTERCHANGE negative switch.
+off="$(remarks kmap.pp -O4 -OoNOLOOPINTERCHANGE)"
 [ "$(cnt 'nest interchanged' "$on")" -ge 1 ] && pass "element-wise map interchanged with -OoLOOPINTERCHANGE" \
   || fail "element-wise map not interchanged with the switch on"
 [ -z "$off" ] && pass "no interchange remark at all without the switch" \
