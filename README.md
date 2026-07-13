@@ -1405,6 +1405,30 @@ Full descriptions, edge cases, and limitations in [unleashed/docs/extra-improvem
 
 ---
 
+### Measuring the `-O4` Optimizer Passes
+
+`-O4` enables 39 custom optimization passes (the `-Oo*` switches listed in `genericlevel4optimizerswitches` in [compiler/globtype.pas](compiler/globtype.pas)). To measure what each pass contributes **on its own**, the repository ships a "leave-one-in" benchmark driver:
+
+```bash
+unleashed/tests/o4_pass_speedup_bench.sh /tmp/o4matrix
+```
+
+For every pass `P` it benchmarks `-O3` (a baseline with **no** custom passes) against `-O3 -OoP` (exactly one pass enabled) over every benchmark fixture, interleaving the timed runs so thermal drift cancels and asserting both builds print identical checksums before trusting any speed number. The result is a pass × benchmark speedup table in `matrix.tsv`.
+
+The harness ([unleashed/tools/pf-bench/](unleashed/tools/pf-bench/)) and the benchmark fixtures ([unleashed/tests/bench/](unleashed/tests/bench/)) ship with the repository, so the script runs from a bare checkout once the compiler, RTL and packages are built (`./rebuildu.sh`); pf-bench itself is built automatically on first use. On hybrid P/E-core machines set `PF_BENCH_CPU=0` to pin the timed runs to one CPU, and use `PF_BENCH_PASSES="LICM VRP"` for a partial run. One caveat: the analysis passes `MODREF` / `PURE` / `IPARA` measure ~1.00x by design in this setup — they only relax fences for *other* passes, so their contribution shows in a leave-one-out comparison (`-O4` vs `-O4 -OoNOMODREF`) instead. A full run takes a few hours.
+
+Standalone speedup is only half the story — many passes pay in **combination** (enablers feeding consumers, loop reshaping opening the door for interchange/tiling/vectorization). To measure what passes contribute *inside* `-O4`, a second driver ablates functional **groups** of passes (`-O4` vs `-O4` with a whole group turned off):
+
+```bash
+unleashed/tests/o4_group_ablation_bench.sh /tmp/o4groups            # stage 1: 7 groups, ~25 min
+DRILL=1 PF_BENCH_GROUPS="loopnest" \
+    unleashed/tests/o4_group_ablation_bench.sh /tmp/o4drill         # stage 2: per-pass, inside a group
+```
+
+Group removal is robust to redundancy within a group (overlapping passes can cover for each other one at a time, but not when the whole team is off) and it measures the enabler analyses with their consumers running. A `NULL` row (both sides identical) always runs first and gives the machine's noise floor; group rows **below** the floor mark groups that earn their place. Stage 2 (`DRILL=1`) then attributes a group's effect to individual passes via leave-one-out within that group. The script header documents the group definitions and all the knobs.
+
+---
+
 ### Detailed Documentation
 
 Each feature has a dedicated reference page in [unleashed/docs/](unleashed/docs/) with the full grammar, semantics, edge cases, and IDE notes. Start at the index: [unleashed/docs/README.md](unleashed/docs/README.md).

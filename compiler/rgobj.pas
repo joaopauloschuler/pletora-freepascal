@@ -2091,7 +2091,12 @@ unit rgobj;
                                end;
                           top_ref:
                             begin
-                              if regtype in [R_INTREGISTER,R_ADDRESSREGISTER] then
+                              { R_MMREGISTER included for AVX2/AVX-512 VSIB gather/
+                                scatter: the reference INDEX can be a vector (xmm/ymm)
+                                register.  The inner getregtype filters keep the mm
+                                allocator to only that mm index (base/segment are
+                                always GP), so ordinary references are unaffected. }
+                              if regtype in [R_INTREGISTER,R_ADDRESSREGISTER,R_MMREGISTER] then
                                 with ref^ do
                                   begin
                                     if (base<>NR_NO) and
@@ -2364,7 +2369,9 @@ unit rgobj;
                                end;
                           Top_ref:
                             begin
-                              if regtype in [R_INTREGISTER,R_ADDRESSREGISTER] then
+                              { R_MMREGISTER included for VSIB gather/scatter (see
+                                the matching note in the use-collection pass). }
+                              if regtype in [R_INTREGISTER,R_ADDRESSREGISTER,R_MMREGISTER] then
                                 with ref^ do
                                   begin
                                     if (base<>NR_NO) and
@@ -2721,7 +2728,9 @@ unit rgobj;
                 end;
               top_ref:
                 begin
-                  if regtype in [R_INTREGISTER,R_ADDRESSREGISTER] then
+                  { R_MMREGISTER included for VSIB gather/scatter (see the note in
+                    the use-collection pass); only the mm VSIB index is affected. }
+                  if regtype in [R_INTREGISTER,R_ADDRESSREGISTER,R_MMREGISTER] then
                     with ref^ do
                       begin
                         if (base <> NR_NO) and
@@ -2784,7 +2793,9 @@ unit rgobj;
               end;
             top_ref:
               begin
-                if regtype in [R_INTREGISTER, R_ADDRESSREGISTER] then
+                { R_MMREGISTER included for VSIB gather/scatter (see the note in the
+                  use-collection pass); only the mm VSIB index is substituted. }
+                if regtype in [R_INTREGISTER, R_ADDRESSREGISTER, R_MMREGISTER] then
                   begin
                     if (ref^.base <> NR_NO) and
                         (getregtype(ref^.base)=regtype) then

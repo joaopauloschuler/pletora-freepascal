@@ -7289,7 +7289,7 @@ zmmreg_m,ymem32                           \350\351\352\361\371\1\x92\110        
 
 
 [VGATHERDPS]
-(Ch_Wop3, Ch_Rop2, Ch_Rop1)
+(Ch_RWop3, Ch_Rop2, Ch_RWop1)
 xmmreg,xmem32,xmmreg                      \361\362\371\1\x92\76\110                 AVX2,DISTINCT,DALL
 xmmreg_m,xmem32                           \350\361\371\1\x92\110                    AVX512,T1S,DISTINCT,DALL
 ymmreg,ymem32,ymmreg                      \361\362\364\371\1\x92\76\110             AVX2,DISTINCT,DALL
@@ -7316,7 +7316,7 @@ ymmreg_m,zmem32                           \350\351\361\371\1\x93\110            
 
 
 [VPGATHERDD]
-(Ch_Wop3, Ch_Rop2, Ch_Rop1)
+(Ch_RWop3, Ch_Rop2, Ch_RWop1)
 xmmreg,xmem32,xmmreg                      \361\362\371\1\x90\76\110                 AVX2,DISTINCT,DALL
 xmmreg_m,xmem32                           \350\361\371\1\x90\110                    AVX512,T1S,DISTINCT,DALL
 ymmreg,ymem32,ymmreg                      \361\362\364\371\1\x90\76\110             AVX2,DISTINCT,DALL

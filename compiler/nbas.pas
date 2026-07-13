@@ -115,7 +115,33 @@ interface
        TAsmNodeFlag = (
          asmnf_get_asm_position,
          { Used registers in assembler block }
-         asmnf_has_registerlist
+         asmnf_has_registerlist,
+         { FPC Unleashed: this asm node is a copy spliced into a caller by the
+           inliner (see optcall.mark_inline_asm_copy). Forces tcgasmnode to take
+           the label-uniquing/copy path even though the enclosing routine is not
+           itself marked po_inline, so local asm labels stay unique across the
+           multiple call sites the inline body is expanded into. }
+         asmnf_inline_copy,
+         { FPC Unleashed (cross-unit inline-asm splicing): set at ppuload time
+           (tasmnode.ppuload) -- this asm body was DESERIALIZED from a ppu, so
+           its tai symbols were re-resolved by name against THIS module (valid,
+           live).  An asm body WITHOUT this flag is the in-memory parse tree of a
+           unit compiled in the same process; when spliced cross-unit its module-
+           local asm symbols are use-after-free (the block was written to ppu but
+           the live copy still points at the defining module's asmdata objects),
+           so ncal.check_inlining keeps such a cross-unit call out of line.  Never
+           serialized (excluded before ppuwrite). }
+         asmnf_from_ppu,
+         { FPC Unleashed (cross-unit inline-asm splicing): set at buildderefimpl
+           (ppu write) time when this asm block references a module-local symbol
+           that cannot be reconstructed in another unit -- a local asm label, a
+           top_ref/relsymbol or ait_const sym whose bind is not a global/external
+           one, or any tai the round trip does not fully reconstruct.  A body
+           carrying such a block is kept out of line cross-unit (ncal.check_
+           inlining); a block WITHOUT this flag is cross-unit-safe (registers,
+           constants, top_local params/locals/result and global top_ref symbols
+           all round-trip). }
+         asmnf_crossunit_unsafe
        );
 
        TAsmNodeFlags = set of TAsmNodeFlag;
@@ -422,7 +448,68 @@ interface
          streamed to a PPU: OptimizeVectorize refuses to run on inline-candidate
          procedures, so the node cannot leak into inline info. }
        tvectoropkind = (vok_arr_arr, vok_arr_scalar, vok_copy, vok_broadcast, vok_minmax,
-                        vok_reduce_init, vok_reduce_sum, vok_reduce_dot, vok_reduce_finish);
+                        vok_reduce_init, vok_reduce_sum, vok_reduce_dot, vok_reduce_finish,
+                        { vok_transc: a[i..i+VL-1] := f(b[i..i+VL-1]) where f is an
+                          inlined APPROXIMATE single-precision transcendental
+                          (-OoAPPROXTRANS).  transfunc selects which; left=dest
+                          window a[i], right=source window b[i]. }
+                        vok_transc,
+                        { INT8 quantized dot-product reduction (-OoINT8DOT). Three
+                          cooperating nodes share a register-resident 32-bit-integer
+                          packed accumulator (via redctx), exactly like the float
+                          vok_reduce_* trio but with an integer widening MAC body:
+                            vok_int8dot_init   acc := [s,0,..]  (32-bit int lanes;
+                                    left=incoming scalar 32-bit int seed s)
+                            vok_int8dot_body   acc += widen16(a[i..])*widen16(b[i..])
+                                    reduced with vpmaddwd (left=a[i], right=b[i]
+                                    shortint windows)
+                            vok_int8dot_finish s := horizontal-sum(acc)
+                                    (left=target 32-bit int scalar temp)
+                          vecwidth is the number of int8 ELEMENTS per iteration:
+                          8 (128-bit xmm, 4 int32 lanes) or 16 (256-bit ymm, 8 int32
+                          lanes under AVX2). isdouble is unused (always false). }
+                        vok_int8dot,
+                        vok_int8dot_init, vok_int8dot_body, vok_int8dot_finish,
+                        { Indexed-gather single-precision sum reduction (-OoGATHER):
+                          s := s + a[idx[i]] where a is a dynamic array of single and
+                          idx a dynamic array of signed 32-bit ints.  The register-
+                          resident float accumulator is seeded/horizontally-summed by
+                          the ordinary vok_reduce_init / vok_reduce_finish trio (a
+                          gather sum is a plain float sum reduction whose element is
+                          gathered rather than contiguously loaded); only the body is
+                          special.  vok_gather is the recognizer's shape tag;
+                          vok_gather_body is the codegen node:
+                            left  = idx[i]  (the index-array element access: its
+                                    address gives the base of the VF contiguous int32
+                                    index window, loaded with vmovdqu)
+                            right = a[0]    (the gathered array's element 0: its
+                                    address is the VSIB base for vgatherdps)
+                          vecwidth = VF (4 xmm / 8 ymm).  Emits vgatherdps with an
+                          all-ones mask re-materialised each iteration and adds the
+                          gathered window into redctx^.accreg.  AVX2-only. }
+                        vok_gather, vok_gather_body);
+
+       { the approximate transcendental a vok_transc node evaluates per lane }
+       ttranscfunc = (tf_exp, tf_tanh, tf_sigmoid);
+
+       { Shared, register-resident accumulator context for a single vectorized
+         reduction (sum / dot product).  The three cooperating reduction nodes --
+         vok_reduce_init (before the loop), vok_reduce_sum/dot (in the loop body)
+         and vok_reduce_finish (after the loop) -- all point to ONE of these so the
+         packed accumulator lives in a persisting xmm register across the whole
+         loop instead of being stored/reloaded through a stack slot every
+         iteration.  vok_reduce_init allocates the virtual mm register at codegen
+         time (rg is not available earlier) and records it here; the body and
+         finish nodes then read/update that same register.  refcount is a plain
+         share count so dogetcopy/free of any subset of the three nodes disposes
+         the record exactly once. }
+       pvecreducectx = ^tvecreducectx;
+       tvecreducectx = record
+          accreg   : tregister;   { the register-resident packed accumulator }
+          seeded   : boolean;     { true once vok_reduce_init has allocated accreg }
+          refcount : longint;     { number of nodes sharing this record }
+       end;
+
        tvectoropnode = class(ttertiarynode)
           op : TOpCG;         { OP_ADD, OP_SUB or OP_IMUL (single-precision) }
           vecwidth : longint; { number of single lanes processed per iteration }
@@ -430,10 +517,12 @@ interface
           scalarleft : boolean; { vok_arr_scalar: true if s is the op's left operand (s op b[i]) }
           ismax : boolean;      { vok_minmax: true for maxps (a[i]:=max(u,v)), false for minps }
           isdouble : boolean;   { false: single (VL=4, ..ps); true: double (VL=2, ..pd) }
+          transfunc : ttranscfunc; { vok_transc: which approximate transcendental (exp/tanh/sigmoid) }
+          redctx : pvecreducectx; { shared register-resident accumulator (reduction kinds only) }
           constructor create(a,b,c : tnode; _op : TOpCG; _vecwidth : longint; _isdouble : boolean);virtual;
           constructor create_scalar(a,b,splat : tnode; _op : TOpCG; _scalarleft : boolean; _vecwidth : longint; _isdouble : boolean);
           constructor create_copy(a,b : tnode; _vecwidth : longint; _isdouble : boolean);
-          constructor create_broadcast(splat,scalar : tnode; _isdouble : boolean);
+          constructor create_broadcast(splat,scalar : tnode; _vecwidth : longint; _isdouble : boolean);
           { vok_minmax: a[i..i+VL-1] := max/min(u, v) where u (opA, loaded into the
             destination register) and v (opB, the second/NaN-preferred operand) are
             each a 16-byte window -- an array-element access or a pre-broadcast
@@ -441,13 +530,36 @@ interface
             (NaN returns opB), so every lane is bit-identical to the if-converted
             scalar min/max. }
           constructor create_minmax(a,opa,opb : tnode; _ismax : boolean; _vecwidth : longint);
+          { vok_transc: a[i..i+VL-1] := f(b[i..i+VL-1]) for an approximate
+            single-precision transcendental f (exp/tanh/sigmoid), lowered to an
+            inline SSE/AVX minimax polynomial. a=dest window, b=source window. }
+          constructor create_transc(a,b : tnode; _func : ttranscfunc; _vecwidth : longint);
+          { softmax variant  a[i] := exp(b[i]-m): bias is the pre-broadcast [m,..]
+            slot, subtracted from the b[i] window before the packed expf. }
+          constructor create_transc_bias(a,b,bias : tnode; _func : ttranscfunc; _vecwidth : longint);
           { reduction (single/double-precision sum / dot product): a packed
             accumulator slot is initialised with the incoming scalar in lane 0,
             accumulated VL-wide across the loop, then horizontally summed back into
             the scalar. }
-          constructor create_reduce_init(acc,scalar : tnode; _isdouble : boolean);
-          constructor create_reduce(acc,b,c : tnode; _isdot : boolean; _vecwidth : longint; _isdouble : boolean);
-          constructor create_reduce_finish(target,acc : tnode; _vecwidth : longint; _isdouble : boolean);
+          constructor create_reduce_init(seed : tnode; _vecwidth : longint; _isdouble : boolean);
+          constructor create_reduce(b,c : tnode; _isdot : boolean; _vecwidth : longint; _isdouble : boolean);
+          constructor create_reduce_finish(target : tnode; _vecwidth : longint; _isdouble : boolean);
+          { INT8 quantized dot-product reduction (-OoINT8DOT): a register-resident
+            32-bit-integer packed accumulator, seeded with the incoming scalar,
+            accumulated with a widening vpmaddwd MAC across the loop, then
+            horizontally summed back into the scalar.  _vecwidth is the int8 element
+            count per iteration (8 -> xmm/4 lanes, 16 -> ymm/8 lanes). }
+          constructor create_int8dot_init(seed : tnode; _vecwidth : longint);
+          constructor create_int8dot(b,c : tnode; _vecwidth : longint);
+          constructor create_int8dot_finish(target : tnode; _vecwidth : longint);
+          { -OoGATHER body: idxelem = idx[i] (index window source), abase = a[0]
+            (VSIB base of the gathered single array). }
+          constructor create_gather(idxelem,abase : tnode; _vecwidth : longint);
+          { allocate a fresh shared reduction context and attach it to self }
+          function new_redctx : pvecreducectx;
+          { attach an existing shared reduction context to self (bumps its share count) }
+          procedure attach_redctx(ctx : pvecreducectx);
+          destructor destroy;override;
           function pass_typecheck : tnode;override;
           function pass_1 : tnode;override;
           function dogetcopy : tnode;override;
@@ -496,6 +608,7 @@ implementation
     uses
       verbose,globals,systems,
       ppu,
+      aasmbase,
       symsym,symconst,symdef,defutil,defcmp,
       pass_1,
       nutils,nld,ncnv,
@@ -639,11 +752,11 @@ implementation
       end;
 
 
-    constructor tvectoropnode.create_broadcast(splat,scalar : tnode; _isdouble : boolean);
+    constructor tvectoropnode.create_broadcast(splat,scalar : tnode; _vecwidth : longint; _isdouble : boolean);
       begin
         inherited create(vectoropn,splat,scalar,nil);
         op:=OP_NONE;
-        vecwidth:=0;
+        vecwidth:=_vecwidth;
         kind:=vok_broadcast;
         scalarleft:=false;
         isdouble:=_isdouble;
@@ -662,20 +775,52 @@ implementation
       end;
 
 
-    constructor tvectoropnode.create_reduce_init(acc,scalar : tnode; _isdouble : boolean);
+    constructor tvectoropnode.create_transc(a,b : tnode; _func : ttranscfunc; _vecwidth : longint);
       begin
-        inherited create(vectoropn,acc,scalar,nil);
+        inherited create(vectoropn,a,b,nil);
         op:=OP_NONE;
-        vecwidth:=0;
+        vecwidth:=_vecwidth;
+        kind:=vok_transc;
+        scalarleft:=false;
+        isdouble:=false;   { approximate transcendentals are single-precision only }
+        transfunc:=_func;
+      end;
+
+
+    constructor tvectoropnode.create_transc_bias(a,b,bias : tnode; _func : ttranscfunc; _vecwidth : longint);
+      begin
+        { softmax shape  a[i] := exp(b[i]-m):  the third operand is the pre-broadcast
+          [m,m,..] slot the body subtracts from b[i] before the packed expf. }
+        inherited create(vectoropn,a,b,bias);
+        op:=OP_NONE;
+        vecwidth:=_vecwidth;
+        kind:=vok_transc;
+        scalarleft:=false;
+        isdouble:=false;   { approximate transcendentals are single-precision only }
+        transfunc:=_func;
+      end;
+
+
+    { reduction: the packed accumulator is register-resident (shared via redctx),
+      so these nodes no longer carry a memory-slot operand.
+        init:   left = incoming scalar seed s (kept in lane 0)
+        sum:    left = b[i] window
+        dot:    left = b[i] window   right = c[i] window
+        finish: left = target scalar temp the horizontal sum is written to }
+    constructor tvectoropnode.create_reduce_init(seed : tnode; _vecwidth : longint; _isdouble : boolean);
+      begin
+        inherited create(vectoropn,seed,nil,nil);
+        op:=OP_NONE;
+        vecwidth:=_vecwidth;
         kind:=vok_reduce_init;
         scalarleft:=false;
         isdouble:=_isdouble;
       end;
 
 
-    constructor tvectoropnode.create_reduce(acc,b,c : tnode; _isdot : boolean; _vecwidth : longint; _isdouble : boolean);
+    constructor tvectoropnode.create_reduce(b,c : tnode; _isdot : boolean; _vecwidth : longint; _isdouble : boolean);
       begin
-        inherited create(vectoropn,acc,b,c);
+        inherited create(vectoropn,b,c,nil);
         op:=OP_ADD;
         vecwidth:=_vecwidth;
         if _isdot then
@@ -687,14 +832,91 @@ implementation
       end;
 
 
-    constructor tvectoropnode.create_reduce_finish(target,acc : tnode; _vecwidth : longint; _isdouble : boolean);
+    constructor tvectoropnode.create_reduce_finish(target : tnode; _vecwidth : longint; _isdouble : boolean);
       begin
-        inherited create(vectoropn,target,acc,nil);
+        inherited create(vectoropn,target,nil,nil);
         op:=OP_ADD;
         vecwidth:=_vecwidth;
         kind:=vok_reduce_finish;
         scalarleft:=false;
         isdouble:=_isdouble;
+      end;
+
+
+    constructor tvectoropnode.create_int8dot_init(seed : tnode; _vecwidth : longint);
+      begin
+        inherited create(vectoropn,seed,nil,nil);
+        op:=OP_NONE;
+        vecwidth:=_vecwidth;
+        kind:=vok_int8dot_init;
+        scalarleft:=false;
+        isdouble:=false;
+      end;
+
+
+    constructor tvectoropnode.create_int8dot(b,c : tnode; _vecwidth : longint);
+      begin
+        inherited create(vectoropn,b,c,nil);
+        op:=OP_ADD;
+        vecwidth:=_vecwidth;
+        kind:=vok_int8dot_body;
+        scalarleft:=false;
+        isdouble:=false;
+      end;
+
+
+    constructor tvectoropnode.create_int8dot_finish(target : tnode; _vecwidth : longint);
+      begin
+        inherited create(vectoropn,target,nil,nil);
+        op:=OP_ADD;
+        vecwidth:=_vecwidth;
+        kind:=vok_int8dot_finish;
+        scalarleft:=false;
+        isdouble:=false;
+      end;
+
+
+    constructor tvectoropnode.create_gather(idxelem,abase : tnode; _vecwidth : longint);
+      begin
+        inherited create(vectoropn,idxelem,abase,nil);
+        op:=OP_ADD;
+        vecwidth:=_vecwidth;
+        kind:=vok_gather_body;
+        scalarleft:=false;
+        isdouble:=false;
+      end;
+
+
+    function tvectoropnode.new_redctx : pvecreducectx;
+      begin
+        New(redctx);
+        { accreg is left undefined until vok_reduce_init allocates it; the
+          `seeded` flag guards every read, so no CPU-specific null-register
+          constant is needed here (nbas is architecture-neutral) }
+        redctx^.seeded:=false;
+        redctx^.refcount:=1;
+        result:=redctx;
+      end;
+
+
+    procedure tvectoropnode.attach_redctx(ctx : pvecreducectx);
+      begin
+        redctx:=ctx;
+        if assigned(redctx) then
+          inc(redctx^.refcount);
+      end;
+
+
+    destructor tvectoropnode.destroy;
+      begin
+        if assigned(redctx) then
+          begin
+            dec(redctx^.refcount);
+            if redctx^.refcount<=0 then
+              Dispose(redctx);
+            redctx:=nil;
+          end;
+        inherited destroy;
       end;
 
 
@@ -705,7 +927,8 @@ implementation
           are internally-built temp refs / invariant scalars); just make sure
           they carry a resultdef }
         typecheckpass(left);
-        typecheckpass(right);
+        if assigned(right) then
+          typecheckpass(right);
         if assigned(third) then
           typecheckpass(third);
         resultdef:=voidtype;
@@ -716,7 +939,8 @@ implementation
       begin
         result:=nil;
         firstpass(left);
-        firstpass(right);
+        if assigned(right) then
+          firstpass(right);
         if assigned(third) then
           firstpass(third);
         expectloc:=LOC_VOID;
@@ -734,6 +958,11 @@ implementation
         n.scalarleft:=scalarleft;
         n.ismax:=ismax;
         n.isdouble:=isdouble;
+        n.transfunc:=transfunc;
+        { share the same register-resident accumulator context with the copy so a
+          whole-tree clone keeps init/body/finish agreeing on one xmm register }
+        n.redctx:=nil;
+        n.attach_redctx(redctx);
         result:=n;
       end;
 
@@ -746,7 +975,8 @@ implementation
                 (tvectoropnode(p).kind=kind) and
                 (tvectoropnode(p).scalarleft=scalarleft) and
                 (tvectoropnode(p).ismax=ismax) and
-                (tvectoropnode(p).isdouble=isdouble);
+                (tvectoropnode(p).isdouble=isdouble) and
+                (tvectoropnode(p).transfunc=transfunc);
       end;
 
 {*****************************************************************************
@@ -1454,6 +1684,9 @@ implementation
       begin
         inherited ppuload(t,ppufile);
         ppufile.getset(tppuset1(asmnodeflags));
+        { deserialized from a ppu: its tai symbols are re-resolved by name against
+          this module and safe to splice cross-unit (see asmnf_from_ppu) }
+        include(asmnodeflags,asmnf_from_ppu);
         if not(asmnf_get_asm_position in asmnodeflags) then
           begin
             p_asm:=TAsmList.create;
@@ -1477,7 +1710,8 @@ implementation
         hp : tai;
       begin
         inherited ppuwrite(ppufile);
-        ppufile.putset(tppuset1(asmnodeflags));
+        { asmnf_from_ppu is a load-time property, not part of the stored body }
+        ppufile.putset(tppuset1(asmnodeflags-[asmnf_from_ppu]));
 { TODO: FIXME Add saving of register sets}
         if not(asmnf_get_asm_position in asmnodeflags) then
           begin
@@ -1493,6 +1727,56 @@ implementation
       end;
 
 
+    { FPC Unleashed (cross-unit inline-asm splicing): true when every tai in the
+      block round-trips through a ppu into ANOTHER unit soundly, so the block can
+      be spliced cross-unit.  Safe content is registers, constants, top_local
+      param/local/result operands and top_ref/relsymbol operands whose symbol is
+      a global/external one (re-resolved by name in the loading unit).  A local
+      asm label, a module-local (non-global) top_ref symbol, an ait_const with a
+      symbol, or any other symbol-carrying tai cannot be reconstructed in the
+      splicing unit and makes the block cross-unit-unsafe. }
+    function asm_block_crossunit_safe(l : TAsmList) : boolean;
+      const
+        crossunit_global = [AB_EXTERNAL,AB_COMMON,AB_GLOBAL,AB_WEAK_EXTERNAL,
+          AB_PRIVATE_EXTERN,AB_IMPORT,AB_LAZY,AB_INDIRECT,AB_EXTERNAL_INDIRECT,
+          AB_WEAK];
+
+      function sym_ok(s : tasmsymbol) : boolean;
+        begin
+          sym_ok:=(not assigned(s)) or (s.bind in crossunit_global);
+        end;
+
+      var
+        hp : tai;
+        i  : longint;
+      begin
+        asm_block_crossunit_safe:=true;
+        if not assigned(l) then
+          exit;
+        hp:=tai(l.first);
+        while assigned(hp) do
+          begin
+            case hp.typ of
+              { benign: no cross-unit symbol identity }
+              ait_comment,ait_align,ait_regalloc,ait_tempalloc,
+              ait_marker,ait_force_line,ait_cfi,ait_none :
+                ;
+              ait_instruction :
+                for i:=0 to tai_cpu_abstract(hp).ops-1 do
+                  if tai_cpu_abstract(hp).oper[i]^.typ=top_ref then
+                    if not(sym_ok(tai_cpu_abstract(hp).oper[i]^.ref^.symbol) and
+                           sym_ok(tai_cpu_abstract(hp).oper[i]^.ref^.relsymbol)) then
+                      exit(false);
+              else
+                { ait_label / ait_const-with-sym / ait_symbol / directives / any
+                  other symbol- or structure-carrying tai: not reconstructable }
+                exit(false);
+            end;
+            hp:=tai(hp.next);
+          end;
+      end;
+
+
     procedure tasmnode.buildderefimpl;
       var
         hp : tai;
@@ -1500,6 +1784,8 @@ implementation
         inherited buildderefimpl;
         if not(asmnf_get_asm_position in asmnodeflags) then
           begin
+            if not asm_block_crossunit_safe(p_asm) then
+              include(asmnodeflags,asmnf_crossunit_unsafe);
             hp:=tai(p_asm.first);
             while assigned(hp) do
              begin

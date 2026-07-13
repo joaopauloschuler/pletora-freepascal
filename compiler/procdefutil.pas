@@ -304,13 +304,13 @@ implementation
     the RTL event, a swallowed worker exception (never awaited), and the thread
     handle. no `inherited` call - TObject.Destroy is an empty stub and the
     managed fields are finalized by FreeInstance after the destructor chain }
-  procedure async_add_destructor(clsdef:tobjectdef;fEvent,fExc,fTid:tfieldvarsym);
+  procedure async_add_destructor(clsdef:tobjectdef;fEvent,fExc,fTid,fJoin:tfieldvarsym);
     var
       pd : tprocdef;
       oldstack : tsymtablestack;
       selfsym,sym : tsym;
-      body : tnode;
-      stmt : tstatementnode;
+      body,tidbody : tnode;
+      stmt,tidstmt : tstatementnode;
       i : longint;
 
     function fld(f:tfieldvarsym):tnode;
@@ -352,6 +352,7 @@ implementation
         end;
       selfsym:=async_find_self(pd);
       body:=internalstatements(stmt);
+      tidbody:=internalstatements(tidstmt);
       addstatement(stmt,cifnode.create(
         caddnode.create(unequaln,fld(fEvent),cnilnode.create),
         ccallnode.createintern('RTLEVENTDESTROY',ccallparanode.create(fld(fEvent),nil)),
@@ -360,15 +361,83 @@ implementation
         caddnode.create(unequaln,fld(fExc),cnilnode.create),
         ccallnode.create(nil,tprocsym(class_tobject.symtable.find('FREE')),class_tobject.symtable,fld(fExc),[],nil),
         nil));
+      { join the worker before closing the handle: CloseThread is a no-op on
+        unix, so an unjoined worker's thread-exit epilogue (threadvar/heap
+        teardown after it drops __keepalive) can still be running when the
+        program shuts down the RTL, racing unit finalization (observed as a
+        rare exit-time hang under heaptrc). the join is bounded: the
+        destructor can only run once the worker has dropped __keepalive, i.e.
+        only its epilogue remains. skip it when the destructor runs on the
+        worker itself (the worker's own __keepalive drop held the last
+        reference) - joining your own thread deadlocks. __joinflag elects a
+        single joiner between __Await and Destroy: joining the same thread
+        twice is undefined behaviour }
+      addstatement(tidstmt,cifnode.create(
+        caddnode.create(unequaln,
+          ccallnode.createintern('GETCURRENTTHREADID',nil),
+          fld(fTid)),
+        cifnode.create(
+          caddnode.create(equaln,
+            ccallnode.createintern('INTERLOCKEDEXCHANGE',
+              ccallparanode.create(cordconstnode.create(1,s32inttype,false),
+                ccallparanode.create(fld(fJoin),nil))),
+            cordconstnode.create(0,s32inttype,false)),
+          ccallnode.createintern('WAITFORTHREADTERMINATE',
+            ccallparanode.create(cordconstnode.create(0,s32inttype,false),
+              ccallparanode.create(fld(fTid),nil))),
+          nil),
+        nil));
+      addstatement(tidstmt,ccallnode.createintern('CLOSETHREAD',ccallparanode.create(fld(fTid),nil)));
       { TThreadID is ordinal on some targets and pointer-like on others, so
         compare against a zero constant cast to it (folds at typecheck) }
       addstatement(stmt,cifnode.create(
         caddnode.create(unequaln,
           fld(fTid),
           ctypeconvnode.create_internal(cordconstnode.create(0,ptruinttype,false),fTid.vardef)),
-        ccallnode.createintern('CLOSETHREAD',ccallparanode.create(fld(fTid),nil)),
+        tidbody,
         nil));
       async_defer_method(pd,body);
+    end;
+
+
+  { synthesize the elect-one-joiner wait used in `__Await`: once the done
+    event fired, the first awaiter joins the worker thread so its exit
+    epilogue (threadvar/heap teardown after the __keepalive drop) is fully
+    over before await returns. this guarantees the last reference can never
+    be dropped by the worker for a future that is awaited, keeping program
+    shutdown from racing the worker's teardown. __joinflag is shared with
+    the destructor so the thread is joined exactly once }
+  function async_await_join_node(awaitpd:tprocdef;fTid,fJoin:tfieldvarsym):tnode;
+    var
+      selfsym : tsym;
+
+    function fld(f:tfieldvarsym):tnode;
+      begin
+        result:=csubscriptnode.create(f,cloadnode.create(selfsym,selfsym.owner));
+      end;
+
+    begin
+      selfsym:=async_find_self(awaitpd);
+      result:=cifnode.create(
+        caddnode.create(unequaln,
+          fld(fTid),
+          ctypeconvnode.create_internal(cordconstnode.create(0,ptruinttype,false),fTid.vardef)),
+        cifnode.create(
+          caddnode.create(unequaln,
+            ccallnode.createintern('GETCURRENTTHREADID',nil),
+            fld(fTid)),
+          cifnode.create(
+            caddnode.create(equaln,
+              ccallnode.createintern('INTERLOCKEDEXCHANGE',
+                ccallparanode.create(cordconstnode.create(1,s32inttype,false),
+                  ccallparanode.create(fld(fJoin),nil))),
+              cordconstnode.create(0,s32inttype,false)),
+            ccallnode.createintern('WAITFORTHREADTERMINATE',
+              ccallparanode.create(cordconstnode.create(0,s32inttype,false),
+                ccallparanode.create(fld(fTid),nil))),
+            nil),
+          nil),
+        nil);
     end;
 
 
@@ -492,7 +561,7 @@ implementation
       argdefs,
       argfields,
       spawnargsyms : tfplist;
-      fEvent,fExc,fKeep,fRes,fSelf,fPv,fTid,fCancel,fDone : tfieldvarsym;
+      fEvent,fExc,fKeep,fRes,fSelf,fPv,fTid,fCancel,fDone,fJoin : tfieldvarsym;
       thunkpd,spawnpd,awaitpd : tprocdef;
       implsym : tlocalvarsym;
       pparam : tparavarsym;
@@ -676,6 +745,7 @@ implementation
       fTid:=add_field('__tid',search_system_type('TTHREADID').typedef);
       fCancel:=add_field('__cancel',pasbool8type);
       fDone:=add_field('__done',pasbool8type);
+      fJoin:=add_field('__joinflag',s32inttype);
       fRes:=nil;
       if not isvoid then
         fRes:=add_field('__res',elemdef);
@@ -754,6 +824,7 @@ implementation
       addstatement(stmt,rtl('RTLEVENTWAITFOR',ccallparanode.create(self_field(awaitpd,fEvent),nil)));
       { re-arm so a second await also passes and reads the cached result }
       addstatement(stmt,rtl('RTLEVENTSETEVENT',ccallparanode.create(self_field(awaitpd,fEvent),nil)));
+      addstatement(stmt,async_await_join_node(awaitpd,fTid,fJoin));
       { if assigned(__exc) then begin __e:=__exc; __exc:=nil; raise __e end }
       thenblk:=internalstatements(thenstmt);
       addstatement(thenstmt,cassignmentnode.create(cloadnode.create(excloc,excloc.owner),self_field(awaitpd,fExc)));
@@ -808,17 +879,22 @@ implementation
         end;
       addstatement(stmt,cassignmentnode.create(impl_field(fEvent),rtl('RTLEVENTCREATE',nil)));
       addstatement(stmt,cassignmentnode.create(impl_field(fKeep),cloadnode.create(implsym,implsym.owner)));
+      { take the caller's interface reference BEFORE starting the worker: the
+        worker drops __keepalive as its last act, and if that were the only
+        counted reference a fast worker would destroy the impl while __Spawn
+        is still writing __tid / converting the result (use-after-free that
+        surfaces as a flaky AV here or at the caller's final _Release) }
+      addstatement(stmt,cassignmentnode.create(
+        cloadnode.create(spawnpd.funcretsym,spawnpd.funcretsym.owner),cloadnode.create(implsym,implsym.owner)));
       addstatement(stmt,cassignmentnode.create(impl_field(fTid),rtl('BEGINTHREAD',
         ccallparanode.create(
           ctypeconvnode.create_internal(cloadnode.create(implsym,implsym.owner),voidpointertype),
           ccallparanode.create(
             ctypeconvnode.create_proc_to_procvar(cloadnode.create_procvar(thunkpd.procsym,thunkpd,thunkpd.procsym.owner)),
             nil)))));
-      addstatement(stmt,cassignmentnode.create(
-        cloadnode.create(spawnpd.funcretsym,spawnpd.funcretsym.owner),cloadnode.create(implsym,implsym.owner)));
       async_defer_method(spawnpd,body);
 
-      async_add_destructor(clsdef,fEvent,fExc,fTid);
+      async_add_destructor(clsdef,fEvent,fExc,fTid,fJoin);
       async_add_control_methods(clsdef,fCancel,fDone,fTid);
 
       build_vmt(clsdef);
@@ -861,7 +937,7 @@ implementation
       futureintf : tobjectdef;
       procnode : tnode;
       procreftype : tdef;
-      fEvent,fExc,fKeep,fProc,fTid,fCancel,fDone : tfieldvarsym;
+      fEvent,fExc,fKeep,fProc,fTid,fCancel,fDone,fJoin : tfieldvarsym;
       thunkpd,spawnpd,awaitpd : tprocdef;
       implsym : tlocalvarsym;
       pparam,procparam : tparavarsym;
@@ -974,6 +1050,7 @@ implementation
       fTid:=add_field('__tid',search_system_type('TTHREADID').typedef);
       fCancel:=add_field('__cancel',pasbool8type);
       fDone:=add_field('__done',pasbool8type);
+      fJoin:=add_field('__joinflag',s32inttype);
 
       { ---- __Thunk: invoke the captured reference on the worker thread ---- }
       thunkpd:=new_method('__Thunk',ptrsinttype,true);
@@ -1013,6 +1090,7 @@ implementation
       body:=internalstatements(stmt);
       addstatement(stmt,rtl('RTLEVENTWAITFOR',ccallparanode.create(self_field(awaitpd,fEvent),nil)));
       addstatement(stmt,rtl('RTLEVENTSETEVENT',ccallparanode.create(self_field(awaitpd,fEvent),nil)));
+      addstatement(stmt,async_await_join_node(awaitpd,fTid,fJoin));
       thenblk:=internalstatements(thenstmt);
       addstatement(thenstmt,cassignmentnode.create(cloadnode.create(excloc,excloc.owner),self_field(awaitpd,fExc)));
       addstatement(thenstmt,cassignmentnode.create(self_field(awaitpd,fExc),cnilnode.create));
@@ -1038,17 +1116,22 @@ implementation
         cloadnode.create(procparam,procparam.owner)));
       addstatement(stmt,cassignmentnode.create(impl_field(fEvent),rtl('RTLEVENTCREATE',nil)));
       addstatement(stmt,cassignmentnode.create(impl_field(fKeep),cloadnode.create(implsym,implsym.owner)));
+      { take the caller's interface reference BEFORE starting the worker: the
+        worker drops __keepalive as its last act, and if that were the only
+        counted reference a fast worker would destroy the impl while __Spawn
+        is still writing __tid / converting the result (use-after-free that
+        surfaces as a flaky AV here or at the caller's final _Release) }
+      addstatement(stmt,cassignmentnode.create(
+        cloadnode.create(spawnpd.funcretsym,spawnpd.funcretsym.owner),cloadnode.create(implsym,implsym.owner)));
       addstatement(stmt,cassignmentnode.create(impl_field(fTid),rtl('BEGINTHREAD',
         ccallparanode.create(
           ctypeconvnode.create_internal(cloadnode.create(implsym,implsym.owner),voidpointertype),
           ccallparanode.create(
             ctypeconvnode.create_proc_to_procvar(cloadnode.create_procvar(thunkpd.procsym,thunkpd,thunkpd.procsym.owner)),
             nil)))));
-      addstatement(stmt,cassignmentnode.create(
-        cloadnode.create(spawnpd.funcretsym,spawnpd.funcretsym.owner),cloadnode.create(implsym,implsym.owner)));
       async_defer_method(spawnpd,body);
 
-      async_add_destructor(clsdef,fEvent,fExc,fTid);
+      async_add_destructor(clsdef,fEvent,fExc,fTid,fJoin);
       async_add_control_methods(clsdef,fCancel,fDone,fTid);
 
       build_vmt(clsdef);

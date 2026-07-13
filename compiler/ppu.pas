@@ -50,7 +50,17 @@ const
     (it's a cardinal) }
   { bumped to 33: per-procdef cross-unit optimizer summary blob added to the
     ibprocdef entry (shared -OoPURE / -OoIPARA summary serialization) }
-  CurrentPPULongVersion = 33;
+  { bumped to 36: inline-body asm tai serialization now records operand size
+    (opsize), operand order (FOperandOrder) and top_ref/relsymbol/label symbols
+    by name+bind+typ so an asm block can be spliced cross-unit (FPC Unleashed
+    cross-unit inline-asm splicing) }
+  { bumped to 37: the optsum_modref blob now carries the per-static-variable
+    read/write sets (-OoMODREF item (d) per-location aliasing precision): after
+    the two by-ref per-formal masks, an smask_exact flag bit (byte bit 6) plus a
+    count byte + that many mangled-name ansistrings for the reads set, then the
+    writes set. Statics are identified cross-unit by their (globally-unique,
+    linker-stable) mangled name. }
+  CurrentPPULongVersion = 37;
 
   { Tags for the per-procdef optimizer-summary blob streamed inside the
     ibprocdef entry (see tprocdef.ppuwrite/ppuload). The blob is a self-
@@ -64,6 +74,20 @@ const
   optsum_ipara = 2;  { -OoIPARA volatile-register clobber mask }
   optsum_icf   = 3;  { -OoICF 128-bit canonical body digest of a globally-visible
                        fold survivor (target/ABI signature + 16 hash bytes) }
+  optsum_modref = 4; { -OoMODREF interprocedural mod/ref memory-access summary
+                       (1 flag byte: reads<<0 | writes<<2 | can_trap<<4) }
+  optsum_deadpara = 5; { -OoDEADPARA per-formal reference bitmap (one dword):
+                       bit N set = paras[N] is REFERENCED in the body (or the
+                       routine was disqualified, in which case every bit is set);
+                       a clear bit for an in-range by-value scalar formal means the
+                       callee provably never reads it, so a caller may elide the
+                       evaluation of a side-effect-free actual bound to it. No
+                       target/ABI guard: the mask is expressed in source-level
+                       parameter indices, valid for any target. A new tag adds no
+                       framing change (self-describing tag,len,payload), so per the
+                       policy above CurrentPPULongVersion is NOT bumped; -OoDEADPARA
+                       is opt-in and off in the defaults, so ordinary ppus emit no
+                       payload and keep their existing interface CRC. }
 
 { unit flags }
   uf_big_endian          = $000004;

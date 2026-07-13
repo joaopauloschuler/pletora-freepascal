@@ -56,6 +56,7 @@ interface
 
     function  CheckVerbosity(v:longint):boolean;
     function  SetMessageVerbosity(v:longint;state:tmsgstate):boolean;
+    function  GetMessageState(m:longint):tmsgstate;
     procedure RestoreLocalVerbosity(pstate : pmessagestaterecord);
     procedure FreeLocalVerbosity(var fstate : pmessagestaterecord);
 

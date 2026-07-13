@@ -2902,6 +2902,23 @@ type
              finalize_procinfo.parse_body;
           end;
 
+        { -OoIPACP: the main program body has now been parsed but not yet
+          code-generated -- scan its call sites for compile-time constants passed
+          to eligible parameters of routines stashed earlier in the unit, retarget
+          them to specialized clones, and compile those clones. }
+        if Errorcount=0 then
+          ipacp_process_main_body(main_procinfo);
+
+        { -OoIPASRA: split const-record parameters at call sites in the main
+          program body, rebuilding them to split-parameter clones. }
+        if Errorcount=0 then
+          ipasra_process_main_body(main_procinfo);
+
+        { -OoCONSTEVAL: fold calls in the main program body that target a
+          proven-const routine with all-constant arguments into literals. }
+        if Errorcount=0 then
+          consteval_process_main_body(main_procinfo);
+
         { Generate specializations of objectdefs methods }
         if Errorcount=0 then
           generate_specialization_procs;

@@ -688,6 +688,30 @@ end;
 {$endif defined(CPUI386) or defined(CPUARM)}
 {$endif FPC_FULLVERSION>30300}
 
+{$if defined(CPUX86_64)}
+{ -OoSTACKGUARD: seed the RTL-owned stack-canary word once, before any user code
+  runs, from the getrandom syscall (libc-free).  If getrandom is unavailable or
+  returns a short read, fall back to mixing the guard's own address (varies per
+  run under ASLR), StackBottom and a fixed nonzero constant.  A zero guard is
+  forced nonzero so an all-zero overwrite is always detected.
+
+  getrandom writes directly into the GLOBAL guard: this routine must NOT take the
+  address of a local, because that would make it an -OoSTACKGUARD instrumentation
+  target -- and since it is the routine that seeds the guard, its own epilogue
+  would compare a canary stored from the still-zero guard against the freshly
+  seeded value and spuriously abort during startup. }
+procedure InitStackChkGuard;
+var
+  res : TSysResult;
+begin
+  res:=Do_SysCall(syscall_nr_getrandom,TSysParam(@FPCStackChkGuard),TSysParam(SizeOf(FPCStackChkGuard)),0);
+  if res<>TSysResult(SizeOf(FPCStackChkGuard)) then
+    FPCStackChkGuard:=ptruint(@FPCStackChkGuard) xor (ptruint(StackBottom) shl 1) xor ptruint($5DEECE66);
+  if FPCStackChkGuard=0 then
+    FPCStackChkGuard:=ptruint($FF0A0000);
+end;
+{$endif defined(CPUX86_64)}
+
 begin
 {$if defined(i386) and not defined(FPC_USE_LIBC)}
   InitSyscallIntf;
@@ -708,6 +732,10 @@ begin
 {$endif}
   { Set up signals handlers (may be needed by init code to test cpu features) }
   InstallSignals;
+{$if defined(CPUX86_64)}
+  { -OoSTACKGUARD: seed the stack-canary word before any user code runs }
+  InitStackChkGuard;
+{$endif defined(CPUX86_64)}
 {$if defined(cpui386) or defined(cpuarm)}
   fpc_cpucodeinit;
 {$endif cpui386}

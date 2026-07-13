@@ -122,6 +122,12 @@ interface
           function  optimize_funcret_assignment(inlineblock: tblocknode): tnode;
           procedure check_inlining;
           function doinlining: boolean;
+          { diagnostic: true when the ONLY thing keeping this (po_inline, has
+            inlininginfo) call out of line is the node-count size cap; returns
+            the measured body node count and the effective budget (both depend
+            on inlinelevel) so the call-site note can show how far over budget
+            the routine is. }
+          function inline_size_over_budget(out measured, budget: cardinal): boolean;
           procedure order_parameters;
        protected
           pushedparasize : longint;
@@ -219,6 +225,30 @@ interface
           { checks if there are any parameters which end up at the stack, i.e.
             which have LOC_REFERENCE and set pi_has_stackparameter if this applies }
           procedure check_stack_parameters;
+          { -OoDEVIRT: turn a proven-monomorphic virtual dispatch into a direct
+            call to the concrete override PD (the runtime dispatch would have
+            selected). Mirrors the WPO devirtualization mechanism: procdefinition
+            (the virtual base def, whose signature the override shares) is kept
+            for the call convention/parameter layout, and the emitted symbol name
+            is forced to PD's, so ncgcal skips the VMT indirect load. }
+          procedure devirtualize_target(pd: tprocdef);
+          { -OoDEVIRT inliner integration: after the receiver is proven
+            monomorphic and the concrete override TARGET resolved, try to rebind
+            this virtual call into a direct call to TARGET so the ordinary
+            inliner expands it from TARGET's RETAINED inlining info (a virtual
+            method never carries po_inline, so its body is kept without it -- see
+            psub). TARGET shares the base method's signature (it overrides it),
+            so procdefinition, every parameter symbol and the self type are
+            switched to TARGET's and cnf_do_inline is set. Limited to void-result
+            (procedure) targets whose retained body passes the size/para checks.
+            Returns true iff the call was rebound for inlining (the caller must
+            then re-run do_optinline); returns false leaving the node untouched,
+            so the caller falls back to the direct-name form (devirtualize_target).
+            All checks precede any mutation, so the node is never left half-bound. }
+          function devirt_prepare_inline(target: tprocdef): boolean;
+          { true if a forced call name is already set (e.g. Objective-C message
+            send, or a prior devirtualization) -> -OoDEVIRT must not touch it }
+          function has_forced_call_name: boolean;
           { force the name of the to-be-called routine to a particular string,
             used for Objective-C message sending.  }
           property parameters : tnode read left write left;
@@ -247,7 +277,7 @@ interface
           { on some targets, value parameters that are passed by reference must
             be copied to a temp location by the caller (and then a reference to
             this temp location must be passed) }
-          procedure copy_value_by_ref_para;
+          procedure copy_value_by_ref_para(forinline: boolean);
        public
           { in case of copy-out parameters: initialization code, and the code to
             copy back the parameter value after the call (including any required
@@ -759,18 +789,24 @@ implementation
       end;
 
 
-    procedure tcallparanode.copy_value_by_ref_para;
+    procedure tcallparanode.copy_value_by_ref_para(forinline: boolean);
       var
         initstat,
         finistat: tstatementnode;
         finiblock: tblocknode;
         paratemp: ttempcreatenode;
         arraysize,
-        arraybegin: tnode;
-        lefttemp: ttempcreatenode;
+        arraybegin,
+        arraycount: tnode;
+        lefttemp,
+        counttemp: ttempcreatenode;
+        highpara: tcallparanode;
+        elementdef,
         vardatatype,
         temparraydef: tdef;
       begin
+        arraycount:=nil;
+        elementdef:=nil;
         { this routine is for targets where by-reference value parameters need
           to be copied by the caller. It's basically the node-level equivalent
           of thlcgobj.g_copyvalueparas }
@@ -796,6 +832,14 @@ implementation
                 is_open_array(parasym.vardef)) then
               begin
                  paratemp:=ctempcreatenode.create(voidpointertype,voidpointertype.size,tt_persistent,true);
+                 { FPC Unleashed (tasklist L251): for an inlined call there is no
+                   separate callee to ref-count / finalize the managed elements of
+                   the private copy, so arraycount (the element count) is captured
+                   below in each branch and used to addref/finalize them here. }
+                 if forinline and
+                    (is_open_array(parasym.vardef) or is_array_of_const(parasym.vardef)) and
+                    is_managed_type(tarraydef(parasym.vardef).elementdef) then
+                   elementdef:=tarraydef(parasym.vardef).elementdef;
                  if is_dynamic_array(left.resultdef) then
                    begin
                       { note that in insert_typeconv, this dynamic array was
@@ -830,13 +874,35 @@ implementation
                        ),
                        genintconstnode(tarraydef(temparraydef).elementdef.size)
                      );
+                     if assigned(elementdef) then
+                       arraycount:=geninlinenode(in_length_x,false,
+                         ctypeconvnode.create_explicit(ctemprefnode.create(lefttemp),
+                           temparraydef));
                    end
                  else
                    begin
                      { no problem here that left is used multiple times, as
                        sizeof() will simply evaluate to the high parameter }
                      arraybegin:=left.getcopy;
+                     { element count = high + 1 (via the hidden high parameter);
+                       capture it before sizeof() consumes left below }
+                     if assigned(elementdef) then
+                       arraycount:=caddnode.create(addn,
+                         geninlinenode(in_high_x,false,left.getcopy),
+                         genintconstnode(1));
                      arraysize:=geninlinenode(in_sizeof_x,false,left);
+                   end;
+                 { latch the element count into its own temp: the dynamic-array
+                   count reads lefttemp, which is released in the cleanup block
+                   before the finalize below would reference it }
+                 counttemp:=nil;
+                 if assigned(arraycount) then
+                   begin
+                     counttemp:=ctempcreatenode.create(sizesinttype,sizesinttype.size,tt_persistent,false);
+                     addstatement(initstat,counttemp);
+                     addstatement(initstat,
+                       cassignmentnode.create(ctemprefnode.create(counttemp),arraycount));
+                     arraycount:=nil;
                    end;
                  addstatement(initstat,paratemp);
                  { paratemp:=getmem(sizeof(para)) }
@@ -879,6 +945,38 @@ implementation
                    assember functions (and we can't know that 100% certain here,
                    e.g. in case of external declarations) (*) }
 
+                 { FPC Unleashed (tasklist L251): for an inlined call the copy has
+                   no callee to adopt the references, so ref-count the managed
+                   elements of the fresh block now (copy-on-write: the caller's
+                   originals keep their own count) and finalize them before the
+                   block is freed (heaptrc-clean). }
+                 if assigned(counttemp) then
+                   begin
+                     addstatement(initstat,
+                       cifnode.create_internal(
+                         caddnode.create_internal(unequaln,ctemprefnode.create(counttemp),genintconstnode(0)),
+                         ccallnode.createintern('fpc_addref_array',
+                           ccallparanode.create(
+                             ctemprefnode.create(counttemp),
+                             ccallparanode.create(
+                               caddrnode.create_internal(crttinode.create(tstoreddef(elementdef),initrtti,rdt_normal)),
+                               ccallparanode.create(
+                                 ctypeconvnode.create_internal(ctemprefnode.create(paratemp),voidpointertype),nil)))),
+                         nil));
+                     addstatement(finistat,
+                       cifnode.create_internal(
+                         caddnode.create_internal(unequaln,ctemprefnode.create(counttemp),genintconstnode(0)),
+                         ccallnode.createintern('fpc_finalize_array',
+                           ccallparanode.create(
+                             ctemprefnode.create(counttemp),
+                             ccallparanode.create(
+                               caddrnode.create_internal(crttinode.create(tstoreddef(elementdef),initrtti,rdt_normal)),
+                               ccallparanode.create(
+                                 ctypeconvnode.create_internal(ctemprefnode.create(paratemp),voidpointertype),nil)))),
+                         nil));
+                     addstatement(finistat,ctempdeletenode.create(counttemp));
+                   end;
+
                  { free the memory again after the call: freemem(paratemp) }
                  addstatement(finistat,
                    ccallnode.createintern('fpc_freemem',
@@ -893,6 +991,96 @@ implementation
                  left:=ctypeconvnode.create_internal(
                    cderefnode.create(ctemprefnode.create(paratemp)),
                    left.resultdef);
+              end
+            { FPC Unleashed (tasklist L251): an INLINED by-value open-array
+              parameter whose actual does NOT present as an array here -- a
+              plain static array (Array[lo..hi]) or a SLICE (a[i..j], which the
+              boundary conversion lowers to a single-element-typed reference at
+              the slice start) -- must still be copied as a runtime-length open
+              array.  The generic managed/else branches below would copy it as a
+              single element (slice) or without element ref-counting (static
+              managed base), so handle it here: element count = high + 1 (the
+              hidden high parameter, located as the sibling callparanode that
+              precedes this one), data start = @left (the first element), the
+              managed elements ref-counted for copy-on-write and finalized so
+              heaptrc stays clean. }
+            else if forinline and
+                    (is_open_array(parasym.vardef) or is_array_of_const(parasym.vardef)) then
+              begin
+                elementdef:=tarraydef(parasym.vardef).elementdef;
+                { locate the hidden high parameter (the callparanode whose right
+                  link is this array parameter) }
+                arraybegin:=nil;
+                highpara:=tcallparanode(callnode.left);
+                while assigned(highpara) and (highpara.right<>self) do
+                  highpara:=tcallparanode(highpara.right);
+                if assigned(highpara) and assigned(highpara.parasym) and
+                   (vo_is_high_para in highpara.parasym.varoptions) then
+                  arraybegin:=highpara.left.getcopy
+                else
+                  internalerror(2026071101);
+                { counttemp := high + 1 }
+                counttemp:=ctempcreatenode.create(sizesinttype,sizesinttype.size,tt_persistent,false);
+                addstatement(initstat,counttemp);
+                addstatement(initstat,
+                  cassignmentnode.create(ctemprefnode.create(counttemp),
+                    caddnode.create(addn,arraybegin,genintconstnode(1))));
+                { paratemp := getmem(count * elesize) }
+                paratemp:=ctempcreatenode.create(voidpointertype,voidpointertype.size,tt_persistent,true);
+                addstatement(initstat,paratemp);
+                addstatement(initstat,
+                  cassignmentnode.create(ctemprefnode.create(paratemp),
+                    ccallnode.createintern('fpc_getmem',
+                      ccallparanode.create(
+                        caddnode.create(muln,ctemprefnode.create(counttemp),
+                          genintconstnode(elementdef.size)),nil))));
+                { if count<>0: MOVE(left, paratemp^, count*elesize) -- @left is the
+                  first element, i.e. the contiguous data start }
+                addstatement(initstat,
+                  cifnode.create_internal(
+                    caddnode.create_internal(unequaln,ctemprefnode.create(counttemp),genintconstnode(0)),
+                    ccallnode.createintern('MOVE',
+                      ccallparanode.create(
+                        caddnode.create(muln,ctemprefnode.create(counttemp),
+                          genintconstnode(elementdef.size)),
+                        ccallparanode.create(
+                          cderefnode.create(ctemprefnode.create(paratemp)),
+                          ccallparanode.create(left,nil)))),
+                    nil));
+                { managed base: ref-count the fresh copy's elements, finalize
+                  them before the block is freed }
+                if is_managed_type(elementdef) then
+                  begin
+                    addstatement(initstat,
+                      cifnode.create_internal(
+                        caddnode.create_internal(unequaln,ctemprefnode.create(counttemp),genintconstnode(0)),
+                        ccallnode.createintern('fpc_addref_array',
+                          ccallparanode.create(
+                            ctemprefnode.create(counttemp),
+                            ccallparanode.create(
+                              caddrnode.create_internal(crttinode.create(tstoreddef(elementdef),initrtti,rdt_normal)),
+                              ccallparanode.create(
+                                ctypeconvnode.create_internal(ctemprefnode.create(paratemp),voidpointertype),nil)))),
+                        nil));
+                    addstatement(finistat,
+                      cifnode.create_internal(
+                        caddnode.create_internal(unequaln,ctemprefnode.create(counttemp),genintconstnode(0)),
+                        ccallnode.createintern('fpc_finalize_array',
+                          ccallparanode.create(
+                            ctemprefnode.create(counttemp),
+                            ccallparanode.create(
+                              caddrnode.create_internal(crttinode.create(tstoreddef(elementdef),initrtti,rdt_normal)),
+                              ccallparanode.create(
+                                ctypeconvnode.create_internal(ctemprefnode.create(paratemp),voidpointertype),nil)))),
+                        nil));
+                  end;
+                addstatement(finistat,
+                  ccallnode.createintern('fpc_freemem',
+                    ccallparanode.create(ctemprefnode.create(paratemp),nil)));
+                addstatement(finistat,ctempdeletenode.create(counttemp));
+                { view the copy as the callee's open array (parasym.vardef) }
+                left:=ctypeconvnode.create_internal(
+                  cderefnode.create(ctemprefnode.create(paratemp)),parasym.vardef);
               end
             else if is_shortstring(parasym.vardef) then
               begin
@@ -963,8 +1151,27 @@ implementation
             addstatement(finistat,ctempdeletenode.create(paratemp));
             callnode.add_done_statement(finiblock);
 
-            firstpass(fparainit);
-            firstpass(left);
+            { arraycount is only ever used through getcopy above }
+            arraycount.free;
+
+            { FPC Unleashed (tasklist L251): for an inlined call the whole call
+              node (with its callinitblock/callcleanupblock) is spliced by
+              getcopy, but fparainit is NOT part of that copy -- leaving the
+              paratemp's create in fparainit while its delete rides
+              callcleanupblock double-frees the temp (internalerror 200108234).
+              Route the setup through the call's own init block (like
+              handlemanagedbyrefpara) so create and delete are copied together. }
+            if forinline then
+              begin
+                callnode.add_init_statement(fparainit);
+                fparainit:=nil;
+                firstpass(left);
+              end
+            else
+              begin
+                firstpass(fparainit);
+                firstpass(left);
+              end;
           end;
       end;
 
@@ -1125,7 +1332,20 @@ implementation
            paramanager.push_addr_param(vs_value,parasym.vardef,
                       callnode.procdefinition.proccalloption) and
            not(cnf_do_inline in callnode.callnodeflags) then
-          copy_value_by_ref_para;
+          copy_value_by_ref_para(false)
+        { FPC Unleashed (tasklist L251): an INLINED call passing an array to a
+          BY-VALUE open-array / array-of-const parameter needs the same private
+          runtime-length copy, but the callee is spliced in (no callee-side copy
+          at codegen), so build it here on every target with element ref-counting
+          + finalization folded in (forinline=true).  An array constructor actual
+          is already a fresh temp, so copy_value_by_ref_para leaves it untouched. }
+        else if assigned(callnode) and
+           (cnf_do_inline in callnode.callnodeflags) and
+           assigned(parasym) and (parasym.varspez=vs_value) and
+           (left.nodetype<>nothingn) and
+           not(vo_has_local_copy in parasym.varoptions) and
+           (is_open_array(parasym.vardef) or is_array_of_const(parasym.vardef)) then
+          copy_value_by_ref_para(true);
 
         if assigned(fparainit) then
           firstpass(fparainit);
@@ -2293,6 +2513,112 @@ implementation
     function tcallnode.getoverrideprocnamedef: tprocdef; inline;
       begin
         result:=foverrideprocnamedef;
+      end;
+
+
+    procedure tcallnode.devirtualize_target(pd: tprocdef);
+      begin
+        foverrideprocnamedef:=pd;
+      end;
+
+
+    function tcallnode.devirt_prepare_inline(target: tprocdef): boolean;
+      var
+        para     : tcallparanode;
+        selfconv : tnode;
+        oldpd    : tabstractprocdef;
+        lim      : longint;
+        idx      : longint;
+      begin
+        result:=false;
+        { The devirtualization target is a vmt-slot method, hence virtual, and a
+          virtual method can NEVER carry po_inline (mutually exclusive with
+          po_virtualmethod) -- so neither the ordinary nor the auto inliner ever
+          touches it. Under -OoDEVIRT the target's body is instead RETAINED as
+          inlining info without po_inline (see psub.CreateInlineInfo call), so a
+          call proven to reach exactly this override can be expanded here. }
+
+        { inlining must be enabled and the retained body present + usable }
+        if not(cs_do_inline in current_settings.localswitches) then
+          exit;
+        { Restrict to void-result methods (procedures). Inlining a FUNCTION call
+          needs the funcret node / parameter temps prepared during pass_1 under
+          cnf_do_inline (maybe_create_funcret_node, gen_hidden_parameters); a
+          virtual call is not an inline candidate then, so that preparation never
+          ran and cannot be retrofitted here. Procedures need none of it, so they
+          expand safely; functions keep the direct-call devirtualization. }
+        if not is_void(target.returndef) then
+          exit;
+        if not((target.typ=procdef) and
+               target.has_inlininginfo and
+               assigned(target.inlininginfo) and
+               assigned(target.inlininginfo^.code) and
+               not(pio_inline_not_possible in target.implprocoptions) and
+               not(pio_inline_forbidden in target.implprocoptions)) then
+          exit;
+        { only expand a same-unit target: a body loaded from another unit's ppu
+          may reference symbols not resolvable for inlining in this context }
+        if not target.in_currentunit then
+          exit;
+        { the override shares the base method's signature, so the parameter
+          lists correspond position for position }
+        if not(assigned(procdefinition) and
+               (target.paras.count=procdefinition.paras.count)) then
+          exit;
+
+        { size heuristic, mirroring tcallnode.heuristics_favors_inlining but
+          measured against TARGET's retained body }
+        lim:=round(exp((1.0/(inlinelevel/3.0+1))*ln(10000)));
+        if not(node_count(target.inlininginfo^.code,lim)<lim) then
+          exit;
+
+        { every actual parameter must be inline-safe, and every parameter symbol
+          must map to TARGET's list; verify BOTH before mutating anything }
+        oldpd:=procdefinition;
+        para:=tcallparanode(left);
+        while assigned(para) do
+          begin
+            if not para.can_be_inlined then
+              exit;
+            if assigned(para.parasym) and
+               (oldpd.paras.indexof(para.parasym)<0) then
+              exit;
+            para:=tcallparanode(para.right);
+          end;
+
+        { commit: remap every parameter symbol to TARGET's corresponding one
+          (matched by its index in the base list) so replaceparaload matches the
+          loads in TARGET's body; reinterpret the base-typed self value as
+          TARGET's class. All checks above already passed, so no partial state. }
+        para:=tcallparanode(left);
+        while assigned(para) do
+          begin
+            if assigned(para.parasym) then
+              begin
+                idx:=oldpd.paras.indexof(para.parasym);
+                para.parasym:=tparavarsym(target.paras[idx]);
+                if (vo_is_self in para.parasym.varoptions) and
+                   assigned(para.left) and assigned(para.left.resultdef) and
+                   assigned(para.parasym.vardef) and
+                   not equal_defs(para.left.resultdef,para.parasym.vardef) then
+                  begin
+                    selfconv:=ctypeconvnode.create_internal(para.left,para.parasym.vardef);
+                    typecheckpass(selfconv);
+                    para.left:=selfconv;
+                  end;
+              end;
+            para:=tcallparanode(para.right);
+          end;
+
+        procdefinition:=target;
+        include(callnodeflags,cnf_do_inline);
+        result:=true;
+      end;
+
+
+    function tcallnode.has_forced_call_name: boolean;
+      begin
+        result:=assigned(foverrideprocnamedef);
       end;
 
 
@@ -4913,6 +5239,35 @@ implementation
       end;
 
 
+    { FPC Unleashed (cross-unit inline-asm splicing): true when the inline body
+      contains an asm STATEMENT block flagged asmnf_crossunit_unsafe at ppu-write
+      time (nbas.tasmnode.buildderefimpl) -- i.e. one whose tai references a
+      module-local symbol that cannot be reconstructed in the splicing unit. Such
+      a body is kept out of line when inlined across units. }
+    function find_crossunit_unsafe_asm(var n : tnode; arg : pointer) : foreachnoderesult;
+      begin
+        result:=fen_false;
+        if (n.nodetype=asmn) and
+           not(asmnf_get_asm_position in tasmnode(n).asmnodeflags) and
+           ((asmnf_crossunit_unsafe in tasmnode(n).asmnodeflags) or
+            { in-memory body of a unit compiled in THIS process: its module-local
+              asm symbols are use-after-free once spliced cross-unit, so refuse
+              (only a ppu-deserialized body has its symbols re-resolved safely) }
+            not(asmnf_from_ppu in tasmnode(n).asmnodeflags)) then
+          begin
+            pboolean(arg)^:=true;
+            result:=fen_norecurse_true;
+          end;
+      end;
+
+
+    function inline_body_has_crossunit_unsafe_asm(code : tnode) : boolean;
+      begin
+        result:=false;
+        foreachnodestatic(code,@find_crossunit_unsafe_asm,@result);
+      end;
+
+
     procedure tcallnode.check_inlining;
       var
         st   : tsymtable;
@@ -4925,8 +5280,55 @@ implementation
            heuristics_favors_inlining then
           begin
             include(callnodeflags,cnf_do_inline);
-            { Check if we can inline the procedure when it references proc/var that
-              are not in the globally available }
+            { FPC Unleashed (cross-unit inline-asm splicing): an inline body's asm
+              STATEMENT block is stored as a raw tai list in the ppu.  The tai
+              round trip now reconstructs the operand size (opsize), the 2-operand
+              order (FOperandOrder) and every GLOBAL top_ref symbol (re-resolved
+              by name against the splicing unit), so a block whose operands are
+              all registers/constants/top_local params-locals-result/global refs
+              can be spliced cross-unit.  A block that references a module-local
+              symbol (a local asm label, a non-global top_ref, an ait_const sym,
+              ...) cannot be reconstructed in another unit and is flagged
+              asmnf_crossunit_unsafe at ppu-write time -- refuse only those, and
+              keep them out of line (runs correctly). }
+            if not procdefinition.in_currentunit and
+               (pi_has_assembler_block in tprocdef(procdefinition).inlininginfo^.flags) then
+              begin
+                if inline_body_has_crossunit_unsafe_asm(tprocdef(procdefinition).inlininginfo^.code) then
+                  begin
+                    Comment(V_lineinfo+V_Debug,'Not inlining "'+tprocdef(procdefinition).procsym.realname+'", asm block references a symbol that cannot be reconstructed across units');
+                    exclude(callnodeflags,cnf_do_inline);
+                  end;
+              end;
+            { An `inherited` call in the body (only class methods reach here --
+              psub.checknodeinlining refuses every other self shape) rebinds its
+              self load to the caller's self actual via replaceparaload; that
+              matching only lines up for a SAME-UNIT body. A body loaded from
+              another unit's ppu reconstructs its self paravarsym separately, so
+              the spliced inherited self is wrong (codegen internalerror). Keep
+              cross-unit inherited out of line. }
+            if not procdefinition.in_currentunit and
+               (pi_has_inherited in tprocdef(procdefinition).inlininginfo^.flags) then
+              begin
+                Comment(V_lineinfo+V_Debug,'Not inlining "'+tprocdef(procdefinition).procsym.realname+'", inherited call cannot be spliced across units');
+                exclude(callnodeflags,cnf_do_inline);
+              end;
+            { The inline body may reference a symbol that is private to its
+              defining unit (a static-symtable staticvarsym/typed const, or a
+              call to an implementation-only procedure): pi_uses_static_symtable.
+              optcall.importglobalsyms rebases those references at the call site
+              (it adds the cross-unit staticvarsym / private procsym to the
+              caller module's imported-symbol list), so on any target whose
+              linker can resolve a reference to another object's UNIT-PRIVATE
+              symbol -- i.e. tf_supports_hidden_symbols, which the defining unit
+              honours by emitting the symbol as a hidden (DSO-local) rather than
+              truly static symbol -- such a body splices and links correctly
+              (verified: private var mutation, typed const and private-proc call
+              all inline cross-unit).  ONLY on the residual targets WITHOUT hidden
+              symbol support is a unit-private symbol unreferenceable from another
+              object (importing it at the call site does not make it public in the
+              defining unit); reconstructing that would need the defining unit to
+              emit a public alias, so keep those calls out of line there. }
             st:=procdefinition.owner;
             while (st.symtabletype in [ObjectSymtable,recordsymtable]) do
               st:=st.defowner.owner;
@@ -4935,7 +5337,7 @@ implementation
                (st.symtabletype=globalsymtable) and
                (not st.iscurrentunit) then
               begin
-                Comment(V_lineinfo+V_Debug,'Not inlining "'+tprocdef(procdefinition).procsym.realname+'", references private symbols from other unit');
+                Comment(V_lineinfo+V_Debug,'Not inlining "'+tprocdef(procdefinition).procsym.realname+'", references unit-private symbols and target lacks hidden-symbol support');
                 exclude(callnodeflags,cnf_do_inline);
               end;
             para:=tcallparanode(parameters);
@@ -4960,6 +5362,27 @@ implementation
           (procdefinition.typ=procdef) and
           ((pio_inline_not_possible in tprocdef(procdefinition).implprocoptions) or
            not(cnf_do_inline in callnodeflags)))
+      end;
+
+
+    function tcallnode.inline_size_over_budget(out measured, budget: cardinal): boolean;
+      var
+        limExcluding: cardinal;
+      begin
+        measured:=0;
+        budget:=0;
+        result:=false;
+        if (procdefinition.typ<>procdef) or
+           not tprocdef(procdefinition).has_inlininginfo or
+           not assigned(tprocdef(procdefinition).inlininginfo^.code) then
+          exit;
+        { same budget formula as heuristics_favors_inlining }
+        limExcluding:=round(exp((1.0/(inlinelevel/3.0+1))*ln(10000)));
+        budget:=limExcluding;
+        { count the WHOLE body (no early cap) so the note can show the real
+          overage rather than just the clamped budget value }
+        measured:=node_count(tprocdef(procdefinition).inlininginfo^.code);
+        result:=measured>=limExcluding;
       end;
 
 
@@ -5265,6 +5688,62 @@ implementation
                       n.free;
                       n:=temp;
                       typecheckpass(n);
+                      { FPC Unleashed (checknodeinlining refusal d): an OPEN ARRAY
+                        parameter indexes 0-based (low(a)=0), but its actual may be
+                        a NON-zero-based static array -- e.g. array[1..N].  The
+                        actual load carries a transparent open-array resultdef at
+                        the call boundary, but re-typechecking the spliced load
+                        reverts it to the static array's own def, so the spliced
+                        a[i] would index as a static array and subtract the
+                        actual's low bound from the callee's 0-based i (reading
+                        actual[i-1]).  Re-apply the exact conversion the call
+                        boundary performs -- wrap the actual in a typeconv to the
+                        open-array parameter type -- so the spliced accesses index
+                        the same 0-based view the callee was compiled against.
+                        Only non-zero-based static arrays need it; other open
+                        arrays and array constructors are already 0-based and must
+                        NOT be wrapped. }
+                      if is_open_array(paras.parasym.vardef) and
+                         assigned(n.resultdef) and
+                         (n.resultdef.typ=arraydef) and
+                         not is_open_array(n.resultdef) and
+                         not is_dynamic_array(n.resultdef) and
+                         not is_array_constructor(n.resultdef) and
+                         (tarraydef(n.resultdef).lowrange<>0) then
+                        begin
+                          n:=ctypeconvnode.create_internal(n,paras.parasym.vardef);
+                          typecheckpass(n);
+                        end
+                      { FPC Unleashed (checknodeinlining refusal d, dynamic-array
+                        actual): a dynamic array passed to an open-array parameter
+                        already had the dynarray->openarray boundary applied to the
+                        actual by insert_typeconv (a deref to the data), but that
+                        node's resultdef was masked back to the dynamic-array type
+                        so gen_high_tree could take high()/length() of it.  The
+                        spliced node's LOCATION is therefore the open-array data
+                        while its type still says "dynamic array"; left untouched
+                        the surrounding open-array access re-typechecks against the
+                        dynamic-array def and dereferences the location once more (a
+                        wild pointer -> the data's first element used as an address).
+                        Re-view the SAME location as the open array: take its address
+                        (the data pointer the boundary produced) and deref it through
+                        the open-array pointer type.  This adds no extra indirection
+                        -- addr(deref-based lvalue) folds back to that data pointer --
+                        it merely restores the open-array resultdef the callee was
+                        compiled against.  The runtime high (length-1, or -1 for a
+                        nil/empty dynarray) is carried by the hidden high parameter,
+                        which is substituted like any other parameter load. }
+                      else if is_open_array(paras.parasym.vardef) and
+                              assigned(n.resultdef) and
+                              is_dynamic_array(n.resultdef) then
+                        begin
+                          n:=cderefnode.create(
+                               ctypeconvnode.create_internal(
+                                 caddrnode.create_internal(n),
+                                 cpointerdef.getreusable(paras.parasym.vardef)));
+                          include(tderefnode(n).derefnodeflags,drnf_no_checkpointer);
+                          typecheckpass(n);
+                        end;
                       result := fen_true;
                     end;
                 end;
@@ -5513,6 +5992,21 @@ implementation
         { check if we have to create a temp, assign the parameter's
           contents to that temp and then substitute the parameter
           with the temp everywhere in the function                  }
+        { FPC Unleashed (tasklist L251): a BY-VALUE open-array / array-of-const
+          parameter has no compile-time size for the generic temp path below
+          (tarraydef.size internalerrors 99080501 on an open array).  The private
+          runtime-length copy the callee needs was already built target-neutrally
+          by copy_value_by_ref_para(forinline=true) in firstcallparan (a getmem'd
+          block, element-wise MOVE, managed elements ref-counted and finalized so
+          copy-on-write and heaptrc stay correct); para.left is now a dereference
+          of that copy (an array constructor actual is a fresh temp and needs no
+          copy).  Either way the actual is already a private value, so insert it
+          directly -- replaceparaload re-views it as the callee's 0-based open
+          array and the hidden high parameter still carries the length. }
+        if (para.parasym.varspez=vs_value) and
+           (is_open_array(para.parasym.vardef) or is_array_of_const(para.parasym.vardef)) then
+          exit(true);
+
         if paraneedsinlinetemp(para,pushconstaddr,complexpara) then
           begin
             tempnode:=ctempcreatenode.create(para.parasym.vardef,para.parasym.vardef.size,

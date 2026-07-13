@@ -1,12 +1,13 @@
 { %OPT="-O4 -OoVECTORIZE -OoFASTMATH -Cfavx2" }
 { Under an AVX2 fputype the packed reduction uses the VEX v-forms
-  (vmovups/vaddps/vmulps/vshufps/vaddss/vmovss).  On an FMA-capable target
-  fast-math contracts  s + a[i]*b[i]  into an fma() node before the vectorizer
-  runs; the recognizer accepts that FMA-contracted dot-product shape too and
-  widens it to packed vmulps+vaddps (the contraction's rounding license already
-  applies under fast-math).  For exactly-representable inputs there is no
-  rounding, so the packed result equals the strict sequential (downto)
-  reference. }
+  (vmovups/vaddps/vshufps/vaddss/vmovss).  On an FMA-capable target fast-math
+  contracts  s + a[i]*b[i]  into an fma() node before the vectorizer runs; the
+  recognizer accepts that FMA-contracted dot-product shape too and widens it to a
+  packed vfmadd231ps multiply-add (the contraction's rounding license already
+  applies under fast-math -- see vect_reduce_fma_01 for the general rounding
+  case).  For exactly-representable inputs (multiples of 1/8, tiny magnitudes)
+  no rounding happens at all, so even the fused result equals the strict
+  sequential (downto) reference bit-for-bit. }
 program vect_reduce_avx_01;
 {$mode objfpc}{$H+}
 procedure work(n: longint; base: single);

@@ -270,6 +270,30 @@ unit cgcpu;
                 if current_procinfo.framepointer=NR_STACK_POINTER_REG then
                   current_asmdata.asmcfi.cfa_def_cfa_offset(list,regsize+localsize+sizeof(pint));
                 current_procinfo.final_localsize:=localsize;
+                { -OoSTACKGUARD: seed the reserved top-of-frame canary slot with
+                  the secret guard word.  R11 is a volatile scratch that holds no
+                  live value at function entry (never an argument register). }
+                if pi_stackguard in current_procinfo.flags then
+                  begin
+                    { load the guard word into R11.  Emit the global reference
+                      directly (RIP-relative, no GOT, under -Cg) rather than via
+                      a_load_ref_reg/make_simple_ref: this code runs AFTER register
+                      allocation, so the GOT-indirection scratch register
+                      make_simple_ref would allocate for a non-local symbol could
+                      never be coloured.  The guard lives in the statically-linked,
+                      non-interposable RTL, so a PC-relative access is correct. }
+                    reference_reset_symbol(href,current_asmdata.RefAsmSymbol('FPC_STACK_CHK_GUARD',AT_DATA),0,sizeof(pint),[]);
+                    if cs_create_pic in current_settings.moduleswitches then
+                      begin
+                        href.refaddr:=addr_pic_no_got;
+                        href.base:=NR_RIP;
+                      end;
+                    a_reg_alloc(list,NR_R11);
+                    list.concat(taicpu.op_ref_reg(A_MOV,S_Q,href,NR_R11));
+                    reference_reset_base(href,current_procinfo.framepointer,current_procinfo.stackguard_offset,ctempposinvalid,sizeof(pint),[]);
+                    a_load_reg_ref(list,OS_ADDR,OS_ADDR,NR_R11,href);
+                    a_reg_dealloc(list,NR_R11);
+                  end;
                 if (target_info.system in systems_x86_64_ms_abi) then
                   begin
                     if localsize<>0 then
@@ -370,7 +394,12 @@ unit cgcpu;
         hreg : tregister;
         r : longint;
         regs_to_save_mm: tcpuregisterarray;
+        docanary : boolean;
+        faillabel : tasmlabel;
+        hai : taicpu;
       begin
+        docanary:=false;
+        faillabel:=nil;
         { we do not need an exit stack frame when we never return
                 * the final ret is left so the peephole optimizer can easily do call/ret -> jmp or call conversions
                 * the entry stack frame must be normally generated because the subroutine could be still left by
@@ -379,6 +408,35 @@ unit cgcpu;
         if not(po_noreturn in current_procinfo.procdef.procoptions) then
           begin
             regs_to_save_mm:=paramanager.get_saved_registers_mm(current_procinfo.procdef.proccalloption);
+            { -OoSTACKGUARD: reload the canary slot and compare it against the
+              secret guard word while the frame is still intact (framepointer
+              valid, stack not yet released).  On mismatch branch to the out-of-line
+              fail path (emitted after the RET) which calls the RTL handler and
+              never returns.  R10/R11 are volatile scratch not used to return a
+              result.  Emitted as a clean four-instruction block (mov guard; mov
+              slot; cmp; jne) with no interleaved reg-alloc/flags markers so the
+              sibling-call peephole (OptSibCall) can recognise and hoist it verbatim
+              above a tail jump -- the check must run before the frame is reused. }
+            docanary:=(pi_stackguard in current_procinfo.flags) and not(nostackframe);
+            if docanary then
+              begin
+                current_asmdata.getjumplabel(faillabel);
+                { guard load, RIP-relative under -Cg (see g_proc_entry) }
+                reference_reset_symbol(href,current_asmdata.RefAsmSymbol('FPC_STACK_CHK_GUARD',AT_DATA),0,sizeof(pint),[]);
+                if cs_create_pic in current_settings.moduleswitches then
+                  begin
+                    href.refaddr:=addr_pic_no_got;
+                    href.base:=NR_RIP;
+                  end;
+                list.concat(taicpu.op_ref_reg(A_MOV,S_Q,href,NR_R11));
+                reference_reset_base(href,current_procinfo.framepointer,current_procinfo.stackguard_offset,ctempposinvalid,sizeof(pint),[]);
+                a_load_ref_reg(list,OS_ADDR,OS_ADDR,href,NR_R10);
+                list.concat(taicpu.op_reg_reg(A_CMP,S_Q,NR_R10,NR_R11));
+                hai:=taicpu.op_sym(A_Jcc,S_NO,faillabel);
+                hai.SetCondition(C_NE);
+                hai.is_jmp:=true;
+                list.concat(hai);
+              end;
             { Prevent return address from a possible call from ending up in the epilogue }
             { (restoring registers happens before epilogue, providing necessary padding) }
             if (current_procinfo.flags*[pi_has_unwind_info,pi_do_call,pi_has_saved_regs])=[pi_has_unwind_info,pi_do_call] then
@@ -433,6 +491,15 @@ unit cgcpu;
           list.concat(tai_regalloc.dealloc(NR_STACK_POINTER_REG,nil));
 
         list.concat(Taicpu.Op_none(A_RET,S_NO));
+
+        { -OoSTACKGUARD: out-of-line canary-mismatch handler.  Placed after the
+          RET so the common (matching) path falls straight through with no taken
+          branch; FPC_STACK_CHK_FAIL prints and aborts, so it never returns. }
+        if docanary then
+          begin
+            a_label(list,faillabel);
+            a_call_name(list,'FPC_STACK_CHK_FAIL',false);
+          end;
 
         if (pi_has_unwind_info in current_procinfo.flags) then
           begin

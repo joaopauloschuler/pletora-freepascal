@@ -944,6 +944,12 @@ interface
           { block-scoped symtables for inline vars; only needed while
             compiling the current unit, so they are not persisted in ppu }
           blocklocalsymtables : tfpobjectlist;
+          { FPC Unleashed: when checknodeinlining refuses to keep inlining
+            info for a routine marked `inline`, the human-readable reason is
+            stashed here so the call-site "is not inlined" note (cg_n_no_inline)
+            can tell the user WHY. Transient: only meaningful for routines
+            defined in the currently-compiled unit, hence not persisted in ppu. }
+          inlinenoreason : ansistring;
           funcretsym : tsym;
           funcretsymderef : tderef;
           struct : tabstractrecorddef;
@@ -997,6 +1003,15 @@ interface
           pure_analyzed : boolean;
           pure_intrinsic_impure : boolean;
           pure_reads_global : boolean;
+          { -OoPURE nothrow attribute, tracked INDEPENDENTLY of purity: the body
+            (or a callee) may raise an exception or trap (div/mod by zero,
+            range/overflow check, inline asm, indirect/virtual/external call).
+            pure_intrinsic_impure above now carries only the MEMORY / side-effect
+            causes (a global write, addr-taken, goto, ...), so the two facts are
+            orthogonal: a routine that writes a global (impure) can still be
+            nothrow, and the fold  pure = not(mem-impure or can-trap)  keeps the
+            pure/const verdict byte-identical to before the split. }
+          pure_can_trap : boolean;
           pure_callees : array of tprocdef;
           pure_qtoken : cardinal;
           pure_qresult : byte;
@@ -1034,6 +1049,12 @@ interface
           pure_ppu_valid : boolean;
           pure_ppu_is_pure : boolean;
           pure_ppu_is_const : boolean;
+          { cross-unit nothrow / mem-pure verdicts (carried alongside pure/const
+            in the same optsum_pure summary, so a caller in another unit can
+            consult them without re-deriving the call graph). nothrow = cannot
+            raise/trap; mempure = writes no memory (may read globals, may trap) }
+          pure_ppu_is_nothrow : boolean;
+          pure_ppu_is_mempure : boolean;
           { identical code folding (-OoICF).
               icf_addrtaken  : transient (this-unit) flag set the moment this
                                routine's address is loaded as a value (@proc /
@@ -1055,6 +1076,75 @@ interface
           icf_addrtaken : boolean;
           icf_hash_valid : boolean;
           icf_hash : array[0..1] of qword;
+          { interprocedural mod/ref memory-access summary (-OoMODREF, see
+            optmodref.pas). Refines the binary -OoPURE verdict: instead of only
+            "pure/const vs impure" it records, conservatively, what the routine
+            READS and what it WRITES, each as one of 0=nothing / 1=only through
+            its own by-reference parameters / 2=unknown-global, plus whether the
+            body can trap or raise. Unlike the pure_* raw facts these fields ARE
+            the final derived summary (no query-time fixpoint: a callee's effect
+            is folded in eagerly when this routine is analysed, and a forward /
+            recursive / unanalysed callee degrades to unknown), so they are both
+            usable directly and serialized verbatim.
+              modref_analyzed : the summary was computed in THIS unit
+              modref_ppu_valid: the summary was loaded from a used unit's ppu
+                                (optsum_modref); either flag means the three
+                                fields below are meaningful.
+              modref_reads / modref_writes : the read / write class (0/1/2 above)
+              modref_can_trap : the routine may raise or trap (a consumer that
+                                reorders/duplicates/hoists the call must decline)
+              modref_reads_pmask / modref_writes_pmask : when the corresponding
+                                direction is mr_byref, a per-formal bitmap of
+                                WHICH by-reference parameters the routine reads /
+                                writes through (bit N = the N-th entry of paras).
+                                A refinement of the coarse "some by-ref param":
+                                a consumer maps only the flagged parameters'
+                                actuals instead of every by-ref actual.
+              modref_pmask_exact : the two masks are complete (every by-ref
+                                access was attributable to an in-range formal).
+                                When false the masks are ignored and mr_byref is
+                                read as "all by-ref actuals" (the coarse
+                                behaviour), so precision never becomes unsound.
+              modref_reads_statics / modref_writes_statics : the bounded set of
+                                static/global variables the routine reads /
+                                writes, each identified by its (globally-unique,
+                                linker-stable) MANGLED NAME so the identity is
+                                sound cross-unit (a same-source-named static in a
+                                different unit has a different mangled name).
+                                Meaningful only when the direction is mr_unknown
+                                AND modref_smask_exact: the direction's whole
+                                global footprint is then EXACTLY this set (plus
+                                any by-ref actuals recorded in the pmask).
+              modref_smask_exact : the static sets are complete -- every
+                                unknown-global access was attributable to a
+                                nameable static that fit the bounded set. When
+                                false the sets are ignored and mr_unknown reverts
+                                to the coarse "any global" meaning, so per-static
+                                precision is a strict subset and never unsound. }
+          modref_analyzed : boolean;
+          modref_ppu_valid : boolean;
+          modref_reads : byte;
+          modref_writes : byte;
+          modref_can_trap : boolean;
+          modref_pmask_exact : boolean;
+          modref_smask_exact : boolean;
+          modref_reads_pmask : dword;
+          modref_writes_pmask : dword;
+          modref_reads_statics : array of ansistring;
+          modref_writes_statics : array of ansistring;
+          { -OoDEADPARA (interprocedural dead-parameter elimination, part (a) of
+            the gcc -fipa-sra port): a per-formal REFERENCE bitmap over paras.
+              deadpara_analyzed : the mask was computed in THIS unit
+              deadpara_ppu_valid: the mask was loaded from a used unit's ppu
+              deadpara_ref_mask : bit N set = paras[N] is referenced (loaded) in
+                the body, or the routine was DISQUALIFIED (virtual/message/
+                external/asm/exported/nested/... -> every bit set). A CLEAR bit
+                for an in-range by-value scalar formal means the callee provably
+                never reads that parameter, so a resolved direct caller may elide
+                evaluating a side-effect-free actual bound to it (optdeadpara). }
+          deadpara_analyzed : boolean;
+          deadpara_ppu_valid : boolean;
+          deadpara_ref_mask : dword;
           constructor create(level:byte;doregister:boolean);virtual;
           constructor ppuload(ppufile:tcompilerppufile);
           destructor  destroy;override;
@@ -1302,7 +1392,9 @@ interface
          routine's final pure/const verdict at write time, so the two booleans
          can be persisted for callers in other units. nil (pass off / optpure
          not linked) => the pure summary is not written. }
-       proc_query_purity_verdict : function(pd:tprocdef; wantconst:boolean):boolean = nil;
+       { want: 0=pure, 1=const, 2=nothrow (cannot raise/trap), 3=mempure
+         (writes no memory; may read globals / may trap) }
+       proc_query_purity_verdict : function(pd:tprocdef; want:byte):boolean = nil;
 
 
     { default types }
@@ -7074,6 +7166,20 @@ implementation
          icf_hash_valid:=false;
          icf_hash[0]:=0;
          icf_hash[1]:=0;
+         modref_analyzed:=false;
+         modref_ppu_valid:=false;
+         modref_reads:=0;
+         modref_writes:=0;
+         modref_can_trap:=false;
+         modref_pmask_exact:=false;
+         modref_smask_exact:=false;
+         modref_reads_pmask:=0;
+         modref_writes_pmask:=0;
+         modref_reads_statics:=nil;
+         modref_writes_statics:=nil;
+         deadpara_analyzed:=false;
+         deadpara_ppu_valid:=false;
+         deadpara_ref_mask:=high(dword);
       end;
 
 
@@ -7088,6 +7194,20 @@ implementation
          icf_hash_valid:=false;
          icf_hash[0]:=0;
          icf_hash[1]:=0;
+         modref_analyzed:=false;
+         modref_ppu_valid:=false;
+         modref_reads:=0;
+         modref_writes:=0;
+         modref_can_trap:=false;
+         modref_pmask_exact:=false;
+         modref_smask_exact:=false;
+         modref_reads_pmask:=0;
+         modref_writes_pmask:=0;
+         modref_reads_statics:=nil;
+         modref_writes_statics:=nil;
+         deadpara_analyzed:=false;
+         deadpara_ppu_valid:=false;
+         deadpara_ref_mask:=high(dword);
 {$ifdef symansistr}
          if po_has_mangledname in procoptions then
            _mangledname:=ppufile.getansistring
@@ -7400,6 +7520,7 @@ implementation
       var
         pureflags : byte;
         icfname : TSymStr;
+        i : longint;
       begin
         { -OoPURE: persist the final pure/const verdict (computed now, when the
           whole defining unit is analysed) as two ready-made booleans, so a
@@ -7409,10 +7530,16 @@ implementation
         if pure_analyzed and assigned(proc_query_purity_verdict) then
           begin
             pureflags:=0;
-            if proc_query_purity_verdict(self,false) then
+            if proc_query_purity_verdict(self,0) then
               pureflags:=pureflags or 1;
-            if proc_query_purity_verdict(self,true) then
+            if proc_query_purity_verdict(self,1) then
               pureflags:=pureflags or 2;
+            { bit 2: nothrow (cannot raise/trap), bit 3: mem-pure (writes no
+              memory) -- tracked independently of purity (-OoPURE nothrow) }
+            if proc_query_purity_verdict(self,2) then
+              pureflags:=pureflags or 4;
+            if proc_query_purity_verdict(self,3) then
+              pureflags:=pureflags or 8;
             ppufile.putbyte(optsum_pure);
             ppufile.putword(1);
             ppufile.putbyte(pureflags);
@@ -7460,6 +7587,52 @@ implementation
             ppufile.putstring(icfname);
           end;
 
+        { -OoMODREF: persist the interprocedural mod/ref memory-access summary as
+          a flag byte (reads in bits 0..1, writes in bits 2..3, can_trap in bit
+          4, per-formal-mask-exact in bit 5) followed by the two by-reference
+          per-formal bitmaps (reads then writes, one dword each). Only emitted
+          when this routine was actually analysed in this unit (=> -OoMODREF was
+          on). No target/ABI guard is needed: the summary is expressed in terms
+          of source-level parameters/globals, not physical registers, so it is
+          valid for any target. }
+        if modref_analyzed then
+          begin
+            ppufile.putbyte(optsum_modref);
+            { framing length word: the reader does not skip modref by it (it reads
+              the fields directly), so a fixed value for the flag byte + two masks
+              is adequate; the variable-length static sets follow field-by-field. }
+            ppufile.putword(1+2*sizeof(dword));
+            ppufile.putbyte((modref_reads and 3) or
+                            ((modref_writes and 3) shl 2) or
+                            (ord(modref_can_trap) shl 4) or
+                            (ord(modref_pmask_exact) shl 5) or
+                            (ord(modref_smask_exact) shl 6));
+            ppufile.putdword(modref_reads_pmask);
+            ppufile.putdword(modref_writes_pmask);
+            { per-static read/write sets (mangled names), only carried when the
+              corresponding sets are meaningful (mr_unknown + smask_exact); empty
+              otherwise, which serializes to a single 0 count byte each }
+            ppufile.putbyte(length(modref_reads_statics));
+            for i:=0 to high(modref_reads_statics) do
+              ppufile.putansistring(modref_reads_statics[i]);
+            ppufile.putbyte(length(modref_writes_statics));
+            for i:=0 to high(modref_writes_statics) do
+              ppufile.putansistring(modref_writes_statics[i]);
+          end;
+
+        { -OoDEADPARA: persist the per-formal reference bitmap (one dword) so a
+          caller in another unit can elide the evaluation of an actual bound to a
+          provably-never-read by-value scalar formal. Only emitted when this
+          routine was actually analysed in this unit (=> -OoDEADPARA was on). No
+          target/ABI guard: the mask is expressed in source-level parameter
+          indices. }
+        if deadpara_analyzed then
+          begin
+            ppufile.putbyte(optsum_deadpara);
+            ppufile.putword(sizeof(dword));
+            ppufile.putdword(deadpara_ref_mask);
+          end;
+
         { terminator }
         ppufile.putbyte(optsum_end);
       end;
@@ -7471,14 +7644,28 @@ implementation
         len : word;
         sig : longint;
         skip : array[0..255] of byte;
-        left,chunk : longint;
+        left,chunk,i : longint;
         icfname : TSymStr;
       begin
         { defaults: no summary loaded -> conservative fallback everywhere }
         pure_ppu_valid:=false;
         pure_ppu_is_pure:=false;
         pure_ppu_is_const:=false;
+        pure_ppu_is_nothrow:=false;
+        pure_ppu_is_mempure:=false;
         icf_hash_valid:=false;
+        modref_ppu_valid:=false;
+        modref_reads:=0;
+        modref_writes:=0;
+        modref_can_trap:=false;
+        modref_pmask_exact:=false;
+        modref_smask_exact:=false;
+        modref_reads_pmask:=0;
+        modref_writes_pmask:=0;
+        modref_reads_statics:=nil;
+        modref_writes_statics:=nil;
+        deadpara_ppu_valid:=false;
+        deadpara_ref_mask:=high(dword);
         repeat
           tag:=ppufile.getbyte;
           if tag=optsum_end then
@@ -7491,6 +7678,31 @@ implementation
                 pure_ppu_valid:=true;
                 pure_ppu_is_pure:=(pureflags and 1)<>0;
                 pure_ppu_is_const:=(pureflags and 2)<>0;
+                pure_ppu_is_nothrow:=(pureflags and 4)<>0;
+                pure_ppu_is_mempure:=(pureflags and 8)<>0;
+              end;
+            optsum_modref:
+              begin
+                pureflags:=ppufile.getbyte;
+                modref_ppu_valid:=true;
+                modref_reads:=pureflags and 3;
+                modref_writes:=(pureflags shr 2) and 3;
+                modref_can_trap:=(pureflags and 16)<>0;
+                modref_pmask_exact:=(pureflags and 32)<>0;
+                modref_smask_exact:=(pureflags and 64)<>0;
+                modref_reads_pmask:=ppufile.getdword;
+                modref_writes_pmask:=ppufile.getdword;
+                setlength(modref_reads_statics,ppufile.getbyte);
+                for i:=0 to high(modref_reads_statics) do
+                  modref_reads_statics[i]:=ppufile.getansistring;
+                setlength(modref_writes_statics,ppufile.getbyte);
+                for i:=0 to high(modref_writes_statics) do
+                  modref_writes_statics[i]:=ppufile.getansistring;
+              end;
+            optsum_deadpara:
+              begin
+                deadpara_ref_mask:=ppufile.getdword;
+                deadpara_ppu_valid:=true;
               end;
             optsum_ipara:
               begin

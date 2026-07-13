@@ -2792,17 +2792,26 @@ unit cgx86;
   {$ifndef i8086}
         { avx helps only to reduce size, using it in general does at least not help on
           an i7-4770
-          but using the xmm registers reduces register pressure (FK) }
-        if (FPUX86_HAS_AVXUNIT in fpu_capabilities[current_settings.fputype]) and
+          but using the xmm registers reduces register pressure (FK).
+          These wide (>=16-byte) block copies are therefore gated on -Os: at speed
+          a single movdqu/vmovdqu reload of a struct that was just written by
+          narrower scalar stores (a 2xdouble record spilled from xmm0:xmm1) cannot
+          be satisfied by store-to-load forwarding and stalls, which regressed
+          complex-arithmetic hot loops (core/fft ~0.6x vs stock at -O2). The
+          MovMovMovMov2MovdqMovdq peephole in aoptx86 is gated on cs_opt_size for
+          the same reason. }
+        if (cs_opt_size in current_settings.optimizerswitches) and
+          (FPUX86_HAS_AVXUNIT in fpu_capabilities[current_settings.fputype]) and
           ((len mod 4)=0) and (len<=48) {$ifndef i386}and (len>=16){$endif i386} then
           result:=copy_avx
-        else if (FPUX86_HAS_AVX512F in fpu_capabilities[current_settings.fputype]) and
+        else if (cs_opt_size in current_settings.optimizerswitches) and
+          (FPUX86_HAS_AVX512F in fpu_capabilities[current_settings.fputype]) and
           ((len mod 4)=0) and (len<=128) {$ifndef i386}and (len>=16){$endif i386} then
           result:=copy_avx512
         else
         { I'am not sure what CPUs would benefit from using sse instructions for moves
           but using the xmm registers reduces register pressure (FK) }
-        if
+        if (cs_opt_size in current_settings.optimizerswitches) and
   {$ifdef x86_64}
           ((current_settings.fputype>=fpu_sse64)
   {$else x86_64}

@@ -66,6 +66,12 @@ const
 var
   { widechar, because also used by widestring -> pwidechar conversions }
   emptychar : widechar;public name 'FPC_EMPTYCHAR';
+  { -OoSTACKGUARD secret stack-canary word.  Seeded once at startup from OS
+    randomness (see the platform system unit); referenced by the prologue/epilogue
+    canary code the compiler emits for instrumented routines.  Lives in an
+    RTL-owned global rather than the glibc %fs:0x28 TLS slot because the default
+    linux-x86_64 RTL is libc-free. }
+  FPCStackChkGuard : ptruint;public name 'FPC_STACK_CHK_GUARD';
 {$ifndef FPC_NO_GENERIC_STACK_CHECK}
   { if the OS does the stack checking, we don't need any stklen from the
     main program }
@@ -1022,6 +1028,24 @@ end;
 procedure fpc_threaderror; [public,alias:'FPC_THREADERROR'];
 begin
     HandleErrorAddrFrameInd(236{RuntimeErrorExitCodes[reThreadError]},get_pc_addr,get_frame);
+end;
+
+
+{ -OoSTACKGUARD: canary-mismatch handler.  The compiler-emitted epilogue calls
+  this (and never returns from it) when a routine's stack canary no longer
+  matches FPC_STACK_CHK_GUARD, i.e. a local buffer overflow has smashed the
+  frame.  Report to stderr and abort with a nonzero exit code. }
+procedure fpc_stack_chk_fail; [public,alias:'FPC_STACK_CHK_FAIL']; noreturn;
+begin
+  if Textrec(StdErr).Mode=fmOutput then
+    begin
+      Writeln(StdErr,'Runtime error: stack smashing detected, program terminated');
+      Flush(StdErr);
+    end;
+  { 134 = 128+SIGABRT, matching glibc's __stack_chk_fail/abort exit status; a
+    dedicated code (not an FPC runtime-error number, avoiding the confusing clash
+    with RTE 203 heap-overflow) so a smashed-frame abort is unambiguous. }
+  Halt(134);
 end;
 
 

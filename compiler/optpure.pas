@@ -66,6 +66,13 @@ interface
       not been analysed (e.g. loaded from another unit) is treated as impure. }
     function proc_is_pure(pd : tprocdef) : boolean;
     function proc_is_const(pd : tprocdef) : boolean;
+    { -OoPURE nothrow attribute, INDEPENDENT of purity: the routine (and every
+      routine it calls) provably cannot raise an exception or trap. Holds for
+      many IMPURE routines too (e.g. a routine that only writes a global). }
+    function proc_is_nothrow(pd : tprocdef) : boolean;
+    { writes no memory (may read globals, MAY trap): "pure minus the nothrow
+      requirement". proc_is_pure = proc_is_mempure and proc_is_nothrow. }
+    function proc_is_mempure(pd : tprocdef) : boolean;
 
 implementation
 
@@ -75,14 +82,27 @@ implementation
       symbase,symtype,symconst,symsym,symtable,
       defutil,
       nutils,ncal,nld,nmem,ninl,ncnv,
+      optutils,
       compinnr;
 
     type
       ppurescan = ^tpurescan;
       tpurescan = record
         pd : tprocdef;
+        { MEMORY / side-effect impurity (a global write, addr-taken, goto,
+          impure intrinsic, unknown call ...) -- but NOT trapping, which is
+          tracked separately in cantrap. kills pure/const/mempure. }
         impure : boolean;
+        { can raise an exception or trap (div/mod, checked arithmetic, a pointer
+          dereference that may fault, inline asm, an unknown/indirect call, a
+          raise / try..except) -- tracked INDEPENDENTLY of memory impurity so a
+          nothrow verdict is available even for a memory-impure routine. kills
+          pure/const (folded back in) and nothrow, but NOT mempure. }
+        cantrap : boolean;
         readsglobal : boolean;
+        { -OoREPORT: the first (dominant) intrinsic-impurity cause found, so the
+          remark can name a concrete why-not. Purely diagnostic. }
+        reason : ansistring;
       end;
 
     { inline intrinsics that are genuinely side-effect-free, non-trapping value
@@ -123,6 +143,16 @@ implementation
               { a[i]: descend to the base; a deref/global base is caught there,
                 a local static array base ends at its loadn }
               t:=tvecnode(t).left;
+            temprefn:
+              { a compiler-created temporary (ttempcreatenode storage) is local,
+                non-escaping stack storage -- e.g. the from/to bound temps that
+                ConvertForLoops synthesizes when it lowers a counted for-loop to a
+                while-loop before this pass runs. A store to such a temp is never
+                externally observable, so it does not disqualify const/pure. (A
+                store THROUGH it -- temp^ := ... -- is a derefn and still caught
+                above; temp.field / temp[i] descend here to the same verdict on
+                local temp storage.) }
+              exit(false);
             derefn:
               exit(true);
             loadn:
@@ -171,31 +201,70 @@ implementation
       end;
 
 
+    { -OoREPORT: a short human phrase for the impurity a node introduced, used
+      only to build the diagnostic remark's why-not text (never a decision) }
+    function purity_reason_for(n : tnode) : ansistring;
+      begin
+        case n.nodetype of
+          asmn:
+            result:='contains inline assembler';
+          raisen,tryexceptn,tryfinallyn,onn:
+            result:='uses exceptions';
+          goton,labeln:
+            result:='contains a goto/label';
+          addrn:
+            result:='takes the address of something';
+          divn,modn:
+            result:='may trap on division';
+          assignn,loadn,derefn,subscriptn,vecn,addn,subn,muln,unaryminusn,typeconvn:
+            result:='writes global/static state or has a checked-arithmetic side effect';
+          inlinen:
+            result:='calls a non-pure intrinsic (I/O, allocation, length/setlength, ...)';
+          calln:
+            result:='calls an indirect / virtual / external routine';
+          else
+            result:='has a side effect';
+        end;
+      end;
+
+
     function purescan_node(var n : tnode; arg : pointer) : foreachnoderesult;
       var
         ctx : ppurescan;
         sym : tsym;
         pd : tabstractprocdef;
         iswrite : boolean;
+        para : tcallparanode;
       begin
         result:=fen_true;
         ctx:=ppurescan(arg);
-        { once proven impure there is nothing left to discover }
-        if ctx^.impure then
+        { nothing more to learn once BOTH facts are already set (memory-impure
+          AND may-trap): the subtree can neither un-set them nor add a verdict.
+          readsglobal is irrelevant once impure (const already lost). }
+        if ctx^.impure and ctx^.cantrap then
           begin
             result:=fen_norecurse_true;
             exit;
           end;
         case n.nodetype of
-          asmn,raisen,tryexceptn,tryfinallyn,onn,goton,labeln,addrn:
+          asmn:
+            { inline asm is opaque: may write memory AND trap }
+            begin ctx^.impure:=true; ctx^.cantrap:=true; end;
+          raisen,tryexceptn,tryfinallyn,onn:
+            { exception machinery: a trap, but no direct memory side effect
+              (child stores are scanned as their own nodes) }
+            ctx^.cantrap:=true;
+          goton,labeln,addrn:
+            { control complexity / addr-taken: keeps the routine out of
+              pure/const as before, but cannot itself raise/trap }
             ctx^.impure:=true;
           divn,modn:
             { division may trap (div by zero) -> not safe to speculate }
-            ctx^.impure:=true;
+            ctx^.cantrap:=true;
           addn,subn,muln,unaryminusn,typeconvn,vecn:
             begin
               if ([cs_check_overflow,cs_check_range]*n.localswitches)<>[] then
-                ctx^.impure:=true;
+                ctx^.cantrap:=true;
               if n.nodetype=vecn then
                 ctx^.readsglobal:=true;
             end;
@@ -203,6 +272,10 @@ implementation
             ctx^.readsglobal:=true;
           derefn:
             begin
+              { a pointer dereference may fault (nil / wild pointer): a trap for
+                nothrow/speculation purposes, whether a read or a write; a write
+                is additionally a memory side effect }
+              ctx^.cantrap:=true;
               if ([nf_write,nf_modify]*n.flags)<>[] then
                 ctx^.impure:=true
               else
@@ -212,8 +285,37 @@ implementation
             if lvalue_write_is_side_effect(tassignmentnode(n).left) then
               ctx^.impure:=true;
           inlinen:
-            if not pure_inline(tinlinenode(n).inlinenumber) then
-              ctx^.impure:=true;
+            case tinlinenode(n).inlinenumber of
+              in_succ_x,in_pred_x:
+                { succ/pred is a non-trapping +1/-1 value computation UNLESS
+                  range/overflow checking is on (then it may trap at the type
+                  boundary). }
+                if ([cs_check_overflow,cs_check_range]*n.localswitches)<>[] then
+                  ctx^.cantrap:=true;
+              in_inc_x,in_dec_x:
+                { inc/dec mutates its target argument in place. That is a memory
+                  side effect only if the target is externally observable;
+                  mutating a plain LOCAL (or a compiler temp) is not. Checked
+                  inc/dec may trap. Only the write-flagged argument matters. }
+                begin
+                  if ([cs_check_overflow,cs_check_range]*n.localswitches)<>[] then
+                    ctx^.cantrap:=true;
+                  para:=tcallparanode(tinlinenode(n).left);
+                  while assigned(para) do
+                    begin
+                      if (assigned(para.left)) and
+                         (([nf_write,nf_modify]*para.left.flags)<>[]) and
+                         lvalue_write_is_side_effect(para.left) then
+                        ctx^.impure:=true;
+                      para:=tcallparanode(para.right);
+                    end;
+                end;
+              else
+                if not pure_inline(tinlinenode(n).inlinenumber) then
+                  { unknown intrinsic (I/O, allocation, ...): may write memory
+                    AND may raise (e.g. an I/O error, out-of-memory) }
+                  begin ctx^.impure:=true; ctx^.cantrap:=true; end;
+            end;
           loadn:
             begin
               sym:=tloadnode(n).symtableentry;
@@ -253,17 +355,17 @@ implementation
             begin
               pd:=tcallnode(n).procdefinition;
               if not assigned(pd) or not(pd is tprocdef) then
-                { indirect / procvar call: unknown target }
-                ctx^.impure:=true
+                { indirect / procvar call: unknown target (may write and raise) }
+                begin ctx^.impure:=true; ctx^.cantrap:=true; end
               else if assigned(tcallnode(n).methodpointer) then
                 { dynamically-dispatched / method-through-pointer call }
-                ctx^.impure:=true
+                begin ctx^.impure:=true; ctx^.cantrap:=true; end
               else if (procoptions_conflict(tprocdef(pd))) then
-                ctx^.impure:=true
+                begin ctx^.impure:=true; ctx^.cantrap:=true; end
               else
                 begin
                   { direct call to an ordinary routine: record the dependency,
-                    the fixpoint decides whether it keeps us pure/const }
+                    the fixpoint decides whether it keeps us pure/const/nothrow }
                   SetLength(ctx^.pd.pure_callees,Length(ctx^.pd.pure_callees)+1);
                   ctx^.pd.pure_callees[High(ctx^.pd.pure_callees)]:=tprocdef(pd);
                 end;
@@ -271,7 +373,9 @@ implementation
           else
             ;
         end;
-        if ctx^.impure then
+        if (ctx^.impure or ctx^.cantrap) and (ctx^.reason='') then
+          ctx^.reason:=purity_reason_for(n);
+        if ctx^.impure and ctx^.cantrap then
           result:=fen_norecurse_true;
       end;
 
@@ -379,23 +483,56 @@ implementation
         if not proc_eligible(pd) then
           begin
             pd.pure_intrinsic_impure:=true;
+            pd.pure_can_trap:=true;
             pd.pure_analyzed:=true;
+            { -OoREPORT: a routine tuning users might expect kept out of a loop
+              (LICM) but that the analysis cannot even consider }
+            OptRemark(pd.fileinfo,'pure',pd.fullprocname(false)+
+              ' not analyzed: ineligible signature (non-simple result, or a'+
+              ' writable/managed/hidden parameter, or method/virtual dispatch)');
             exit;
           end;
         ctx.pd:=pd;
         ctx.impure:=false;
+        ctx.cantrap:=false;
         ctx.readsglobal:=false;
+        ctx.reason:='';
         foreachnodestatic(pm_postprocess,code,@purescan_node,@ctx);
         pd.pure_intrinsic_impure:=ctx.impure;
+        pd.pure_can_trap:=ctx.cantrap;
         pd.pure_reads_global:=ctx.readsglobal;
         pd.pure_analyzed:=true;
         { -vh diagnostic: report the discovered verdict once, here, at the point
           it is first available (not per call site), respecting -vh gating. const
-          is the stronger verdict (implies pure), so report only the strongest. }
+          is the stronger verdict (implies pure), so report only the strongest;
+          the nothrow verdict is ORTHOGONAL and reported on its own line (so an
+          impure-but-nothrow routine still gets a nothrow hint). }
         if proc_is_const(pd) then
           MessagePos1(pd.fileinfo,cg_h_proc_const,pd.fullprocname(false))
         else if proc_is_pure(pd) then
           MessagePos1(pd.fileinfo,cg_h_proc_pure,pd.fullprocname(false));
+        if proc_is_nothrow(pd) then
+          MessagePos1(pd.fileinfo,cg_h_proc_nothrow,pd.fullprocname(false));
+        { -OoREPORT: the same verdict, plus the concrete why-not when neither
+          verdict holds, routed through the optimization-remarks facility. The
+          fixpoint (proc_is_pure/const) is the final answer -- when the body is
+          intrinsically clean but a callee spoils it, name that instead. }
+        if proc_is_const(pd) then
+          OptRemark(pd.fileinfo,'pure',pd.fullprocname(false)+
+            ' proven const (result depends only on its by-value parameters)')
+        else if proc_is_pure(pd) then
+          OptRemark(pd.fileinfo,'pure',pd.fullprocname(false)+
+            ' proven pure (reads but never writes global state)')
+        else if ctx.impure or ctx.cantrap then
+          OptRemark(pd.fileinfo,'pure',pd.fullprocname(false)+
+            ' not pure/const: '+ctx.reason)
+        else
+          OptRemark(pd.fileinfo,'pure',pd.fullprocname(false)+
+            ' not pure/const: calls a routine not provably pure/const');
+        { orthogonal nothrow remark: observable even for an impure routine }
+        if proc_is_nothrow(pd) then
+          OptRemark(pd.fileinfo,'pure',pd.fullprocname(false)+
+            ' proven nothrow (cannot raise or trap)');
       end;
 
 
@@ -416,23 +553,26 @@ implementation
     var
       pure_query_token : cardinal = 0;
 
-    function dfs_pure(pd : tprocdef; token : cardinal; wantconst : boolean) : boolean;
+    { want: 0=pure, 1=const, 2=nothrow, 3=mempure. The self-fail predicate and
+      the cross-unit leaf bit differ per mode; a routine has the verdict iff it
+      does not self-fail AND every callee also has it (greatest fixpoint). }
+    function dfs_pure(pd : tprocdef; token : cardinal; want : byte) : boolean;
       var
         i : longint;
-        r : boolean;
+        r,selffail : boolean;
       begin
         if not assigned(pd) then
           exit(false);
         { a routine read from another unit's ppu carries its already-resolved
-          cross-unit verdict as two booleans (shared PPU optimizer summary):
-          treat it as a leaf with that verdict instead of re-deriving its call
-          graph (which is not available here). }
+          cross-unit verdicts as ready-made booleans (shared PPU optimizer
+          summary): treat it as a leaf with that verdict instead of re-deriving
+          its call graph (which is not available here). }
         if pd.pure_ppu_valid then
-          begin
-            if wantconst then
-              exit(pd.pure_ppu_is_const)
-            else
-              exit(pd.pure_ppu_is_pure);
+          case want of
+            1: exit(pd.pure_ppu_is_const);
+            2: exit(pd.pure_ppu_is_nothrow);
+            3: exit(pd.pure_ppu_is_mempure);
+            else exit(pd.pure_ppu_is_pure);
           end;
         if not pd.pure_analyzed then
           exit(false);
@@ -446,14 +586,20 @@ implementation
           end;
         pd.pure_qtoken:=token;
         pd.pure_qresult:=0; { visiting }
-        if pd.pure_intrinsic_impure or (wantconst and pd.pure_reads_global) then
+        case want of
+          1: selffail:=pd.pure_intrinsic_impure or pd.pure_can_trap or pd.pure_reads_global;
+          2: selffail:=pd.pure_can_trap;
+          3: selffail:=pd.pure_intrinsic_impure;
+          else selffail:=pd.pure_intrinsic_impure or pd.pure_can_trap;
+        end;
+        if selffail then
           begin
             pd.pure_qresult:=2;
             exit(false);
           end;
         r:=true;
         for i:=0 to High(pd.pure_callees) do
-          if not dfs_pure(pd.pure_callees[i],token,wantconst) then
+          if not dfs_pure(pd.pure_callees[i],token,want) then
             begin
               r:=false;
               break;
@@ -469,25 +615,42 @@ implementation
     function proc_is_pure(pd : tprocdef) : boolean;
       begin
         inc(pure_query_token);
-        result:=dfs_pure(pd,pure_query_token,false);
+        result:=dfs_pure(pd,pure_query_token,0);
       end;
 
 
     function proc_is_const(pd : tprocdef) : boolean;
       begin
         inc(pure_query_token);
-        result:=dfs_pure(pd,pure_query_token,true);
+        result:=dfs_pure(pd,pure_query_token,1);
+      end;
+
+
+    function proc_is_nothrow(pd : tprocdef) : boolean;
+      begin
+        inc(pure_query_token);
+        result:=dfs_pure(pd,pure_query_token,2);
+      end;
+
+
+    function proc_is_mempure(pd : tprocdef) : boolean;
+      begin
+        inc(pure_query_token);
+        result:=dfs_pure(pd,pure_query_token,3);
       end;
 
 
     { write-time hook consulted by tprocdef.ppuwrite to persist a routine's
-      final pure/const verdict into its ppu optimizer summary. }
-    function purity_verdict_hook(pd : tprocdef; wantconst : boolean) : boolean;
+      final pure/const/nothrow/mempure verdicts into its ppu optimizer summary.
+      want: 0=pure, 1=const, 2=nothrow, 3=mempure. }
+    function purity_verdict_hook(pd : tprocdef; want : byte) : boolean;
       begin
-        if wantconst then
-          result:=proc_is_const(pd)
-        else
-          result:=proc_is_pure(pd);
+        case want of
+          1: result:=proc_is_const(pd);
+          2: result:=proc_is_nothrow(pd);
+          3: result:=proc_is_mempure(pd);
+          else result:=proc_is_pure(pd);
+        end;
       end;
 
 initialization

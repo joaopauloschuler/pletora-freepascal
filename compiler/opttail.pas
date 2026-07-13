@@ -38,6 +38,7 @@ unit opttail;
       defcmp,defutil,
       nutils,nbas,nflw,ncal,nld,ncnv,nmem,
       pass_1,
+      optutils,
       paramgr;
 
     procedure do_opttail(var n : tnode;p : tprocdef);
@@ -256,6 +257,16 @@ unit opttail;
         writeln;
         writeln('====================================================================================');
 {$endif debug_opttail}
+                { -OoREPORT: a self-recursive routine a user might expect turned
+                  into a loop, but whose signature blocks the rewrite }
+                if is_managed_type(vardef) then
+                  OptRemark(p.fileinfo,'tailrec',p.fullprocname(false)+
+                    ' tail recursion not applied: parameter '+realname+
+                    ' is a managed type')
+                else
+                  OptRemark(p.fileinfo,'tailrec',p.fullprocname(false)+
+                    ' tail recursion not applied: parameter '+realname+
+                    ' is an out parameter');
                 exit;
               end;
 
@@ -289,6 +300,8 @@ unit opttail;
             n:=internalstatements(s);
             addstatement(s,labelnode);
             addstatement(s,oldnodes);
+            OptRemark(p.fileinfo,'tailrec',p.fullprocname(false)+
+              ' self-recursive tail call rewritten into a loop');
 {$ifdef debug_opttail}
         writeln('====================================================================================');
         write('Tail call replaced by: ');

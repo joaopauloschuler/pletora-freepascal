@@ -570,8 +570,9 @@ interface
            matching pops + ret; that guard branch is retargeted to a fresh bare ret
            and the pushes are moved to the start of the slow path. The fast path
            then provably preserves every callee-saved register because it neither
-           saves nor clobbers one; the slow path is byte-identical. Opt-in
-           (-OoSHRINKWRAP): a wrong prologue move is a miscompile }
+           saves nor clobbers one; the slow path is byte-identical. Part of the
+           -O4 default optimizer set (promoted after the forced-suite/self-host/
+           torture evaluation) }
          cs_opt_shrinkwrap,
          { global value numbering + full-redundancy elimination (the gcc
            tree-fre / LLVM GVN family): number side-effect-free scalar
@@ -590,8 +591,9 @@ interface
            expression by any assignment to one of its operands; the conditional
            right operand of a short-circuit and/or is never treated as
            unconditionally available; procedures with labels, inline assembler
-           or exceptions are skipped wholesale. Opt-in (-OoGVNPRE): a wrong
-           reuse is a miscompile }
+           or exceptions are skipped wholesale. Part of the -O4 default
+           optimizer set (promoted after the forced-suite/self-host/torture
+           evaluation) }
          cs_opt_gvnpre,
          { interprocedural pure/const function-attribute discovery (the gcc
            -fipa-pure-const idea ported to FPC): walk the unit's routines
@@ -605,8 +607,9 @@ interface
            consumed by LICM (-OoLICM), which may hoist a call to a proven-const
            function with loop-invariant arguments out of a loop. Conservative:
            any global/threadvar/pointer write, call to an unproven routine,
-           Writeln/IO, raise, try/except or inline asm => not pure. Opt-in
-           (-OoPURE): a wrong attribute is a miscompile }
+           Writeln/IO, raise, try/except or inline asm => not pure. Part of
+           the -O4 default optimizer set (promoted after the forced-suite/
+           self-host/torture evaluation) }
          cs_opt_pure,
          { partial inlining / function splitting (the gcc -fpartial-inlining /
            ipa-split idea ported to FPC): a routine that starts with a cheap,
@@ -729,7 +732,8 @@ interface
            and -- because an exception unwind (longjmp) restores only
            callee-saved registers -- for any call inside a routine that itself
            has exception handling. Both integer and XMM/MM clobbers are tracked.
-           x86_64 only. Opt-in; NOT part of the -O4 defaults }
+           x86_64 only. Part of the -O4 default optimizer set (promoted after
+           the forced-suite/self-host/torture evaluation) }
          cs_opt_ipara,
          { final value replacement + dead loop elimination (-OoFINALVALUE):
            the gcc -ftree-scev-cprop scalar-evolution constant propagation
@@ -751,8 +755,9 @@ interface
            result is bit-identical, hence DISABLED under -Co/-Cr (where the
            loop would trap on the overflowing iteration). Any body that is not
            exactly the single accumulator update (calls, stores, control flow,
-           break/continue/exit, nested loops) never matches. Opt-in; NOT part
-           of the -O4 defaults }
+           break/continue/exit, nested loops) never matches. Part of the -O4
+           default optimizer set (promoted after the forced-suite/self-host/
+           torture evaluation) }
          cs_opt_finalvalue,
          { sibling-call optimization (-OoSIBCALL): the gcc
            -foptimize-sibling-calls tail-call pass ported to FPC and applied at
@@ -777,8 +782,275 @@ interface
            exception frame, no dynamic stack allocation, no nested-frame capture
            and no address-taken local or parameter (so no @local can escape into
            the callee's arguments).  Anything not provably safe falls back to a
-           normal call.  Opt-in; NOT part of the -O4 defaults }
-         cs_opt_sibcall
+           normal call.  Part of the -O4 default optimizer set (promoted after
+           the forced-suite/self-host/torture evaluation) }
+         cs_opt_sibcall,
+         { optimization-remarks facility (-Ooreport): the gcc -fopt-info /
+           clang -Rpass counterpart shared by the fork's -Oo* loop and
+           vectorizer passes. When set, each covered pass emits one structured
+           line per APPLIED transform and -- the more valuable half -- one per
+           MISSED transform naming the concrete blocking reason, at the position
+           of the affected loop, prefixed by the pass name (see the shared
+           OptRemark helper in optutils). Independent of message verbosity
+           (unlike the per-pass -vn notes) and machine-greppable. Measure-only:
+           enabling it never changes generated code. NOT part of the -O4
+           defaults }
+         cs_opt_report,
+         { provable-receiver devirtualization (-OoDEVIRT): the intra-procedural
+           counterpart of the WPO -Owdevirtcalls pass. At a virtual call site
+           x.VirtMethod(...) where a conservative local dataflow proves the
+           receiver x's dynamic type EXACTLY -- x is a local (or by-value
+           parameter) reference variable, never address-taken, never captured
+           by a nested scope, never passed by var/out, and EVERY assignment to
+           x in the routine is a concrete constructor call TFoo.Create (the
+           same class TFoo, via a loadvmtaddr of a typen, never a class-ref
+           variable) -- the indirect VMT dispatch is replaced by a direct call
+           to TFoo's resolution of that vmt slot (the override the runtime
+           dispatch would have selected). No runtime guard is needed because
+           the only non-nil value x can hold is a TFoo instance; a call on nil
+           is already undefined in the virtual form. Interfaces, class-ref
+           constructor calls, virtual class methods/constructors via an
+           instance and dynamic casts prove nothing and are skipped. Measure
+           and report via -Ooreport. Opt-in; NOT part of the -O4 defaults --
+           a wrong target is a miscompile }
+         cs_opt_devirt,
+         { interprocedural constant propagation via call-site-driven function
+           cloning (the gcc -fipa-cp / -fipa-cp-clone idea, ported to FPC's
+           single-pass, immediate-codegen model as an intra-unit CLONE pass --
+           see compiler/optipacp.pas). When a routine's body is stashed before
+           codegen and a LATER caller passes a compile-time ordinal/bool/enum
+           constant for an eligible by-value, never-written parameter, a
+           specialized out-of-line clone is synthesised: the parameter's reads
+           are substituted with the literal and the enclosing arithmetic /
+           comparisons / if-branches re-folded, so the clone's own optimizer
+           pipeline (dead-branch elimination, unrolling, vectorization) fires
+           on now-constant loop bounds and flags. Clones are cached per
+           (routine,param,value) and shared across call sites; growth is bound
+           by a node-count budget and a per-routine clone cap. The clone keeps
+           the original signature (the constant argument is still passed but
+           ignored internally) so the calling convention is untouched, and the
+           call is retargeted by rebuilding a fresh call node to the clone.
+           Opt-in; NOT part of the -O4 defaults -- a wrong clone is a
+           miscompile }
+         cs_opt_ipacp,
+         { AVX-256 (ymm) autovectorization width: widen the -OoVECTORIZE 128-bit
+           SSE/AVX packed windows to 256-bit ymm on an AVX-capable fputype
+           (single: 8 lanes/iteration, double: 4), with a vextractf128-based
+           horizontal-reduction epilogue (reduce ymm -> xmm -> scalar). Opt-in
+           and only takes effect when the fputype actually has an AVX unit
+           (-Cfavx / -Cfavx2 / ...); otherwise the existing 128-bit path is
+           kept. The scalar remainder tail (now up to 7/3 iterations) is
+           unchanged in shape. NOT part of the -O4 defaults }
+         cs_opt_vect256,
+         { compile-time evaluation of a call to a proven-CONST routine (see
+           -OoPURE) whose actual arguments are all compile-time constants: the
+           callee's stashed pre-firstpass body is interpreted by a small bounded
+           evaluator (locals as a value environment; assignment, if/case/for/
+           while/repeat, nested calls to other proven-const routines under a
+           recursion cap, and a hard step budget) with the exact two's-complement
+           / IEEE semantics of the generated code, and the whole call node is
+           replaced by the computed literal (the effect gcc gets from inlining +
+           IPA-CP/ccp folding, or D/C++ CTFE/constexpr). Any potentially-trapping
+           shape (-Co/-Cr active, div/mod by a zero divisor the evaluator sees)
+           refuses to fold. First cut scalar-only: ordinal/enum/boolean/float
+           params, result and locals; sets/arrays/records/strings/address-taking
+           anywhere in the body make the callee ineligible. Distinct from -OoIPACP
+           (clones a specialized body but still emits a runtime call) and from
+           GVN-PRE (reuses a runtime value, never a literal). Opt-in; NOT part of
+           the -O4 defaults -- a wrong fold is a miscompile }
+         cs_opt_consteval,
+         { interprocedural mod/ref analysis (-OoMODREF): a port of gcc's
+           ipa-modref (gcc/ipa-modref.cc, default-on there at -O2 as
+           -fipa-modref) that REFINES the binary pure/const verdict of -OoPURE.
+           For each ordinary routine compiled in the unit a conservative
+           memory-access summary is recorded -- what it READS and what it WRITES,
+           each classified into: nothing / only through its own by-reference
+           (var/out/const/constref) parameters / unknown-global -- plus whether
+           it can trap or raise. The summary is folded bottom-up (a callee's
+           effect is mapped through the actual arguments at each call site into
+           the caller's own frame; a forward/recursive callee whose summary is
+           not yet available and any indirect/procvar/virtual/external/asm callee
+           or write through a dereferenced pointer degrade conservatively to
+           unknown-global) and serialized cross-unit through the established
+           per-procdef PPU optimizer-summary mechanism (the optsum_modref tag,
+           beside optsum_pure). Consumers then relax call fences that today treat
+           every non-pure call as a universal barrier: a call whose summary
+           provably neither reads nor writes the location in question is no
+           barrier even though the callee is impure -- e.g. a helper that writes
+           only its own out parameter (bound to a caller local) no longer kills a
+           caller's pending global store or blocks promoting a global across a
+           loop. The stronger pure/const bits stay authoritative where set.
+           Part of the -O4 default optimizer set (promoted after the
+           forced-suite/self-host/torture evaluation) }
+         cs_opt_modref,
+         { vectorized APPROXIMATE transcendentals (-OoAPPROXTRANS): an element-wise
+           single-precision activation loop whose body is  a[i] := exp(b[i]) ,
+           a[i] := tanh(b[i])  or the sigmoid shape  a[i] := 1/(1+exp(-b[i]))  over
+           simple non-aliased dynamic arrays of single is recognized by the
+           OoVECTORIZE recognizer and lowered -- instead of a per-element opaque
+           libm/RTL scalar call the loop vectorizer cannot widen across -- to an
+           inlined 128-bit SSE/AVX minimax polynomial (a Cephes-style vectorized
+           expf: range-reduce n=round(x*log2e), a degree-5 polynomial on the
+           remainder, scale by 2^n via integer exponent-field insertion; tanh and
+           sigmoid are derived from that expf), so a whole register lane computes
+           at once.  This is an APPROXIMATE math transform -- the packed result is
+           NOT bit-identical to the scalar libm call (worst-case ~1e-6 abs/rel over
+           the practical range) and out-of-range/NaN inputs are clamped rather than
+           trapped -- so, exactly like -OoFASTMATH, it is a deliberate opt-in and
+           breaks strict-IEEE determinism.  Single precision only; the scalar
+           remainder tail keeps the exact RTL call (documented contract).  Opt-in
+           (-OoAPPROXTRANS); NOT part of the -O4 defaults }
+         cs_opt_approxtrans,
+         { loop interchange (-OoLOOPINTERCHANGE): reorder a perfect 2-deep counted
+           for-nest so the innermost loop strides the row-contiguous dimension,
+           improving spatial locality and exposing the inner loop to the
+           vectorizer.  The named gcc/LLVM -floop-interchange transform ported to
+           FPC's tree-node optimizer.  Fires only when the interchanged order is
+           strictly more cache-contiguous than the current one (a cost model on the
+           affine array-subscript coefficients).  Two sound body shapes: (a) an
+           element-wise map  W[idx]:=f(R0[idx],R1[idx],..)  where the write array is
+           distinct from every read array and the SAME index expression indexes the
+           write and all reads (so repeated writes to a colliding cell are
+           idempotent -- interchange is bit-exact regardless of the index map's
+           injectivity), and (b) a scalar sum-reduction  s:=s+T  whose addend T only
+           READS arrays (reordering a pure read-and-accumulate is legal for an
+           associative+commutative reduction -- exact for integer s, and for
+           floating-point s ONLY under -OoFASTMATH which permits the reassociation).
+           Rectangular nest only (inner bounds independent of the outer counter),
+           both counters dead outside the nest, unit ascending step, no range/
+           overflow checking.  Part of the -O4 default optimizer set (promoted
+           after the forced-suite/self-host/torture/pf-bench evaluation) }
+         cs_opt_loopinterchange,
+         { loop tiling / cache blocking (-OoLOOPTILE): block a perfect three-deep
+           counted for-nest of the matmul/conv reduction shape
+             for i: for j: for k: C[wi] := C[wi] + T
+           (wi affine in i,j only; T only READS arrays other than C, e.g.
+           a[i*K+k]*b[k*N+j]) into cache-sized tiles over the two output loops i
+           and j, with the point loops emitted in i/k/j order (the original j and k
+           interchanged) so the innermost loop strides the contiguous dimension and
+           a reused operand panel stays cache-resident across the inner iterations
+           instead of being re-streamed.  The named gcc -floop-block / polyhedral
+           tiling transform ported to FPC's tree optimizer, COMPOSING tiling with
+           loop interchange.  Sound because the write index is invariant of the
+           reduction counter k and the j<->k interchange leaves each output cell
+           touched once per k in increasing-k order (per-cell reduction order is
+           preserved -- bit-identical per output cell); only the (i,j) cell VISIT
+           order is blocked, which is bit-exact for distinct cells (injective wi --
+           the matmul norm) and, for the colliding non-injective case, exact for an
+           integer accumulator and permitted for a float accumulator only under
+           -OoFASTMATH.  A reuse cost
+           model fires the transform only when an operand is invariant of i AND one
+           of j (real reuse across both tiled loops).  Rectangular nest, all
+           counters dead outside, unit ascending step, no range/overflow checking.
+           Part of the -O4 default optimizer set (promoted after the forced-suite/
+           self-host/torture/pf-bench evaluation, jointly with -OoLOOPINTERCHANGE
+           which it composes with) }
+         cs_opt_looptile,
+         { interprocedural dead-parameter elimination (-OoDEADPARA): part (a) of
+           the gcc -fipa-sra port. For a routine whose body provably never READS a
+           given by-value scalar parameter (a bottom-up per-formal reference mask
+           computed at the callee's codegen and serialized cross-unit via the
+           optsum_deadpara PPU tag), a later-compiled CALLER at a resolved DIRECT
+           call site stops EVALUATING that argument's side-effect-free, non-trapping
+           actual and passes a cheap constant instead -- the expensive dead
+           computation disappears without any signature change (Design 2:
+           caller-side argument-evaluation elision, sound cross-unit and even for
+           virtual/exported/address-taken callees since the callee is untouched;
+           opaque procvar/indirect/aggregate-return call sites are never rewritten).
+           Never elides var/out/const-by-ref, managed, hidden (self/parentfp/high/
+           result) or non-ordinal parameters, and never an actual that may trap or
+           have side effects (a call, a div, a deref, an overflow/range-checked or
+           float op). The record-splitting half (part (b)) and the WPO-wide variant
+           remain open. Part of the -O4 default optimizer set (promoted after the
+           forced-suite/self-host/torture/pf-bench evaluation) }
+         cs_opt_dead_para,
+         { INT8 quantized dot-product idiom recognition (-OoINT8DOT): recognize the
+           integer multiply-accumulate reduction  acc := acc + a[i]*b[i]  where a
+           and b are simple non-aliased dynamic arrays of shortint (signed 8-bit)
+           and acc is a simple non-aliased 32-bit signed/unsigned integer local,
+           and lower it to an integer-SIMD widening MAC: the 8-bit operand windows
+           are SIGN-EXTENDED to 16-bit (SSE2 punpcklbw+psraw on baseline, pmovsxbw
+           under SSE4.1/AVX, vpmovsxbw ymm under AVX2) and reduced with the exact
+           vpmaddwd (16x16->32 vertical multiply + adjacent-pair 32-bit add) +
+           vpaddd register-resident accumulator sequence, horizontally summed after
+           the loop.  The multiply is EXACT (|a|,|b|<=128 so each product fits in
+           16 bits and each vpmaddwd adjacent-pair sum in 32 bits) and integer
+           addition is associative/commutative modulo 2^32, so the partial-sum
+           reassociation is bit-identical to the wrapping scalar reference for ALL
+           inputs including the saturation-triggering extremes (-128*-128 repeated)
+           -- unlike a vpmaddubsw route whose 16-bit saturating adds are not exact
+           for the general signed case.  Requires the exact-32-bit accumulator width
+           (a 64-bit accumulator would not wrap at 32 bits per lane) and refuses
+           under -Co/-Cr (a checked reduction is left scalar).  128-bit xmm baseline
+           (VF=8); 256-bit ymm (VF=16) under -OoVECT256 on an AVX2 fputype; scalar
+           remainder tail.  Part of the -O4 default optimizer set (promoted after
+           the forced-suite/self-host/torture/pf-bench evaluation; the widening
+           MAC is bit-identical to the wrapping scalar reference for all inputs).
+           128-bit xmm at plain -O4; 256-bit ymm still gated behind opt-in
+           -OoVECT256.  AVX-512 VNNI (vpdpbusd) and the neural-api int8-storage
+           adaptation remain open }
+         cs_opt_int8dot,
+         { Gather vectorization for indexed (non-unit-stride) loads (-OoGATHER):
+           recognize an otherwise-vectorizable single-precision sum reduction whose
+           element is read through a computed int32 index array --
+           s := s + a[idx[i]]  with a : array of single and idx : array of longint
+           (signed 32-bit) -- and widen the indexed load with the AVX2 gather
+           instruction vgatherdps (float32) instead of falling back to scalar
+           loads.  The VF consecutive indices idx[i..i+VF-1] are loaded contiguously
+           (vmovdqu), an all-ones mask is re-materialized each iteration (the gather
+           clobbers its mask), and vgatherdps reads a[idx[i..i+VF-1]] lane-by-lane
+           into a packed register that is added into the register-resident partial
+           sum -- exactly the same addresses the scalar loop would touch (full mask,
+           no speculative extra reads; scalar remainder tail).  Opt-in, NOT in the
+           -O4 defaults for this first landing.  Requires an AVX2 fputype (there is
+           no SSE gather; the loop stays scalar without AVX2); 128-bit xmm VF=4
+           baseline, 256-bit ymm VF=8 under -OoVECT256.  Shares the float reduction's
+           fast-math gate (the packed partial-sum reorders the adds identically to
+           -OoREASSOC).  Refused under -Co/-Cr (a checked indexed load would raise on
+           an out-of-range idx that the unchecked gather silently reads).  AVX-512
+           scatter (vscatterdps) and the neural-api im2col/conv adaptation remain
+           open }
+         cs_opt_gather,
+         { -fstack-protector-strong-style stack canaries (-OoSTACKGUARD): on entry
+           to a routine whose frame contains a local array/record aggregate, an
+           address-taken local, or an inline-asm block (gcc's -strong selection
+           heuristic; pure scalar leaves are skipped so the cost stays near zero),
+           store a secret guard word into a dedicated 8-byte slot reserved at the
+           very top of the local frame -- between the locals and the saved
+           RBP/return address, so a linear overflow of a local buffer hits it
+           first -- and, before every normal return, reload the slot and compare
+           it against the guard; on mismatch call the RTL handler
+           FPC_STACK_CHK_FAIL (prints "stack smashing detected" and aborts with a
+           nonzero exit code).  The guard is NOT the glibc %fs:0x28 TLS canary:
+           the default linux-x86_64 RTL is libc-free (static, no glibc TLS), so
+           the guard lives in an RTL-owned global FPC_STACK_CHK_GUARD seeded once
+           at startup from the getrandom syscall (with a TSC/stack-address mix
+           fallback).  Instrumented routines keep a real RBP frame (the frame
+           pointer is not omitted) so the canary slot has a stable location on
+           every exit path; raise/unwind exits never return through the smashed
+           frame so they safely bypass the check.  Opt-in, NOT in any -O level.
+           x86-64 only. }
+         cs_opt_stackguard,
+         { interprocedural scalar replacement of aggregates (-OoIPASRA): part (b)
+           of the gcc -fipa-sra port (see optipasra.pas). Splits a `const`/
+           `constref` record parameter whose fields are only READ in the callee
+           into individual by-value scalar parameters, so the callee stops
+           dereferencing through the aggregate reference and the fields land in
+           registers. A single-pass fork cannot rewrite an already-compiled
+           callee's signature, so -- like -OoIPACP -- it CLONES: an eligible
+           routine's pre-firstpass body is stashed, and a later caller passing a
+           side-effect-free record actual for every splittable parameter gets a
+           fresh out-of-line clone whose signature has the record param replaced
+           by N scalar params (one per read field) and whose body reads those
+           params directly; the call is rebuilt to pass `rec.f1 .. rec.fN`. Only
+           const/constref record params every use of which is a direct read of a
+           splittable (ordinal/enum/float/pointer-sized, non-managed) field, at
+           most 4 fields, non-bitpacked record; virtual/exported/external/inline/
+           nested/address-taken callees are never touched (the original routine
+           is untouched -- cloning is additive). Same-unit only for this landing;
+           cross-unit reach and the WPO program-wide variant remain open. Opt-in;
+           NOT part of the -O4 defaults -- a wrong clone is a miscompile }
+         cs_opt_ipasra
        );
        toptimizerswitches = set of toptimizerswitch;
 
@@ -858,7 +1130,10 @@ interface
          'PREDCOM','SRA','STOREMERGE','CASECLUSTER','CROSSJUMP','BLOCKORDER',
          'SINK','STOREMOTION','VRP','REFELIDE','SWITCHTABLE','REE',
          'SHRINKWRAP','GVNPRE','PURE','PARTIALINLINE','STACKALLOC','SLP',
-         'UNROLLDYN','PREFETCH','ICF','IPARA','FINALVALUE','SIBCALL'
+         'UNROLLDYN','PREFETCH','ICF','IPARA','FINALVALUE','SIBCALL',
+         'REPORT','DEVIRT','IPACP','VECT256','CONSTEVAL','MODREF',
+         'APPROXTRANS','LOOPINTERCHANGE','LOOPTILE','DEADPARA','INT8DOT','GATHER',
+         'STACKGUARD','IPASRA'
        );
        WPOptimizerSwitchStr : array [twpoptimizerswitch] of string[14] = (
          'DEVIRTCALLS','OPTVMTS','SYMBOLLIVENESS'
@@ -893,7 +1168,7 @@ interface
        genericlevel3optimizerswitches = [cs_opt_level3,cs_opt_constant_propagate,cs_opt_nodedfa,cs_opt_loopstrength
                                          {$ifndef llvm},cs_opt_use_load_modify_store{$endif},
                                          cs_opt_loopunroll,cs_opt_forloop];
-       genericlevel4optimizerswitches = [cs_opt_level4,cs_opt_reorder_fields,cs_opt_dead_values,cs_opt_fastmath,cs_opt_loopmotion,cs_opt_loopunswitch,cs_opt_bitidiom,cs_opt_rangecheckelim,cs_opt_jumpthread,cs_opt_loopdistpat,cs_opt_looppeel,cs_opt_loopsplit,cs_opt_loopfuse,cs_opt_ifconvert,cs_opt_reassoc,cs_opt_unrolljam,cs_opt_predcom,cs_opt_sra,cs_opt_storemerge,cs_opt_casecluster,cs_opt_crossjump,cs_opt_blockorder,cs_opt_sink,cs_opt_storemotion,cs_opt_vrp,cs_opt_switchtable,cs_opt_ree];
+       genericlevel4optimizerswitches = [cs_opt_level4,cs_opt_reorder_fields,cs_opt_dead_values,cs_opt_fastmath,cs_opt_loopmotion,cs_opt_loopunswitch,cs_opt_bitidiom,cs_opt_rangecheckelim,cs_opt_jumpthread,cs_opt_loopdistpat,cs_opt_looppeel,cs_opt_loopsplit,cs_opt_loopfuse,cs_opt_ifconvert,cs_opt_reassoc,cs_opt_unrolljam,cs_opt_predcom,cs_opt_sra,cs_opt_storemerge,cs_opt_casecluster,cs_opt_crossjump,cs_opt_blockorder,cs_opt_sink,cs_opt_storemotion,cs_opt_vrp,cs_opt_switchtable,cs_opt_ree,cs_opt_vectorize,cs_opt_devirt,cs_opt_dead_para,cs_opt_int8dot,cs_opt_loopinterchange,cs_opt_looptile,cs_opt_modref,cs_opt_pure,cs_opt_ipara,cs_opt_sibcall,cs_opt_gvnpre,cs_opt_shrinkwrap,cs_opt_finalvalue];
 
        { whole program optimizations whose information generation requires
          information from all loaded units
@@ -1283,7 +1558,11 @@ interface
          { set if no frame pointer is needed, the rules when this applies is target specific }
          pi_no_framepointer_needed,
          { procedure has been normalized so no expressions contain block nodes }
-         pi_normalized
+         pi_normalized,
+         { procedure is instrumented with a -OoSTACKGUARD stack canary; its frame
+           pointer is kept and an 8-byte guard slot is reserved at the top of the
+           local area (transient codegen flag, never serialized) }
+         pi_stackguard
        );
        tprocinfoflags=set of tprocinfoflag;
 

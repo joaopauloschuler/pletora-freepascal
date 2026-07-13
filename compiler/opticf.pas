@@ -113,7 +113,7 @@ interface
 implementation
 
     uses
-      cutils,
+      cutils,globals,verbose,
       cpubase,aasmbase,aasmtai,aasmcpu,cgbase,cgutils,
       symconst,symbase,symtype,symdef;
 
@@ -462,6 +462,21 @@ implementation
         st : tsymtabletype;
       begin
         alias_safe:=false;
+        { The zero-byte fold RELOCATES DUP's entry symbol out of DUP's own
+          per-function section (.text.n_<dup>) into REP's section (.text.n_<rep>).
+          Under section-per-function (the default here) DUP and REP always live in
+          distinct sections, so with debug info this strands DUP's end/line labels:
+          the per-proc DWARF address range and .debug_aranges entry for DUP were
+          already emitted (during DUP's own compilation, before ICF) with low_pc =
+          DUP's symbol and length = <DUP-end-label> - <DUP-symbol>.  After the move
+          those two operands straddle two sections and the internal assembler raises
+          IE 200404124 on the aranges length const (fantastica/fpc-torture seeds
+          3 & 11).  The thunk fold keeps DUP's symbol, end-label and section header
+          together, so its debug range stays intra-section and valid -- fall back to
+          it whenever per-proc debug ranges are generated. }
+        if (cs_debuginfo in current_settings.moduleswitches) or
+           (cs_use_lineinfo in current_settings.globalswitches) then
+          exit;
         { a multi-entry routine (extra aliasnames) would strand its other entry
           symbols if we moved only the primary one to the survivor }
         if not dup.single_entry then
@@ -531,6 +546,30 @@ implementation
         if assigned(e) then
           extern_survivor:=e.name;
       end;
+
+    { -OoREPORT: one measure-only remark per fold, at the folded routine's own
+      source position when its procdef is known }
+    procedure icf_report_fold(dup : ticfroutine; const targetname : TSymStr);
+      var
+        pos : tfileposinfo;
+        dupname : TSymStr;
+      begin
+        if not(cs_opt_report in current_settings.optimizerswitches) then
+          exit;
+        if assigned(dup.pd) then
+          begin
+            pos:=dup.pd.fileinfo;
+            dupname:=dup.pd.procsym.realname;
+          end
+        else
+          begin
+            pos:=current_filepos;
+            dupname:=dup.startsym.sym.name;
+          end;
+        MessagePos2(pos,cg_o_opt_remark,'icf',
+          'byte-identical routine '+dupname+' folded onto '+targetname);
+      end;
+
 
     function OptimizeICF(alist : TAsmList) : longint;
       var
@@ -628,6 +667,10 @@ implementation
                     fold_to_thunk(alist,rt,rep.startsym.sym.name);
                   rt.folded:=true;
                   rep.has_local_dup:=true;
+                  if assigned(rep.pd) then
+                    icf_report_fold(rt,rep.pd.procsym.realname)
+                  else
+                    icf_report_fold(rt,rep.startsym.sym.name);
                   inc(OptimizeICF);
                 end;
             end;
@@ -649,6 +692,7 @@ implementation
                   begin
                     fold_to_thunk(alist,rt,extname);
                     rt.folded:=true;
+                    icf_report_fold(rt,extname);
                     inc(OptimizeICF);
                   end;
               end;

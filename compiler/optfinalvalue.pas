@@ -111,11 +111,12 @@ interface
 implementation
 
     uses
-      globtype,globals,constexp,
+      globtype,globals,constexp,cutils,
       symconst,symtype,symsym,symdef,
       defutil,
       nutils,nbas,nflw,nld,nadd,ncon,ncnv,ninl,ncal,
       compinnr,
+      optutils,
       pass_1;
 
 
@@ -561,6 +562,7 @@ implementation
               fault-preserving guard cannot stand in here). }
             if cr then
               exit;
+            OptRemark(fn.fileinfo,'finalvalue','empty dead counted loop deleted');
             n:=cnothingnode.create;
             fn.free;
             do_firstpass(n);
@@ -668,6 +670,7 @@ implementation
                  caddnode.create_internal(lten,loexpr.getcopy,hiexpr.getcopy),
                  blk,nil);
 
+        OptRemark(fn.fileinfo,'finalvalue','loop replaced by closed form of '+tostr(cnt)+' accumulator(s)');
         n:=guard;
         fn.free;
         do_firstpass(n);

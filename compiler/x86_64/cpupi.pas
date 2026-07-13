@@ -85,6 +85,19 @@ implementation
           end
         else
           tg.setfirsttemp(tg.direction*maxpushedparasize);
+
+        { -OoSTACKGUARD: with a real framepointer (direction<0) carve the dedicated
+          8-byte canary slot at the very top of the local frame (closest to the
+          saved RBP/return address) here, before any local or temp is allocated, so
+          every array/temp lands below it and a linear overflow reaches the canary
+          first.  For a frame-pointer-omitted RSP frame (direction>0) the top of
+          the frame is only known once all temps are laid out, so the slot is
+          reserved in calc_stackframe_size instead. }
+        if (pi_stackguard in flags) and (tg.direction<0) then
+          begin
+            stackguard_offset:=tg.firsttemp-8;
+            tg.setfirsttemp(tg.firsttemp-8);
+          end;
       end;
 
 
@@ -108,6 +121,16 @@ implementation
           result:=Align(tg.lasttemp,8)
         else
           result:=Align(tg.direction*tg.lasttemp+maxpushedparasize,8);
+
+        { -OoSTACKGUARD, frame-pointer-omitted (RSP, direction>0) case: reserve the
+          8-byte canary slot at the top of the frame (highest offset, just below
+          the saved callee-saved registers / return address).  The framepointer-
+          relative store/check reads current_procinfo.stackguard_offset. }
+        if (pi_stackguard in flags) and (tg.direction>0) then
+          begin
+            stackguard_offset:=result;
+            result:=result+8;
+          end;
       end;
 
     procedure tcpuprocinfo.add_finally_scope(startlabel,endlabel,handler:TAsmSymbol;implicit:Boolean);

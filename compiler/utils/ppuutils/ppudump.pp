@@ -1726,7 +1726,9 @@ const
          (mask:pi_no_framepointer_needed;
          str:' set if no frame pointer is needed, the rules when this applies is target specific'),
          (mask:pi_normalized;
-         str:'  has been normalized so no expressions contain block nodes ')
+         str:'  has been normalized so no expressions contain block nodes '),
+         (mask:pi_stackguard;
+         str:'  is instrumented with a -OoSTACKGUARD stack canary ')
   );
 var
   procinfooptions : tprocinfoflags;
@@ -2607,7 +2609,21 @@ const
          'cs_opt_icf',
          'cs_opt_ipara',
          'cs_opt_finalvalue',
-         'cs_opt_sibcall'
+         'cs_opt_sibcall',
+         'cs_opt_report',
+         'cs_opt_devirt',
+         'cs_opt_ipacp',
+         'cs_opt_vect256',
+         'cs_opt_consteval',
+         'cs_opt_modref',
+         'cs_opt_approxtrans',
+         'cs_opt_loopinterchange',
+         'cs_opt_looptile',
+         'cs_opt_dead_para',
+         'cs_opt_int8dot',
+         'cs_opt_gather',
+         'cs_opt_stackguard',
+         'cs_opt_ipasra'
        );
     var
          globalswitch  : tglobalswitch;
@@ -4625,7 +4641,22 @@ begin
                  optsum_pure:
                    begin
                      b:=ppufile.getbyte;
-                     writeln([space,' Optimizer summary : PURE  is_pure=',ord((b and 1)<>0),' is_const=',ord((b and 2)<>0)]);
+                     writeln([space,' Optimizer summary : PURE  is_pure=',ord((b and 1)<>0),' is_const=',ord((b and 2)<>0),' is_nothrow=',ord((b and 4)<>0),' is_mempure=',ord((b and 8)<>0)]);
+                   end;
+                 optsum_modref:
+                   begin
+                     b:=ppufile.getbyte;
+                     write([space,' Optimizer summary : MODREF  reads=',b and 3,' writes=',(b shr 2) and 3,' can_trap=',ord((b and 16)<>0),' pmask_exact=',ord((b and 32)<>0),' smask_exact=',ord((b and 64)<>0)]);
+                     write(['  reads_pmask=$',hexstr(ppufile.getdword,8),' writes_pmask=$',hexstr(ppufile.getdword,8),' (0=none 1=byref-params 2=unknown-global; pmask bit N=paras[N])']);
+                     j:=ppufile.getbyte;
+                     write(['  reads_statics[',j,']:']);
+                     for l:=1 to j do
+                       write([' ',ppufile.getansistring]);
+                     j:=ppufile.getbyte;
+                     write(['  writes_statics[',j,']:']);
+                     for l:=1 to j do
+                       write([' ',ppufile.getansistring]);
+                     writeln('');
                    end;
                  optsum_ipara:
                    begin
@@ -4641,6 +4672,8 @@ begin
                        end;
                      writeln;
                    end;
+                 optsum_deadpara:
+                   writeln([space,' Optimizer summary : DEADPARA  ref_mask=$',hexstr(ppufile.getdword,8),' (bit N set = paras[N] referenced; clear = provably never read)']);
                  else
                    begin
                      writeln([space,' Optimizer summary : unknown tag ',optsumtag,' (',optsumlen,' bytes)']);

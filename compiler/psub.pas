@@ -132,6 +132,24 @@ interface
     { parses only the body of a non nested routine; needs a correctly setup pd }
     procedure read_proc_body(pd:tprocdef);
 
+    { -OoIPACP: scan the already-parsed main program body (MAINPI, potype_proginit)
+      for call sites that pass compile-time constants to eligible parameters of
+      stashed routines, retarget them to specialized clones, and compile those
+      clones.  Must be called after MAINPI.parse_body and before its
+      generate_code_tree, with the module static symtable on the symtablestack. }
+    procedure ipacp_process_main_body(mainpi:tcgprocinfo);
+
+    { -OoIPASRA: scan the already-parsed main program body for call sites that
+      pass a side-effect-free record actual to every splittable parameter of a
+      stashed routine, rebuild them to split-parameter clones, and compile those
+      clones.  Same timing contract as ipacp_process_main_body. }
+    procedure ipasra_process_main_body(mainpi:tcgprocinfo);
+
+    { -OoCONSTEVAL: fold const-routine calls with all-constant arguments in the
+      main program body into literals.  Must be called after MAINPI.parse_body
+      and before its generate_code_tree. }
+    procedure consteval_process_main_body(mainpi:tcgprocinfo);
+
     procedure import_external_proc(pd:tprocdef);
 
 
@@ -173,8 +191,14 @@ implementation
        optcse,
        optloop,
        optfinalvalue,
+       optdevirt,
        optpure,
+       optmodref,
+       optdeadpara,
        optpartialinline,
+       optipacp,
+       optipasra,
+       optconsteval,
        optipara,
        opticf,
        optsra,
@@ -191,18 +215,120 @@ implementation
        {$endif}
        ;
 
+    { FPC Unleashed helpers: decide whether the asm STATEMENT blocks in an
+      inline routine's body can be spliced into a caller.  Operands referencing
+      a local variable, parameter or the function result show up as top_local
+      operands (resolved through tabstractnormalvarsym.localloc at codegen) or,
+      for the TP-style INLINE() form, as ait_const entries whose symbol is still
+      an unresolved AB_NONE local placeholder.
+
+      Registers/immediates/GLOBAL symbols survive verbatim relocation into
+      another frame.  A top_local operand is ALSO handleable (Task B) when it
+      references a value parameter, a plain local or the ordinal/pointer function
+      result: optcall.expand_inline_asm_operands materialises each such callee
+      sym as a REAL localvarsym in the caller frame, prepends the argument init
+      and rebinds the operand.  We stay conservative and still refuse the cases
+      that path cannot serve soundly: by-reference/var/out/const-ref parameters
+      and managed or aggregate (non-ordinal, non-pointer) operands, and the
+      TP-style INLINE() AB_NONE placeholders. }
+
+    { true when a top_local asm operand referencing callee sym `p` can be
+      materialised in the caller frame by expand_inline_asm_operands }
+    function inline_asm_local_operand_ok(p: pointer): boolean;
+      var
+        vs : tabstractnormalvarsym;
+      begin
+        result:=false;
+        if not assigned(p) then
+          exit;
+        vs:=tabstractnormalvarsym(p);
+        if not(vs.typ in [paravarsym,localvarsym]) then
+          exit;
+        if not assigned(vs.vardef) then
+          exit;
+        { managed types need refcount/init-final traffic the asm splice omits,
+          whatever way they are passed -- refused (document-only case (c)) }
+        if is_managed_type(vs.vardef) then
+          exit;
+        if (vs.typ=paravarsym) and
+           (tparavarsym(vs).varspez in [vs_var,vs_out,vs_constref]) then
+          { by-reference parameter: the operand resolves to the hidden pointer
+            SLOT, so expand_inline_asm_operands backs it with a caller pointer
+            local initialised to @actual. Only the address is relocated, which
+            is sound for any (non-managed) referenced type -- ordinal, pointer
+            or aggregate -- because the asm accesses it exactly as out-of-line. }
+          result:=true
+        else
+          { by-value parameter / plain local / ordinal-or-pointer result: the
+            value is copied into a caller local, so keep it a simple scalar (a
+            by-value aggregate is not covered by the plain value copy). }
+          result:=is_ordinal(vs.vardef) or is_pointer(vs.vardef);
+      end;
+
+    { returns '' when the block is inline-safe, otherwise the reason it is not }
+    function inline_asm_block_reason(p_asm: TAsmList): string;
+      var
+        hp : tai;
+        i  : longint;
+      begin
+        result:='';
+        if not assigned(p_asm) then
+          exit;
+        hp:=tai(p_asm.first);
+        while assigned(hp) do
+          begin
+            case hp.typ of
+              ait_instruction :
+                for i:=0 to tai_cpu_abstract(hp).ops-1 do
+                  if (tai_cpu_abstract(hp).oper[i]^.typ=top_local) and
+                     not inline_asm_local_operand_ok(tai_cpu_abstract(hp).oper[i]^.localoper^.localsym) then
+                    exit('assembler block referencing a managed operand or a by-value aggregate parameter/local');
+              ait_const :
+                if assigned(tai_const(hp).sym) and
+                   (tai_const(hp).sym.bind=AB_NONE) then
+                  exit('assembler block referencing a TP-style INLINE() local placeholder');
+              { AB_LOCAL asm labels are made unique per inline site by
+                optcall.unique_inline_asm_labels, so they no longer block inlining }
+              else
+                ;
+            end;
+            hp:=tai(hp.next);
+          end;
+      end;
+
+    function inline_asm_uses_local(var n: tnode; arg: pointer): foreachnoderesult;
+      var
+        reason : string;
+      begin
+        result:=fen_false;
+        if (n.nodetype=asmn) and
+           not(asmnf_get_asm_position in tasmnode(n).asmnodeflags) then
+          begin
+            reason:=inline_asm_block_reason(tasmnode(n).p_asm);
+            if reason<>'' then
+              begin
+                pshortstring(arg)^:=reason;
+                result:=fen_norecurse_true;
+              end;
+          end;
+      end;
+
+
     function checknodeinlining(procdef: tprocdef): boolean;
 
       procedure _no_inline(const reason: TMsgStr);
         begin
           include(procdef.implprocoptions,pio_inline_not_possible);
+          { stash the reason so the call-site cg_n_no_inline note can report it
+            (for same-unit callers); see tprocdef.inlinenoreason }
+          procdef.inlinenoreason:=reason;
           Message1(parser_n_not_supported_for_inline,reason);
           Message(parser_h_inlining_disabled);
         end;
 
       var
         i : integer;
-        currpara : tparavarsym;
+        asmreason : shortstring;
       begin
         result := false;
         { this code will never be used (only specialisations can be inlined),
@@ -210,10 +336,40 @@ implementation
           ppu file }
         if df_generic in current_procinfo.procdef.defoptions then
           exit;
-        if pi_has_assembler_block in current_procinfo.flags then
+        { A pure `assembler;` routine gets its parameters, result and (for
+          get_pc_addr-style helpers) return address through the ABI calling
+          convention -- the asm body reads bare ABI registers / the return slot,
+          none of which exist once the routine is spliced without a call. Such
+          routines must NEVER be node-inlined, so keep the historical refusal. }
+        if pi_is_assembler in current_procinfo.flags then
           begin
-            _no_inline('assembler');
-            exit;
+            if pi_has_assembler_block in current_procinfo.flags then
+              begin
+                _no_inline('assembler');
+                exit;
+              end;
+          end
+        else if pi_has_assembler_block in current_procinfo.flags then
+          begin
+            { FPC Unleashed: inner `asm ... end` STATEMENT blocks used to block
+              inlining unconditionally. We now allow inlining as long as no asm
+              operand references a local variable, parameter or the function
+              result (top_local operands / TP-style INLINE ait_const refs):
+              such a block only touches registers, immediates and global symbols,
+              so it can be spliced verbatim into the caller (labels are made
+              unique at the inline site via asmnf_inline_copy). Operands that
+              reference locals/params would need those locals to be materialised
+              in the caller's frame before tcgasmnode.ResolveRef can bind them,
+              which is not yet implemented -- refuse those with a precise reason. }
+            asmreason:='';
+            if assigned(tcgprocinfo(current_procinfo).code) then
+              foreachnodestatic(tcgprocinfo(current_procinfo).code,
+                @inline_asm_uses_local,@asmreason);
+            if asmreason<>'' then
+              begin
+                _no_inline(asmreason);
+                exit;
+              end;
           end;
         if (pi_has_global_goto in current_procinfo.flags) or
            (pi_has_interproclabel in current_procinfo.flags) then
@@ -221,9 +377,20 @@ implementation
             _no_inline('global goto');
             exit;
           end;
+        { NB: an ORDINARY `exit`/`exit(value)` inside a nested construct (loop,
+          if, case, even try/finally) is NOT gated here -- the inliner already
+          handles it: the spliced body carries nf_block_with_exit (psub.pas
+          CreateInlineInfo), so every exit inside it is lowered to a jump to the
+          per-inline-site exit label rather than the caller's real exit, and
+          exit(value) first assigns the funcret temp (texitnode.pass_typecheck).
+          pi_has_nested_exit is set ONLY by the MacPas non-local
+          `Exit(EnclosingRoutine)` (pexpr.pas), which longjmp/label-jumps out to
+          a SPECIFIC enclosing procedure's frame and is inherently nested-scope;
+          splicing it into an arbitrary caller would jump into a frame that does
+          not exist there, so it stays refused (soundness). }
         if pi_has_nested_exit in current_procinfo.flags then
           begin
-            _no_inline('nested exit');
+            _no_inline('non-local Exit of an enclosing routine');
             exit;
           end;
         if pi_calls_c_varargs in current_procinfo.flags then
@@ -231,27 +398,47 @@ implementation
             _no_inline('called C-style varargs functions');
             exit;
           end;
-        { the compiler cannot handle inherited in inlined subroutines because
-          it tries to search for self in the symtable, however, the symtable
-          is not available }
+        { FPC Unleashed: an `inherited` call in the body used to block inlining
+          unconditionally (the historical worry was that self would be searched
+          in an unavailable symtable). For a CLASS method self is a plain
+          instance pointer passed as an ordinary hidden value parameter, so the
+          node inliner's replaceparaload rebinds the inherited call's self load
+          to the call site's self actual exactly like any other parameter, and
+          the inherited target is statically (non-virtually) dispatched -- such
+          bodies splice and run correctly. Old-style `object` methods (value
+          self passed by reference) and other self shapes still miscompile the
+          spliced inherited self, so they keep the refusal. Cross-unit inherited
+          is additionally refused at the call site (ncal.check_inlining) because
+          the ppu-reconstructed self does not line up with the caller's paras. }
         if pi_has_inherited in current_procinfo.flags then
           begin
-            _no_inline('inherited');
-            exit;
+            if not (assigned(procdef.struct) and is_class(procdef.struct)) then
+              begin
+                _no_inline('inherited');
+                exit;
+              end;
           end;
+        { pio_nested_access is set on THIS procdef whenever a nested routine
+          reads its frame -- a parent local or parameter, a non-local exit/goto
+          target, or its address taken as a nested procvar (tprocinfo.
+          set_needs_parentfp).  Such a routine cannot be node-inlined: the nested
+          routine is compiled exactly once against this frame's fixed offsets,
+          and inlining relocates the captured locals into arbitrary caller frames
+          the already-emitted nested routine cannot follow.  Refuse it. }
         if pio_nested_access in procdef.implprocoptions then
          begin
            _no_inline('access to local from nested scope');
            exit;
          end;
-        { We can't support inlining for procedures that have nested
-          procedures because the nested procedures use a fixed offset
-          for accessing locals in the parent procedure (PFV) }
-        if current_procinfo.has_nestedprocs then
-          begin
-            _no_inline('nested procedures');
-            exit;
-          end;
+        { FPC Unleashed: a routine merely CONTAINING nested procedures used to be
+          refused too.  But when pio_nested_access is NOT set (checked above),
+          none of those nested routines reads this routine's frame -- they are
+          independent functions that only happen to be lexically nested.  This
+          routine's frame is then dead, so node-inlining it (its locals become
+          caller temps that no nested routine reads) is sound: the nested
+          routines stay emitted with the out-of-line copy and the spliced body's
+          calls to them pass a dummy/unused parentfp (ncal handles the unused
+          parentfp).  So has_nestedprocs alone no longer blocks inlining. }
 
         if pi_uses_get_frame in current_procinfo.flags then
           begin
@@ -262,31 +449,38 @@ implementation
             exit;
           end;
 
+        { FPC Unleashed: open-array / array-of-const value parameters used to
+          block inlining because an open array is 0-based inside the callee while
+          the actual may be a differently-based array (e.g. array[1..N]): a naive
+          splice would re-typecheck a[i] as a fixed-array index and subtract the
+          actual's low bound from the callee's 0-based i.  tcallnode.replaceparaload
+          now re-applies the call-boundary conversion (wraps a non-zero-based
+          static-array actual in a typeconv to the open-array parameter type) so
+          the spliced accesses keep the callee's 0-based view; a dynamic-array
+          actual has the dynarray->openarray boundary rebuilt in the splice
+          (ncal.replaceparaload).  `array of const` actuals are always `[...]`
+          constructors (0-based), so those inline unconditionally.
+
+          `array of variant` keeps a refusal: it is NOT covered by the
+          open-array re-basing path (is_open_array is false for it) and can take
+          a differently-based static actual.
+
+          A BY-VALUE (vs_value) open array / array of const needs a private copy
+          of the array inside the callee.  The generic inline copy-temp machinery
+          cannot size such a temp (an open array has no compile-time size --
+          tarraydef.size internalerrors 99080501), so the copy is instead built
+          target-neutrally at the call boundary by copy_value_by_ref_para
+          (forinline=true, in ncal.firstcallparan): a runtime-sized heap block,
+          element-wise MOVE, with managed elements ref-counted and finalized so
+          copy-on-write and heaptrc stay correct.  These now inline. }
         for i:=0 to procdef.paras.count-1 do
           begin
-            currpara:=tparavarsym(procdef.paras[i]);
-            case currpara.vardef.typ of
-              arraydef :
-                begin
-                  if is_array_of_const(currpara.vardef) or
-                     is_variant_array(currpara.vardef) then
-                    begin
-                      _no_inline('array of const');
-                      exit;
-                    end;
-                  { open arrays might need re-basing of the index, i.e. if you pass
-                    an array[1..10] as open array, you have to add 1 to all index operations
-                    if you directly inline it }
-                  if is_open_array(currpara.vardef) then
-                    begin
-                      _no_inline('open array');
-                      exit;
-                    end;
-                end;
-              else
-                ;
-            end;
-        end;
+            if is_variant_array(tparavarsym(procdef.paras[i]).vardef) then
+              begin
+                _no_inline('array of variant');
+                exit;
+              end;
+          end;
         result:=true;
       end;
 
@@ -1092,9 +1286,71 @@ implementation
       );
 {$endif}
 
+    { -OoSTACKGUARD: gcc -fstack-protector-strong selection heuristic.  Returns
+      true iff the routine's frame holds an object worth protecting against a
+      linear stack smash: a local array/record aggregate, an address-taken local
+      (or by-value parameter copy thereof), or an inline-asm block.  Pure scalar
+      leaves are skipped so the switch costs virtually nothing where it cannot
+      help.  Assembler routines, the program init frame (whose "locals" are static
+      globals, not stack storage) and explicit nostackframe routines are excluded. }
+    function stackguard_wanted(pi:tcgprocinfo):boolean;
+
+      function st_has_vulnerable(st:tsymtable):boolean;
+        var
+          i : longint;
+          sym : tsym;
+          vs : tabstractvarsym;
+          isframeobj : boolean;
+        begin
+          result:=false;
+          if st=nil then
+            exit;
+          for i:=0 to st.SymList.Count-1 do
+            begin
+              sym:=tsym(st.SymList[i]);
+              if not (sym.typ in [localvarsym,paravarsym]) then
+                continue;
+              vs:=tabstractvarsym(sym);
+              if vs.vardef=nil then
+                continue;
+              { true stack-frame storage: locals always, parameters only when
+                passed by value (a by-ref/var/const param is just a pointer) }
+              isframeobj:=(sym.typ=localvarsym) or
+                          ((sym.typ=paravarsym) and (vs.varspez=vs_value));
+              if not isframeobj then
+                continue;
+              if vs.vardef.typ in [arraydef,recorddef] then
+                exit(true);
+              if vs.addr_taken then
+                exit(true);
+            end;
+        end;
+
+      begin
+        result:=false;
+        if not (cs_opt_stackguard in current_settings.optimizerswitches) then
+          exit;
+        if po_assembler in pi.procdef.procoptions then
+          exit;
+        if po_nostackframe in pi.procdef.procoptions then
+          exit;
+        if pi.procdef.proctypeoption=potype_proginit then
+          exit;
+        if pi_has_assembler_block in pi.flags then
+          exit(true);
+        if st_has_vulnerable(pi.procdef.parast) then
+          exit(true);
+        if st_has_vulnerable(pi.procdef.localst) then
+          exit(true);
+      end;
+
+
     procedure tcgprocinfo.setup_tempgen;
       begin
         tg:=tgobjclass.create;
+
+        if stackguard_wanted(self) then
+          include(flags,pi_stackguard);
 
 {$if defined(i386) or defined(x86_64) or defined(arm) or defined(aarch64) or defined(m68k)}
 {$if defined(arm)}
@@ -1234,13 +1490,44 @@ implementation
       end;
 
 
+    { recursively gather the procdef and (parsed) code tree of every nested
+      routine of pi into the parallel lists defs/bodies, for
+      CollectNestedProcDefSyms.  Nested routines are parsed with their parent,
+      so their code trees are available when the parent's DFA runs (the parent's
+      generate_code precedes generate_code_tree's descent into the nest). }
+    procedure collect_nested_bodies(pi : tprocinfo;defs,bodies : tfplist);
+      var
+        hpi : tprocinfo;
+      begin
+        hpi:=pi.get_first_nestedproc;
+        while assigned(hpi) do
+          begin
+            if assigned(tcgprocinfo(hpi).code) and
+               not(df_generic in hpi.procdef.defoptions) then
+              begin
+                defs.Add(hpi.procdef);
+                bodies.Add(tcgprocinfo(hpi).code);
+              end;
+            collect_nested_bodies(hpi,defs,bodies);
+            hpi:=tprocinfo(hpi.next);
+          end;
+      end;
+
+
     procedure tcgprocinfo.TransformNodeTree;
       var
         i : integer;
         UserCode : TNode;
         updated,
         RedoDFA : boolean;
+        loopfillsyms : tfplist;
+        guardsyms : tfplist;
+        nestedsyms : tfplist;
+        nesteddefs,nestedbodies : tfplist;
       begin
+       loopfillsyms:=tfplist.Create;
+       guardsyms:=tfplist.Create;
+       nestedsyms:=tfplist.Create;
        { inlining is a heuristics, so we do this very early }
        do_optinline(code,updated);
 
@@ -1285,6 +1572,25 @@ implementation
          ((flags*[pi_has_assembler_block,pi_is_assembler,pi_uses_exceptions,pi_has_label])=[]) then
          OptimizeFinalValue(code);
 
+       { provable-receiver devirtualization (-OoDEVIRT): rewrite virtual calls
+         whose receiver a conservative constructor-provenance analysis proves
+         monomorphic into direct calls to the concrete override (see optdevirt).
+         Skipped for routines with inline assembler (the receiver's storage may
+         be referenced opaquely) or with labels (goto could enter regions the
+         provenance scan assumed unreachable). Independent of DFA -- it is a
+         structural whole-tree scan. This runs AFTER do_optinline above, so a
+         call rebound here toward an inlineable override (OptimizeDevirt returns
+         true) is fed back through do_optinline once more, letting the inliner
+         expand the now-direct target in this same routine; the freshly inlined
+         body is still seen by the DFA/constprop/loop passes that follow. }
+       if (cs_opt_devirt in current_settings.optimizerswitches) and
+         ((flags*[pi_has_assembler_block,pi_is_assembler,pi_has_label])=[]) then
+         begin
+           if OptimizeDevirt(code) and
+              (cs_do_inline in current_settings.localswitches) then
+             do_optinline(code,updated);
+         end;
+
        if (cs_opt_nodedfa in current_settings.optimizerswitches) and
          { creating dfa is not always possible }
          ((flags*[pi_has_assembler_block,pi_uses_exceptions,pi_is_assembler])=[]) then
@@ -1293,6 +1599,46 @@ implementation
            dfabuilder.createdfainfo(code);
            include(flags,pi_dfaavailable);
            RedoDFA:=false;
+
+           { record local/static arrays that are element-filled and element-read
+             by matched counted for-loops, on the still-structured for-node tree
+             (ConvertForLoops below lowers the for-nodes to while-loops).  Their
+             later DFA "does not seem to be initialized" warning is a false
+             positive; skip it in the warning loop.  Diagnostic only -- liveness
+             and noregvarinitneeded are untouched, so codegen is unaffected. }
+           CollectLoopFillCoveredSyms(code,loopfillsyms);
+
+           { record local/parameter scalars that are read only under a
+             correlated if-guard that provably dominates them (see
+             CollectCorrelatedGuardSyms).  Their later DFA "does not seem to be
+             initialized" warning is a false positive; skip it in the warning
+             loop.  Only done for routines without labels/goto/exceptions
+             (guaranteed linear control flow within a statement list, so no edge
+             can enter the second guard without the first).  Diagnostic only --
+             liveness and noregvarinitneeded are untouched, so codegen is
+             unaffected. }
+           if (flags*[pi_has_assembler_block,pi_is_assembler,pi_uses_exceptions,pi_has_label])=[] then
+             CollectCorrelatedGuardSyms(code,guardsyms);
+
+           { record locals of this routine that are assigned only inside a
+             nested routine which the routine calls before reading them.  The
+             DFA does not model a nested-procedure call as a definition of the
+             captured parent local, so its later "does not seem to be
+             initialized" warning is a false positive; skip it in the warning
+             loop.  Diagnostic only -- liveness and noregvarinitneeded are
+             untouched, so codegen is unaffected. }
+           if has_nestedprocs and assigned(procdef.localst) then
+             begin
+               nesteddefs:=tfplist.Create;
+               nestedbodies:=tfplist.Create;
+               try
+                 collect_nested_bodies(self,nesteddefs,nestedbodies);
+                 CollectNestedProcDefSyms(code,procdef.localst,nesteddefs,nestedbodies,nestedsyms);
+               finally
+                 nesteddefs.Free;
+                 nestedbodies.Free;
+               end;
+             end;
 
            if cs_opt_constant_propagate in current_settings.optimizerswitches then
              begin
@@ -1361,6 +1707,47 @@ implementation
            if (cs_opt_loopfuse in current_settings.optimizerswitches)
              and not(pi_has_label in flags) then
              RedoDFA:=OptimizeLoopFuse(code) or RedoDFA;
+
+           if RedoDFA then
+             begin
+               dfabuilder.redodfainfo(code);
+               RedoDFA:=false;
+             end;
+
+           { loop interchange: reorder a perfect two-level counted nest so the
+             innermost loop strides the row-contiguous dimension, improving spatial
+             locality and exposing the (now unit-stride) inner loop to the
+             vectorizer that runs below.  Run before unroll-and-jam / the
+             vectorizer / strength reduction / the for->while lowering: it matches
+             on for-nodes with plain a[i*W+j] index nodes and rebuilds the nest
+             with the two loop headers swapped.  Needs valid DFA (it counts counter
+             references to prove the counters are dead outside the nest); skips
+             procedures with labels like the loop passes below so control cannot
+             enter a reordered body mid-stream. }
+           if (cs_opt_loopinterchange in current_settings.optimizerswitches)
+             and not(pi_has_label in flags) then
+             RedoDFA:=OptimizeLoopInterchange(code) or RedoDFA;
+
+           if RedoDFA then
+             begin
+               dfabuilder.redodfainfo(code);
+               RedoDFA:=false;
+             end;
+
+           { loop tiling / cache blocking: block a perfect three-level counted
+             matmul-shaped reduction nest  for i: for j: for k: C[wi]:=C[wi]+T
+             into cache-sized tiles over the two output loops i and j, emitting the
+             point loops in i/k/j order (j and k interchanged) so a reused operand
+             panel (b[k*N+j]) stays cache-resident and the inner j-loop strides the
+             contiguous dimension.  Run right after interchange and before the
+             vectorizer: the reordered unit-stride inner loop is left intact for it.
+             Needs valid DFA (it counts counter references to prove the counters
+             are dead outside the nest and rectangular); skips procedures with
+             labels like the loop passes below so control cannot enter a tiled body
+             mid-stream. }
+           if (cs_opt_looptile in current_settings.optimizerswitches)
+             and not(pi_has_label in flags) then
+             RedoDFA:=OptimizeLoopTile(code) or RedoDFA;
 
            if RedoDFA then
              begin
@@ -1444,7 +1831,7 @@ implementation
              free single-precision min/max activation (ReLU / one-sided clamp /
              element-wise max-min) is widened to a packed maxps/minps main loop,
              so the enabling gate is either switch. }
-           if (([cs_opt_vectorize,cs_opt_ifconvert]*current_settings.optimizerswitches)<>[])
+           if (([cs_opt_vectorize,cs_opt_ifconvert,cs_opt_approxtrans]*current_settings.optimizerswitches)<>[])
              and not(pi_has_label in flags) then
              RedoDFA:=OptimizeVectorize(code) or RedoDFA;
 
@@ -1681,7 +2068,16 @@ implementation
                        { function result is passed by var but it must be initialized }
                        not(vo_is_funcret in tparavarsym(tloadnode(dfabuilder.nodemap[i]).symtableentry).varoptions)) or
                        { do not warn about initialized hidden parameters }
-                       ((tparavarsym(tloadnode(dfabuilder.nodemap[i]).symtableentry).varoptions*[vo_is_high_para,vo_is_parentfp,vo_is_result,vo_is_self])<>[]))) then
+                       ((tparavarsym(tloadnode(dfabuilder.nodemap[i]).symtableentry).varoptions*[vo_is_high_para,vo_is_parentfp,vo_is_result,vo_is_self])<>[]))) and
+                       { skip matched loop-fill false positives (see above) }
+                       not((tnode(dfabuilder.nodemap[i]).nodetype=loadn) and
+                           (loopfillsyms.IndexOf(tloadnode(dfabuilder.nodemap[i]).symtableentry)>=0)) and
+                       { skip correlated if-guard false positives (see above) }
+                       not((tnode(dfabuilder.nodemap[i]).nodetype=loadn) and
+                           (guardsyms.IndexOf(tloadnode(dfabuilder.nodemap[i]).symtableentry)>=0)) and
+                       { skip nested-procedure-def false positives (see above) }
+                       not((tnode(dfabuilder.nodemap[i]).nodetype=loadn) and
+                           (nestedsyms.IndexOf(tloadnode(dfabuilder.nodemap[i]).symtableentry)>=0)) then
                        CheckAndWarn(UserCode,tnode(dfabuilder.nodemap[i]));
                    end
                  else
@@ -1723,9 +2119,38 @@ implementation
          summary is available to every routine compiled after it in the unit;
          mutually-recursive SCCs are resolved by the on-demand fixpoint in
          optpure. Opt-in via -OoPURE; the flags default to "impure" for routines
-         we never analysed (e.g. loaded from other units). }
-       if cs_opt_pure in current_settings.optimizerswitches then
+         we never analysed (e.g. loaded from other units). -OoCONSTEVAL consumes
+         the "const" verdict (and streams it cross-unit via optsum_pure), so it
+         implies running this analysis as well. -OoMODREF refines the same
+         pure/const verdict, so it implies it too. }
+       if ([cs_opt_pure,cs_opt_consteval,cs_opt_modref]*current_settings.optimizerswitches)<>[] then
          AnalyzeProcPurity(procdef,code);
+
+       { interprocedural mod/ref memory-access summaries (the gcc ipa-modref
+         idea): record, per routine, a conservative summary of what it READS and
+         WRITES, refining -OoPURE's binary verdict so a later-compiled caller can
+         drop a call barrier that provably touches neither the pending store nor
+         the promoted value at issue. Runs here on the final node tree, right
+         after the purity analysis it builds on, so callees compiled earlier in
+         the unit already have their summaries recorded; forward/recursive
+         callees degrade to unknown-global. Opt-in via -OoMODREF. }
+       if cs_opt_modref in current_settings.optimizerswitches then
+         AnalyzeProcModref(procdef,code);
+
+       { interprocedural dead-parameter elimination (the gcc -fipa-sra idea,
+         part (a)): first REWRITE this routine's own resolved direct call sites --
+         eliding the evaluation of any side-effect-free actual bound to a formal a
+         callee (compiled earlier in this unit, or loaded from a used unit's ppu)
+         provably never reads -- THEN compute and record this routine's own
+         per-formal reference bitmap so later-compiled callers can do the same to
+         calls of this routine. Rewriting first lets a parameter that only fed an
+         elided actual cascade to dead in this routine too. Opt-in via -OoDEADPARA;
+         signature-preserving (caller-side elision), so sound cross-unit. }
+       if cs_opt_dead_para in current_settings.optimizerswitches then
+         begin
+           RewriteDeadParaCalls(procdef,code);
+           AnalyzeProcDeadPara(procdef,code,has_nestedprocs,flags);
+         end;
 
        { global value numbering + full-redundancy elimination: number
          side-effect-free scalar expressions across control flow and reuse a
@@ -1754,6 +2179,10 @@ implementation
              longjmp is performed }
           not(m_non_local_goto in current_settings.modeswitches) then
          do_consttovar(code);
+
+       loopfillsyms.Free;
+       guardsyms.Free;
+       nestedsyms.Free;
       end;
 
 
@@ -2420,6 +2849,57 @@ implementation
                 CreateInlineInfo;
               end;
           end;
+
+        { -OoDEVIRT: retain the body of a small VIRTUAL method as inlining info
+          so that a call proven to reach exactly this override (devirtualized in
+          another routine of this unit) can be expanded inline. A virtual method
+          can never carry po_inline -- it is mutually exclusive with
+          po_virtualmethod, so both the ordinary and the automatic inliner skip
+          it -- hence the body is kept WITHOUT setting po_inline: normal virtual
+          dispatch is unaffected, only tcallnode.devirt_prepare_inline consumes
+          the retained body. Same soundness gate (checknodeinlining) and size
+          heuristic as auto-inlining; excludes constructors/destructors (never
+          devirtualized) and the same unsafe proc kinds. }
+        if (cs_opt_devirt in current_settings.optimizerswitches) and
+           (po_virtualmethod in procdef.procoptions) and
+           not(po_noinline in procdef.procoptions) and
+           not(procdef.has_inlininginfo) and not(has_nestedprocs) and
+           not(procdef.proctypeoption in [potype_proginit,potype_unitinit,potype_unitfinalize,potype_constructor,
+                                          potype_destructor,potype_class_constructor,potype_class_destructor]) and
+           ((procdef.procoptions*[po_exports,po_external,po_interrupt,po_iocheck,po_assembler,po_abstractmethod])=[]) and
+           (not(procdef.proccalloption in [pocall_safecall])) and
+           heuristics_favors_autoinlining(code) then
+          begin
+            if checknodeinlining(procdef) then
+              CreateInlineInfo;   { deliberately WITHOUT include(procoptions,po_inline) }
+          end;
+
+        { -OoIPACP cross-unit: retain the body of an IPACP-eligible routine that
+          is reachable from another unit (an interface routine, or one already
+          inline) as inlininginfo so its tree is streamed into this unit's PPU.
+          A caller in a USED unit then recovers that tree and clones it,
+          specialized on the constants it passes.  Retained WITHOUT po_inline
+          (like the DEVIRT retention above): ordinary call/inlining behaviour is
+          unchanged, only optipacp.make_crossunit_stash consumes the tree, and
+          it independently re-verifies eligibility on the loaded copy.  Gated on
+          the same size/eligibility screen as the intra-unit stash, so PPU bloat
+          is bounded to routines that could actually be specialized. }
+        if (cs_opt_ipacp in current_settings.optimizerswitches) and
+           not(procdef.has_inlininginfo) and not(has_nestedprocs) and
+           ipacp_crossunit_retain_candidate(procdef,code,flags,has_nestedprocs) then
+          CreateInlineInfo;   { deliberately WITHOUT include(procoptions,po_inline) }
+
+        { -OoCONSTEVAL cross-unit: retain the body of a const-eligible routine
+          reachable from another unit (an interface routine, or one already
+          inline) as inlininginfo so its tree is streamed into this unit's PPU.
+          A caller in a USED unit interprets that tree at compile time to fold a
+          call with all-constant arguments into a literal.  Retained WITHOUT
+          po_inline (ordinary call/inlining behaviour is unchanged; only
+          optconsteval consumes the tree). }
+        if (cs_opt_consteval in current_settings.optimizerswitches) and
+           not(procdef.has_inlininginfo) and not(has_nestedprocs) and
+           consteval_crossunit_retain_candidate(procdef,code,flags,has_nestedprocs) then
+          CreateInlineInfo;   { deliberately WITHOUT include(procoptions,po_inline) }
 
         templist:=TAsmList.create;
 
@@ -3404,6 +3884,183 @@ implementation
       end;
 
 
+    { uninitialized-variable/result diagnostics silenced while a specialized
+      IPACP clone (a copy of already-validated code) is code-generated }
+    const
+      ipacp_suppressed_msgs : array[0..8] of longint = (
+        sym_w_uninitialized_local_variable,
+        sym_w_uninitialized_variable,
+        sym_h_uninitialized_local_variable,
+        sym_h_uninitialized_variable,
+        sym_w_function_result_uninitialized,
+        sym_h_uninitialized_managed_local_variable,
+        sym_h_uninitialized_managed_variable,
+        sym_w_managed_function_result_uninitialized,
+        { the constant fold that specializes the clone can make a case/if arm
+          unreachable -- a true statement about the clone, noise on user lines }
+        cg_w_unreachable_code);
+
+    { -OoIPACP: compile a synthesised specialized clone procdef (built by
+      optipacp.ipacp_process_calls) whose body is CLONECODE.  Like
+      compile_partial_inline_header, but the clone is a normal out-of-line
+      routine (no inline info is created), reentrantly code-generated at
+      module-level symtablestack state after the caller's own
+      generate_code_tree. }
+    procedure compile_ipacp_clone(clonepd:tprocdef;clonecode:tnode);
+      var
+        oldpi : tprocinfo;
+        oldmoduleprocinfo : tprocinfo;
+        oldstructdef : tabstractrecorddef;
+        oldblock : tblock_type;
+        i : longint;
+        savedmsgstate : array[0..high(ipacp_suppressed_msgs)] of tmsgstate;
+        pi : tcgprocinfo;
+      begin
+        if not assigned(clonepd) or not assigned(clonecode) then
+          exit;
+        { The clone body is a copy of code already fully checked when the
+          original routine compiled; the DFA run over the specialized copy can
+          raise spurious uninitialized-variable/result warnings on the user's
+          own source lines (constant folding can leave e.g. `Result:=a;
+          Result:=Result+k` in a shape the partial life analysis flags even
+          though the write dominates). Turn those specific messages off for the
+          clone's compilation only; everything else (real errors) still fires. }
+        for i:=0 to high(ipacp_suppressed_msgs) do
+          begin
+            savedmsgstate[i]:=GetMessageState(ipacp_suppressed_msgs[i]);
+            SetMessageVerbosity(ipacp_suppressed_msgs[i],ms_off_global);
+          end;
+        oldpi:=current_procinfo;
+        oldmoduleprocinfo:=tprocinfo(current_module.procinfo);
+        oldstructdef:=current_structdef;
+        oldblock:=block_type;
+
+        pi:=tcgprocinfo(cprocinfo.create(nil));
+        current_module.procinfo:=pi;
+        pi.procdef:=clonepd;
+        current_procinfo:=pi;
+        current_structdef:=nil;
+        block_type:=bt_body;
+
+        clonepd.aliasnames.insert(clonepd.mangledname);
+        alloc_proc_symbol(clonepd);
+
+        pi.add_to_symtablestack;
+
+        pi.entrypos:=clonecode.fileinfo;
+        pi.entryswitches:=current_settings.localswitches;
+        pi.exitpos:=clonecode.fileinfo;
+        pi.exitswitches:=current_settings.localswitches;
+
+        pi.code:=clonecode;
+        do_typecheckpass(pi.code);
+
+        pi.remove_from_symtablestack;
+
+        current_structdef:=oldstructdef;
+        block_type:=oldblock;
+
+        if Errorcount=0 then
+          pi.generate_code_tree;
+
+        freeandnil(pi);
+        current_module.procinfo:=oldmoduleprocinfo;
+        current_procinfo:=oldpi;
+        for i:=0 to high(ipacp_suppressed_msgs) do
+          SetMessageVerbosity(ipacp_suppressed_msgs[i],savedmsgstate[i]);
+      end;
+
+
+    procedure ipacp_process_main_body(mainpi:tcgprocinfo);
+      var
+        ipacp_pending : TFPObjectList;
+        ipacp_code    : tnode;
+        i             : longint;
+      begin
+        if not (cs_opt_ipacp in current_settings.optimizerswitches) then
+          exit;
+        if not assigned(mainpi) or not assigned(mainpi.procdef) or
+           not assigned(mainpi.code) then
+          exit;
+        { only the real program/library init body carries user code worth
+          scanning; the synthetic stubs (mainstub/libmainstub/pkgstub) do not }
+        if mainpi.procdef.proctypeoption<>potype_proginit then
+          exit;
+        ipacp_pending:=TFPObjectList.create(true);
+        try
+          ipacp_code:=mainpi.code;
+          { mirror read_proc_body: the caller's symtables must be reachable while
+            the retargeted call nodes are re-typechecked.  For the main proc the
+            localst IS the module static symtable (already on the stack) and the
+            (empty) parast sits below normal_function_level, so add/remove are
+            effectively no-ops here -- but keep them for symmetry/safety. }
+          mainpi.add_to_symtablestack;
+          ipacp_process_calls(mainpi.procdef,ipacp_code,ipacp_pending);
+          mainpi.remove_from_symtablestack;
+          mainpi.code:=ipacp_code;
+          { compile the synthesised clone bodies now (before the main body's own
+            generate_code_tree): each is an independent out-of-line routine and
+            only its symbol needs to exist for the retargeted call sites }
+          for i:=0 to ipacp_pending.count-1 do
+            compile_ipacp_clone(tipacpclone(ipacp_pending[i]).clonepd,
+              tipacpclone(ipacp_pending[i]).clonecode);
+        finally
+          ipacp_pending.free;
+        end;
+      end;
+
+
+    procedure ipasra_process_main_body(mainpi:tcgprocinfo);
+      var
+        ipasra_pending : TFPObjectList;
+        ipasra_code    : tnode;
+        i              : longint;
+      begin
+        if not (cs_opt_ipasra in current_settings.optimizerswitches) then
+          exit;
+        if not assigned(mainpi) or not assigned(mainpi.procdef) or
+           not assigned(mainpi.code) then
+          exit;
+        if mainpi.procdef.proctypeoption<>potype_proginit then
+          exit;
+        ipasra_pending:=TFPObjectList.create(true);
+        try
+          ipasra_code:=mainpi.code;
+          mainpi.add_to_symtablestack;
+          ipasra_process_calls(mainpi.procdef,ipasra_code,ipasra_pending);
+          mainpi.remove_from_symtablestack;
+          mainpi.code:=ipasra_code;
+          for i:=0 to ipasra_pending.count-1 do
+            compile_ipacp_clone(tipasraclone(ipasra_pending[i]).clonepd,
+              tipasraclone(ipasra_pending[i]).clonecode);
+        finally
+          ipasra_pending.free;
+        end;
+      end;
+
+
+    procedure consteval_process_main_body(mainpi:tcgprocinfo);
+      var
+        cecode : tnode;
+      begin
+        if not (cs_opt_consteval in current_settings.optimizerswitches) then
+          exit;
+        if not assigned(mainpi) or not assigned(mainpi.procdef) or
+           not assigned(mainpi.code) then
+          exit;
+        if mainpi.procdef.proctypeoption<>potype_proginit then
+          exit;
+        cecode:=mainpi.code;
+        { the caller's symtables must be reachable while the folded-in literals
+          are typechecked; for the main proc the localst IS the module static
+          symtable (already on the stack) but keep add/remove for symmetry }
+        mainpi.add_to_symtablestack;
+        consteval_process_calls(mainpi.procdef,cecode);
+        mainpi.remove_from_symtablestack;
+        mainpi.code:=cecode;
+      end;
+
+
     procedure read_proc_body(old_current_procinfo:tprocinfo;pd:tprocdef);
       {
         Parses the procedure directives, then parses the procedure body, then
@@ -3416,12 +4073,18 @@ implementation
         pi_dosplit       : boolean;
         pi_headerpd      : tprocdef;
         pi_headercode    : tnode;
+        ipacp_pending    : TFPObjectList;
+        ipacp_code       : tnode;
+        ipacp_i          : longint;
+        ipasra_pending   : TFPObjectList;
       begin
         Message1(parser_d_procedure_start,pd.fullprocname(false));
         oldfailtokenmode:=[];
         pi_dosplit:=false;
         pi_headerpd:=nil;
         pi_headercode:=nil;
+        ipacp_pending:=nil;
+        ipasra_pending:=nil;
 
         { create a new procedure }
         current_procinfo:=cprocinfo.create(old_current_procinfo);
@@ -3479,6 +4142,67 @@ implementation
             current_procinfo.flags,
             assigned(current_procinfo.get_first_nestedproc));
 
+        { -OoIPACP: stash this routine's pre-codegen body as a clone template
+          for later callers, then scan its own body for calls that pass a
+          compile-time constant to an eligible parameter of an already-stashed
+          routine and retarget them to specialized clones (compiled below,
+          after this routine's generate_code_tree). }
+        if (cs_opt_ipacp in current_settings.optimizerswitches) and
+           (not isnestedproc) and
+           (not(df_generic in pd.defoptions)) then
+          begin
+            ipacp_pending:=TFPObjectList.create(true);
+            ipacp_stash_candidate(pd,
+              tcgprocinfo(current_procinfo).code,
+              current_procinfo.flags,
+              assigned(current_procinfo.get_first_nestedproc));
+            ipacp_code:=tcgprocinfo(current_procinfo).code;
+            tcgprocinfo(current_procinfo).add_to_symtablestack;
+            ipacp_process_calls(pd,ipacp_code,ipacp_pending);
+            tcgprocinfo(current_procinfo).remove_from_symtablestack;
+            tcgprocinfo(current_procinfo).code:=ipacp_code;
+          end;
+
+        { -OoIPASRA: stash this routine's pre-codegen body as a split-clone
+          template, then scan its own body for direct calls to an already-stashed
+          routine that pass a side-effect-free record actual to every splittable
+          parameter and rebuild them to a split-parameter clone (compiled below,
+          after this routine's generate_code_tree). }
+        if (cs_opt_ipasra in current_settings.optimizerswitches) and
+           (not isnestedproc) and
+           (not(df_generic in pd.defoptions)) then
+          begin
+            ipasra_pending:=TFPObjectList.create(true);
+            ipasra_stash_candidate(pd,
+              tcgprocinfo(current_procinfo).code,
+              current_procinfo.flags,
+              assigned(current_procinfo.get_first_nestedproc));
+            ipacp_code:=tcgprocinfo(current_procinfo).code;
+            tcgprocinfo(current_procinfo).add_to_symtablestack;
+            ipasra_process_calls(pd,ipacp_code,ipasra_pending);
+            tcgprocinfo(current_procinfo).remove_from_symtablestack;
+            tcgprocinfo(current_procinfo).code:=ipacp_code;
+          end;
+
+        { -OoCONSTEVAL: stash this routine's pre-codegen body as a template for
+          later callers, then scan its own body for direct calls to an
+          already-compiled proven-const routine whose arguments are all
+          compile-time constants and replace each with the computed literal
+          (the callee's const verdict, computed during its own generate_code_tree
+          above, is already available).  Runs pre-firstpass so the replacement
+          literal feeds the caller's normal folding cascade. }
+        if (cs_opt_consteval in current_settings.optimizerswitches) and
+           (not isnestedproc) and
+           (not(df_generic in pd.defoptions)) then
+          begin
+            consteval_stash_candidate(pd,tcgprocinfo(current_procinfo).code);
+            ipacp_code:=tcgprocinfo(current_procinfo).code;
+            tcgprocinfo(current_procinfo).add_to_symtablestack;
+            consteval_process_calls(pd,ipacp_code);
+            tcgprocinfo(current_procinfo).remove_from_symtablestack;
+            tcgprocinfo(current_procinfo).code:=ipacp_code;
+          end;
+
         { When it's a nested procedure then defer the code generation,
           when back at normal function level then generate the code
           for all deferred nested procedures and the current procedure }
@@ -3503,6 +4227,29 @@ implementation
             pi_headerpd:=partialinline_make_header(pd,pi_headercode);
             if assigned(pi_headerpd) then
               compile_partial_inline_header(pi_headerpd,pi_headercode);
+          end;
+
+        { -OoIPACP: now that the caller has been code-generated (its call sites
+          already retargeted to the clone symbols), compile the specialized
+          clone bodies that were synthesised for it. }
+        if assigned(ipacp_pending) then
+          begin
+            for ipacp_i:=0 to ipacp_pending.count-1 do
+              compile_ipacp_clone(tipacpclone(ipacp_pending[ipacp_i]).clonepd,
+                tipacpclone(ipacp_pending[ipacp_i]).clonecode);
+            freeandnil(ipacp_pending);
+          end;
+
+        { -OoIPASRA: now that the caller has been code-generated (its call sites
+          already rebuilt to the split-clone symbols), compile the synthesised
+          split-parameter clone bodies (a split clone is an ordinary out-of-line
+          routine, so the IPACP clone-compiler applies unchanged). }
+        if assigned(ipasra_pending) then
+          begin
+            for ipacp_i:=0 to ipasra_pending.count-1 do
+              compile_ipacp_clone(tipasraclone(ipasra_pending[ipacp_i]).clonepd,
+                tipasraclone(ipasra_pending[ipacp_i]).clonecode);
+            freeandnil(ipasra_pending);
           end;
 
         { release procinfo }

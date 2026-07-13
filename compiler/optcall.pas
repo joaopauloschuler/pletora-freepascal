@@ -36,7 +36,8 @@ unit optcall;
   implementation
 
     uses
-      cclasses,
+      cutils,cclasses,
+      globtype,
       verbose,globals,
       defutil,defcmp,
       symconst,symtype,symdef,symsym,
@@ -45,7 +46,8 @@ unit optcall;
       nutils,
       fmodule,
       pass_1,
-      nbas,ncal,nld;
+      aasmbase,aasmtai,aasmdata,
+      nbas,ncal,nld,nmem;
 
     { this procedure removes the user code flag because it prevents optimizations }
     function removeusercodeflag(var n : tnode; arg : pointer) : foreachnoderesult;
@@ -59,11 +61,271 @@ unit optcall;
       end;
 
 
+    { FPC Unleashed: give each spliced copy of an inline asm block its own fresh
+      AB_LOCAL asm labels. When a routine with an inner "asm ... jge .Lok ...
+      .Lok: ..." block is inlined at two+ call sites, dogetcopy's concatlistcopy
+      aliases the SAME tasmlabel across the copies, and tcgasmnode's alt-symbol
+      relabel always uses alt number 1 -- so both copies would emit "name_1" and
+      the assembler reports "Duplicate label". We rebind every AB_LOCAL label
+      DEFINED in this copy to a freshly allocated label (unique module-wide),
+      rewriting the definition AND every reference (branch operands, ait_const
+      sym/endsym) consistently, so each site's jmp/label pair is self-contained.
+      The alt-symbol pass then still runs (asmnf_inline_copy) but now derives its
+      "_1" names from distinct bases, so no collision. }
+    procedure unique_inline_asm_labels(p_asm : TAsmList);
+      var
+        hp   : tai;
+        i    : longint;
+        oldl : array of tasmlabel;
+        newl : array of tasmlabel;
+
+      function mapped(sym : tasmsymbol) : tasmlabel;
+        var
+          j : longint;
+        begin
+          result:=nil;
+          if not(assigned(sym) and (sym.bind=AB_LOCAL) and (sym is tasmlabel)) then
+            exit;
+          for j:=0 to high(oldl) do
+            if oldl[j]=sym then
+              exit(newl[j]);
+        end;
+
+      procedure remapsym(var sym : tasmsymbol);
+        var
+          m : tasmlabel;
+        begin
+          m:=mapped(sym);
+          if assigned(m) then
+            sym:=m;
+        end;
+
+      begin
+        oldl:=nil;
+        newl:=nil;
+        if not assigned(p_asm) then
+          exit;
+        { pass 1: allocate a fresh label for each AB_LOCAL label DEFINED here }
+        hp:=tai(p_asm.first);
+        while assigned(hp) do
+          begin
+            if (hp.typ=ait_label) and
+               assigned(tai_label(hp).labsym) and
+               (tai_label(hp).labsym.bind=AB_LOCAL) and
+               (mapped(tai_label(hp).labsym)=nil) then
+              begin
+                setlength(oldl,length(oldl)+1);
+                setlength(newl,length(newl)+1);
+                oldl[high(oldl)]:=tai_label(hp).labsym;
+                current_asmdata.getjumplabel(newl[high(newl)]);
+              end;
+            hp:=tai(hp.next);
+          end;
+        if length(oldl)=0 then
+          exit;
+        { pass 2: rewrite definitions and every reference of the mapped labels }
+        hp:=tai(p_asm.first);
+        while assigned(hp) do
+          begin
+            case hp.typ of
+              ait_label :
+                begin
+                  if assigned(mapped(tai_label(hp).labsym)) then
+                    tai_label(hp).labsym:=mapped(tai_label(hp).labsym);
+                end;
+              ait_const :
+                begin
+                  remapsym(tai_const(hp).sym);
+                  remapsym(tai_const(hp).endsym);
+                end;
+              ait_instruction :
+                for i:=0 to tai_cpu_abstract(hp).ops-1 do
+                  if tai_cpu_abstract(hp).oper[i]^.typ=top_ref then
+                    begin
+                      remapsym(tai_cpu_abstract(hp).oper[i]^.ref^.symbol);
+                      remapsym(tai_cpu_abstract(hp).oper[i]^.ref^.relsymbol);
+                    end;
+              else
+                ;
+            end;
+            hp:=tai(hp.next);
+          end;
+      end;
+
+
+    { FPC Unleashed: flag asm blocks in an inlined body copy so tcgasmnode
+      relabels their local asm labels for this call site, and give each copy its
+      own fresh AB_LOCAL labels (see unique_inline_asm_labels). }
+    function mark_inline_asm_copy(var n : tnode; arg : pointer) : foreachnoderesult;
+      begin
+        result:=fen_false;
+        if (n.nodetype=asmn) and
+           not(asmnf_get_asm_position in tasmnode(n).asmnodeflags) then
+          begin
+            include(tasmnode(n).asmnodeflags,asmnf_inline_copy);
+            unique_inline_asm_labels(tasmnode(n).p_asm);
+          end;
+      end;
+
+
     function setinlinelevel(var n:tnode; arg:pointer):foreachnoderesult;
       begin
         if n.nodetype=calln then
           tcallnode(n).inlinelevel:=PtrUInt(arg);
         result:=fen_false;
+      end;
+
+
+    var
+      { module-unique counter for the caller locals synthesised to back asm
+        operands referencing the inlined routine's params/locals/result }
+      inlineasmlocalseq : longint = 0;
+
+    { collect every spliced inline-copy asm node into the tfplist(arg) }
+    function collect_inline_asm_nodes(var n : tnode; arg : pointer) : foreachnoderesult;
+      begin
+        result:=fen_false;
+        if (n.nodetype=asmn) and
+           (asmnf_inline_copy in tasmnode(n).asmnodeflags) and
+           assigned(tasmnode(n).p_asm) then
+          tfplist(arg).add(n);
+      end;
+
+    { FPC Unleashed (Task B): make an inlined asm block's top_local operands --
+      which still point at the CALLEE's paravarsym/localvarsym/result and would
+      get no localloc in the caller frame -- resolvable at the call site.  For
+      each referenced callee sym we materialise a REAL localvarsym in the
+      CALLER's localst (so gen_alloc_symtable gives it a stack slot, forced to
+      memory because the caller has inherited pi_has_assembler_block), prepend
+      `newlocal := actual-argument` for value parameters, rebind every operand
+      to the new local, and return `funcretnode := newlocal` for the ordinal
+      function result (added after the body by the caller).  Eligibility was
+      already screened by psub.inline_asm_local_operand_ok, so only value params,
+      plain locals and ordinal/pointer results reach here. }
+    procedure expand_inline_asm_operands(callnode : tcallnode; body : tnode; out resultwriteback : tnode);
+      var
+        asmnodes : tfplist;
+        mapkeys  : array of pointer;
+        mapvals  : array of tlocalvarsym;
+
+      function get_or_create(sym : tabstractnormalvarsym) : tlocalvarsym;
+        var
+          m        : longint;
+          para     : tcallparanode;
+          byref    : boolean;
+          localdef : tdef;
+          paddr    : taddrnode;
+        begin
+          for m:=0 to high(mapkeys) do
+            if mapkeys[m]=pointer(sym) then
+              exit(mapvals[m]);
+          { a by-reference parameter (var/out/constref) is passed as a hidden
+            pointer: its top_local operand resolves to that pointer SLOT (the asm
+            author loads it and dereferences manually, exactly as out-of-line).
+            So we back it with a caller local of POINTER type holding @actual --
+            relocating only the address, which is sound for any referenced type
+            and lets the spliced asm read AND write the caller's actual. }
+          byref:=(sym.typ=paravarsym) and
+                 (tparavarsym(sym).varspez in [vs_var,vs_out,vs_constref]);
+          if byref then
+            localdef:=cpointerdef.getreusable(sym.vardef)
+          else
+            localdef:=sym.vardef;
+          inc(inlineasmlocalseq);
+          result:=clocalvarsym.create('$inlasm$'+tostr(inlineasmlocalseq),vs_value,localdef,[]);
+          { compiler-generated: the asm read/write is invisible to the node DFA,
+            so mark it internal to suppress the spurious "assigned but never
+            used" / "not initialised" diagnostics (fatal under -Sew) }
+          include(result.symoptions,sp_internal);
+          { the spliced asm reaches this local through a top_local operand that
+            tcgasmnode.ResolveRef materialises as a MEMORY reference off the
+            frame pointer -- so the local must live in memory, never a register.
+            clocalvarsym.create defaults varregable from the def (vr_intreg for
+            an ordinal/pointer), which would let the register allocator place it
+            in a register whose (uninitialised) registerhi then trips
+            translate_register (IE 200602021) once the caller carries an
+            exception frame.  Force it to memory. }
+          result.varregable:=vr_none;
+          result.register_sym;
+          current_procinfo.procdef.localst.insertsym(result);
+          result.varstate:=vs_initialised;
+          setlength(mapkeys,length(mapkeys)+1);
+          setlength(mapvals,length(mapvals)+1);
+          mapkeys[high(mapkeys)]:=pointer(sym);
+          mapvals[high(mapvals)]:=result;
+          if (not byref) and (sym.typ=localvarsym) and (vo_is_funcret in sym.varoptions) then
+            begin
+              { function result: connect the new local back to funcretnode after
+                the body has run (only when the result is actually consumed) }
+              if assigned(callnode.funcretnode) and
+                 (cnf_return_value_used in callnode.callnodeflags) then
+                resultwriteback:=cassignmentnode.create(
+                  callnode.funcretnode.getcopy,
+                  cloadnode.create(result,current_procinfo.procdef.localst));
+            end
+          else if sym.typ=paravarsym then
+            begin
+              para:=tcallparanode(callnode.left);
+              while assigned(para) and (para.parasym<>tparavarsym(sym)) do
+                para:=tcallparanode(para.right);
+              if assigned(para) and assigned(para.left) then
+                if byref then
+                  begin
+                    { by-reference parameter: `newptrlocal := @actual`.  The
+                      actual (para.left) is the l-value the caller passes by
+                      reference; a typed address-of matches the pointer local. }
+                    paddr:=caddrnode.create_internal(para.left.getcopy);
+                    include(paddr.addrnodeflags,anf_typedaddr);
+                    addstatement(callnode.inlineinitstatement,
+                      cassignmentnode.create(
+                        cloadnode.create(result,current_procinfo.procdef.localst),
+                        paddr));
+                  end
+                else
+                  { value parameter: `newlocal := actual-argument-value`.  After
+                    createinlineparas, para.left is the (possibly temp-wrapped)
+                    evaluated actual, so a plain copy is the callee's value copy. }
+                  addstatement(callnode.inlineinitstatement,
+                    cassignmentnode.create(
+                      cloadnode.create(result,current_procinfo.procdef.localst),
+                      para.left.getcopy));
+            end;
+          { a plain local needs no init (it starts uninitialised, as in the callee) }
+        end;
+
+      var
+        i,j       : longint;
+        an        : tasmnode;
+        hp        : tai;
+        calleesym : tabstractnormalvarsym;
+        callerlocal : tlocalvarsym;
+      begin
+        resultwriteback:=nil;
+        mapkeys:=nil;
+        mapvals:=nil;
+        asmnodes:=tfplist.create;
+        foreachnodestatic(pm_postprocess,body,@collect_inline_asm_nodes,asmnodes);
+        for i:=0 to asmnodes.count-1 do
+          begin
+            an:=tasmnode(asmnodes[i]);
+            hp:=tai(an.p_asm.first);
+            while assigned(hp) do
+              begin
+                if hp.typ=ait_instruction then
+                  for j:=0 to tai_cpu_abstract(hp).ops-1 do
+                    if tai_cpu_abstract(hp).oper[j]^.typ=top_local then
+                      begin
+                        calleesym:=tabstractnormalvarsym(tai_cpu_abstract(hp).oper[j]^.localoper^.localsym);
+                        if assigned(calleesym) then
+                          begin
+                            callerlocal:=get_or_create(calleesym);
+                            tai_cpu_abstract(hp).oper[j]^.localoper^.localsym:=pointer(callerlocal);
+                          end;
+                      end;
+                hp:=tai(hp.next);
+              end;
+          end;
+        asmnodes.free;
       end;
 
 
@@ -110,24 +372,82 @@ unit optcall;
       end;
 
 
+    { FPC Unleashed (checknodeinlining refusal b): rebind the self of an
+      `inherited` call spliced from an inline body.  Unlike an ordinary method
+      call -- whose self travels in methodpointer and is rebound by
+      replaceparaload -- an inherited call carries its self in the separate
+      call_self_node field (a load of the ENCLOSING routine's `self`).  The
+      inline splice runs replaceparaload over the body's ordinary child nodes but
+      does not descend into call_self_node, so a spliced inherited call keeps a
+      self load of the CALLEE's self paravarsym, which has no location in the
+      caller frame -> reads garbage / crashes.  Here we run the very same
+      replaceparaload over each inherited call's call_self_node, mapping that
+      self load to THIS call site's self actual exactly like every other
+      parameter (temp-wrapped complex receivers are handled by that machinery).
+      arg is the tcallnode being inlined.  Only class methods reach here
+      (psub.checknodeinlining) and cross-unit callers are excluded
+      (ncal.check_inlining). }
+    function rebind_inlined_inherited_self(var n : tnode; arg : pointer) : foreachnoderesult;
+      var
+        cn : tcallnode;
+      begin
+        result:=fen_false;
+        if (n.nodetype=calln) and
+           (cnf_inherited in tcallnode(n).callnodeflags) and
+           assigned(tcallnode(n).call_self_node) then
+          begin
+            cn:=tcallnode(arg);
+            foreachnode(pm_preprocess,tcallnode(n).call_self_node,@cn.replaceparaload,@cn.fileinfo);
+          end;
+      end;
+
+
     function doinline(var _n: tnode; arg: pointer): foreachnoderesult;
       var
         n,
         body : tnode;
+        asmresultwriteback : tnode;
         para : tcallparanode;
         inlineblock,
         inlinecleanupblock : tblocknode;
         callnode: tcallnode;
+        inlinemeasured, inlinebudget : cardinal;
       begin
         result:=fen_false;
-        if not(_n.nodetype=calln) or not(po_inline in tcallnode(_n).procdefinition.procoptions) then
+        { po_inline marks the ordinary inline routines; cnf_do_inline additionally
+          covers -OoDEVIRT targets, which are virtual (never po_inline) but whose
+          body was retained as inlining info and rebound here by
+          tcallnode.devirt_prepare_inline }
+        if not(_n.nodetype=calln) or
+           not((po_inline in tcallnode(_n).procdefinition.procoptions) or
+               (cnf_do_inline in tcallnode(_n).callnodeflags)) then
           exit;
         callnode:=tcallnode(_n);
 
         if not(callnode.doinlining) then
           begin
             if not(po_compilerproc in callnode.procdefinition.procoptions) then
-              Message1(cg_n_no_inline,tprocdef(callnode.procdefinition).customprocname([pno_proctypeoption, pno_paranames,pno_ownername, pno_noclassmarker, pno_prettynames]));
+              begin
+                { FPC Unleashed: append the refusal reason when it is known
+                  (routine defined in the current unit); see tprocdef.inlinenoreason }
+                if tprocdef(callnode.procdefinition).inlinenoreason<>'' then
+                  Message2(cg_n_no_inline,
+                    tprocdef(callnode.procdefinition).customprocname([pno_proctypeoption, pno_paranames,pno_ownername, pno_noclassmarker, pno_prettynames]),
+                    ' ('+tprocdef(callnode.procdefinition).inlinenoreason+')')
+                { FPC Unleashed (Task F): when the routine is otherwise inlinable
+                  but its body exceeds the node-count size cap, spell out the
+                  measured node count and the effective budget so the user sees
+                  how far over budget it is rather than just "not inlined". }
+                else if callnode.inline_size_over_budget(inlinemeasured,inlinebudget) then
+                  Message2(cg_n_no_inline,
+                    tprocdef(callnode.procdefinition).customprocname([pno_proctypeoption, pno_paranames,pno_ownername, pno_noclassmarker, pno_prettynames]),
+                    ' (body node count '+tostr(inlinemeasured)+
+                    ' exceeds inlining budget '+tostr(inlinebudget)+')')
+                else
+                  Message2(cg_n_no_inline,
+                    tprocdef(callnode.procdefinition).customprocname([pno_proctypeoption, pno_paranames,pno_ownername, pno_noclassmarker, pno_prettynames]),
+                    '');
+              end;
             exit;
           end;
 
@@ -157,13 +477,33 @@ unit optcall;
 
         { create a copy of the body and replace parameter loads with the parameter values }
         body:=tprocdef(callnode.procdefinition).inlininginfo^.code.getcopy;
+        { FPC Unleashed: mark any asm blocks in the spliced copy so tcgasmnode
+          uniques their local labels at this call site (the enclosing routine is
+          not necessarily po_inline). checknodeinlining has already guaranteed
+          the blocks reference no local/parameter operands. }
+        foreachnodestatic(pm_postprocess,body,@mark_inline_asm_copy,nil);
         foreachnodestatic(pm_postprocess,body,@ removeusercodeflag,nil);
         foreachnodestatic(pm_postprocess,body,@importglobalsyms,nil);
         foreachnodestatic(pm_postprocess,body,@setinlinelevel,pointer(callnode.inlinelevel+1));
         foreachnode(pm_preprocess,body,@callnode.replaceparaload,@callnode.fileinfo);
 
+        { FPC Unleashed (refusal b): rebind the self of any inherited call in the
+          spliced body to this call site's self actual (see
+          rebind_inlined_inherited_self). }
+        if pi_has_inherited in (callnode.procdefinition as tprocdef).inlininginfo^.flags then
+          foreachnodestatic(body,@rebind_inlined_inherited_self,callnode);
+
+        { FPC Unleashed (Task B): rebind any inlined asm block's top_local
+          operands (param/local/result references) to fresh caller locals and
+          prepend their argument inits; get back the result write-back to append
+          after the body. No-op when no such operand exists, so global-only asm
+          blocks (and every non-asm inline) are unaffected. }
+        expand_inline_asm_operands(callnode,body,asmresultwriteback);
+
         { Concat the body and finalization parts }
         addstatement(callnode.inlineinitstatement,body);
+        if assigned(asmresultwriteback) then
+          addstatement(callnode.inlineinitstatement,asmresultwriteback);
         addstatement(callnode.inlineinitstatement,inlinecleanupblock);
         inlinecleanupblock:=nil;
 

@@ -49,6 +49,8 @@ unit optloop;
     function OptimizeLoopFuse(node : tnode) : boolean;
     function OptimizeReassoc(node : tnode) : boolean;
     function OptimizeUnrollJam(node : tnode) : boolean;
+    function OptimizeLoopInterchange(node : tnode) : boolean;
+    function OptimizeLoopTile(node : tnode) : boolean;
     function OptimizePredCom(node : tnode) : boolean;
     function OptimizeCodeSink(node : tnode) : boolean;
     function OptimizeStoreMotion(node : tnode) : boolean;
@@ -64,9 +66,9 @@ unit optloop;
       cclasses,cutils,compinnr,cdynset,
       cgbase,aasmbase,aasmtai,aasmdata,aasmcnst,
       globtype,globals,constexp,
-{$ifdef i386}
+{$if defined(i386) or defined(x86_64)}
       cpuinfo,
-{$endif i386}
+{$endif}
       verbose,
       symbase,symconst,symdef,symsym,symtype,symtable,fmodule,
       defutil,defcmp,
@@ -75,7 +77,7 @@ unit optloop;
       nadd,nbas,nflw,ncon,ninl,ncal,nld,nmem,ncnv,nmat,
       ncgmem,
       pass_1,
-      optbase,optutils,optpure,
+      optbase,optutils,optpure,optmodref,
       procinfo;
 
     function number_unrolls(node : tnode) : cardinal;
@@ -108,6 +110,157 @@ unit optloop;
 
         if number_unrolls=0 then
           number_unrolls:=1;
+      end;
+
+    { --- -OoPURE consumer helpers for the loop-family passes -----------------
+
+      Several loop passes scan a body / region and treat ANY call as a hard
+      barrier or disqualifier.  When -OoPURE has proved the callee's attributes
+      a resolved DIRECT call is far weaker than that:
+
+        * a CONST routine reads and writes NO memory, is side-effect free and
+          non-trapping -- it can neither observe nor clobber any memory the pass
+          cares about and can never raise, so it is transparent to any of these
+          transforms (reorder / duplicate with a shifted counter / promote a
+          global to a register across it);
+
+        * a PURE routine additionally MAY read global/heap memory (but writes
+          none): it is transparent only to passes whose sole concern is store
+          ordering AND that never keep a promoted value out of memory across it
+          (a pure callee could read the stale in-memory copy).
+
+      Both classifiers require a statically resolved ordinary/direct call and
+      reject the aggregate-return machinery (funcret/init/cleanup nodes perform
+      hidden stores) and indirect/virtual/procvar targets, mirroring the
+      -OoDEADSTORE (optdeadstore.el_classify_call) model. }
+
+    function loop_call_target(n : tnode) : tprocdef;
+      var
+        cn : tcallnode;
+        pd : tprocdef;
+      begin
+        result:=nil;
+        { both -OoPURE and -OoMODREF run the purity analysis these helpers
+          consult (see psub); either switch enables the loop-call relaxations }
+        if ([cs_opt_pure,cs_opt_modref]*current_settings.optimizerswitches)=[] then
+          exit;
+        if not assigned(n) or (n.nodetype<>calln) then
+          exit;
+        cn:=tcallnode(n);
+        { resolved direct call only (excludes indirect / procvar targets) }
+        if not assigned(cn.procdefinition) or not(cn.procdefinition is tprocdef) then
+          exit;
+        pd:=tprocdef(cn.procdefinition);
+        { a method call must dispatch to a statically known body }
+        if assigned(cn.methodpointer) and
+           ((po_virtualmethod in pd.procoptions) or
+            (po_abstractmethod in pd.procoptions)) then
+          exit;
+        { aggregate-return machinery performs hidden stores -> stay a barrier }
+        if assigned(cn.funcretnode) or assigned(cn.callinitblock) or
+           assigned(cn.callcleanupblock) then
+          exit;
+        result:=pd;
+      end;
+
+    { a resolved direct call whose target -OoPURE proved CONST (no memory read,
+      no memory write, no side effect, non-trapping) }
+    function loop_is_const_call(n : tnode) : boolean;
+      var
+        pd : tprocdef;
+      begin
+        pd:=loop_call_target(n);
+        result:=assigned(pd) and proc_is_const(pd);
+      end;
+
+    { a resolved direct call whose target -OoPURE proved PURE or CONST (writes
+      no memory; a bare PURE routine may still read global memory) }
+    function loop_is_pure_call(n : tnode) : boolean;
+      var
+        pd : tprocdef;
+      begin
+        pd:=loop_call_target(n);
+        result:=assigned(pd) and proc_is_pure(pd);
+      end;
+
+    { -OoMODREF generalisation of loop_is_pure_call: a resolved direct call whose
+      mod/ref summary proves it writes NO memory (modref_writes = mr_none) and
+      cannot trap.  This is exactly as reorderable as a proven-PURE call -- writes
+      nothing, non-trapping, and any memory it READS is re-read identically when
+      the surrounding reduction's only store is the non-address-taken local
+      accumulator (which no callee can name) -- but it admits routines -OoPURE
+      leaves unproven, e.g. an ineligible signature (an open-array / managed /
+      hidden parameter) that reads its by-ref/global input and writes nothing. }
+    function loop_is_modref_writefree_call(n : tnode) : boolean;
+      var
+        pd : tprocdef;
+      begin
+        result:=false;
+        if not(cs_opt_modref in current_settings.optimizerswitches) then
+          exit;
+        pd:=loop_call_target(n);
+        if not(assigned(pd) and modref_summary_available(pd) and
+               (pd.modref_writes=mr_none) and not modref_pd_can_trap(pd)) then
+          exit;
+        { -OoREASSOC duplicates the addend (with a shifted counter) and rebuilds
+          each copy.  The copy step used to mishandle a call actual carrying an
+          open-array / managed / hidden conversion (a fixed array bound to an
+          open-array parameter re-typechecked as its element type), so this
+          relaxation was restricted to calls whose every actual was a plain
+          simple-typed value.  reassoc_reset_cb now leaves an already-firstpassed
+          call's expanded argument list intact on each copy (only the counter
+          substitution, an identical-typed rewrite, is refreshed), so that
+          restriction is lifted -- any resolved write-free non-trapping call is
+          admissible regardless of its parameter shapes. }
+        result:=true;
+      end;
+
+    { -OoMODREF write-disjoint generalisation of loop_is_modref_writefree_call for
+      -OoREASSOC: a resolved direct call whose mod/ref summary is EXACT (both the
+      per-formal by-ref mask and the per-static set are complete) and that CANNOT
+      TRAP, admitted even when it WRITES memory.
+
+      Soundness rests on the exact shape of the reassociation transform (see
+      treassoccontext.processloop): the reduction addend is copied as an
+      INDIVISIBLE BLOB into K partial accumulators, and the copies are evaluated
+      in COUNTER ORDER within each unrolled body ( expr(i); expr(i+1); ...;
+      expr(i+K-1); i+=K ), so across the whole loop the addend evaluations occur
+      in exactly the original order 0,1,2,... and exactly as many times.  The
+      transform therefore preserves the COUNT and ORDER of every side effect and
+      never reorders any memory access relative to another WITHIN or ACROSS
+      addend copies; the only thing it regroups is the summation of the (bit-
+      identical) addend VALUES.  Consequently a call's write in one copy feeds a
+      later copy's read at precisely the same point it would in the original loop
+      -- the "cross-addend interference" hazard a value-splitting reassociator
+      would face does not arise here.  The reduction's own state (the accumulator
+      and the loop counter) is a non-address-taken local no callee can name, and
+      the loop bounds are captured into temps once (as the for-loop itself
+      evaluates them), so a writing addend call cannot corrupt the control state.
+      Non-trapping is still required: a mid-loop trap would expose the scattered
+      partial sums (not yet combined) to an outer handler, a state the original
+      loop never has.  The exact-summary requirement is the conservative gate --
+      only calls whose full footprint (d)/(e) characterise are admitted.
+
+      NOTE (recorded in the tasklist MODREF entry): because order/count are
+      preserved, DISJOINTNESS of the write footprint is not actually the operative
+      safety condition here -- non-trapping is.  This function is the conservative
+      exact-summary subset of the sound set; it is validated adversarially by
+      unleashed/tests/reassoc_modref_check.sh (a call that writes AND reads the
+      same globals, and a two-call addend where one call writes what the other
+      reads, both split bit-exactly against the serial reference). }
+    function loop_is_modref_reorderable_call(n : tnode) : boolean;
+      var
+        pd : tprocdef;
+      begin
+        result:=false;
+        if not(cs_opt_modref in current_settings.optimizerswitches) then
+          exit;
+        pd:=loop_call_target(n);
+        if not(assigned(pd) and modref_summary_available(pd) and
+               pd.modref_pmask_exact and pd.modref_smask_exact and
+               not modref_pd_can_trap(pd)) then
+          exit;
+        result:=true;
       end;
 
     type
@@ -246,6 +399,24 @@ unit optloop;
                     { create block statement }
                     result:=internalstatements(newforstatement);
                     addstatement(newforstatement,unrollblock);
+                    { The fully-unrolled body dropped the loop counter: its reads
+                      were rewritten to constants and the for-node is gone, so the
+                      counter variable is now never assigned.  A stand-alone
+                      for-loop leaves the counter at its last iterated value (the
+                      `to' bound t1) when it ran.  Unless that exit value is known
+                      dead (lnf_dont_mind_loopvar_on_exit -- set by objfpc/delphi's
+                      undefined-on-exit rule at parse time, or by DFA once it has
+                      proved the counter unused after the loop), restore it so a
+                      post-loop read of an escaping counter (mode unleashed keeps
+                      the counter live across the exit) still sees the right value.
+                      counts>=1 means the loop actually ran; a zero-trip loop
+                      leaves the counter untouched, exactly as a real for-loop
+                      would, so no fixup is emitted for it. }
+                    if (counts>=1) and
+                       not(lnf_dont_mind_loopvar_on_exit in tfornode(node).loopflags) then
+                      addstatement(newforstatement,
+                        cassignmentnode.create_internal(tfornode(node).left.getcopy,
+                          tfornode(node).t1.getcopy));
                     doinlinesimplify(result);
                   end;
               end
@@ -1250,7 +1421,19 @@ unit optloop;
           expr : tnode;
         end;
         changed : boolean;
+        { -OoPURE nothrow consumer: true when the loop body writes NO memory
+          (only locals / non-address-taken temps), computed once per loop in
+          processloop. Lets a proven MEM-PURE + NOTHROW loop-invariant call be
+          hoisted even though it reads globals: with no memory written in the
+          loop its global reads are invariant, and nothrow makes the zero-trip
+          speculation into the preheader sound. }
+        loopmaywrite : boolean;
+        { the loop body node (tfornode.t2 / twhilerepeatnode.right), stashed for
+          the -OoMODREF per-location hoist scan in modref_call_hoistable }
+        loopbody : tnode;
         function is_pure_invariant(expr : tnode) : boolean;
+        function nothrow_call_hoistable(expr : tnode) : boolean;
+        function modref_call_hoistable(expr : tnode) : boolean;
         function find_existing_hoist(n : tnode) : ttempcreatenode;
         function hoistcandidate(var n : tnode) : foreachnoderesult;
         procedure processloop(var n : tnode);
@@ -1377,6 +1560,350 @@ unit optloop;
       end;
 
 
+    { does writing to l-value L touch memory observable outside the frame?
+      (a static/global, a by-reference parameter, or a pointer deref). A store
+      to a plain local / non-address-taken temp is NOT. Mirrors optpure's
+      lvalue_write_is_side_effect, kept local to optloop. }
+    function licm_lvalue_writes_memory(t : tnode) : boolean;
+      var
+        sym : tsym;
+      begin
+        result:=true;
+        while assigned(t) do
+          case t.nodetype of
+            typeconvn: t:=ttypeconvnode(t).left;
+            subscriptn: t:=tsubscriptnode(t).left;
+            vecn: t:=tvecnode(t).left;
+            temprefn: exit(false);
+            derefn: exit(true);
+            loadn:
+              begin
+                sym:=tloadnode(t).symtableentry;
+                if sym is tstaticvarsym then
+                  exit(true)
+                else if sym is tparavarsym then
+                  begin
+                    if (vo_is_self in tparavarsym(sym).varoptions) then
+                      exit(true);
+                    if (tparavarsym(sym).varspez in [vs_var,vs_out,vs_constref]) and
+                       not(vo_is_funcret in tparavarsym(sym).varoptions) then
+                      exit(true)
+                    else
+                      exit(false);
+                  end
+                else if sym is tlocalvarsym then
+                  exit(false)
+                else
+                  exit(true);
+              end;
+            else
+              exit(true);
+          end;
+      end;
+
+
+    { conservative "this node writes memory" test for the loop-body scan below.
+      Over-reporting only DISABLES the nothrow hoist (never enables an unsound
+      one), so anything not obviously local-only counts as a write. }
+    function licm_writes_memory_cb(var n : tnode; arg : pointer) : foreachnoderesult;
+      var
+        pd : tprocdef;
+        para : tcallparanode;
+      begin
+        result:=fen_false;
+        case n.nodetype of
+          asmn:
+            begin pboolean(arg)^:=true; result:=fen_norecurse_true; end;
+          calln:
+            begin
+              { a call writes no memory only if -OoPURE proved it MEM-PURE
+                (const/pure both imply mem-pure); anything else may store }
+              pd:=loop_call_target(n);
+              if not(assigned(pd) and proc_is_mempure(pd)) then
+                begin pboolean(arg)^:=true; result:=fen_norecurse_true; end;
+            end;
+          assignn:
+            if licm_lvalue_writes_memory(tassignmentnode(n).left) then
+              begin pboolean(arg)^:=true; result:=fen_norecurse_true; end;
+          derefn:
+            if ([nf_write,nf_modify]*n.flags)<>[] then
+              begin pboolean(arg)^:=true; result:=fen_norecurse_true; end;
+          inlinen:
+            case tinlinenode(n).inlinenumber of
+              in_inc_x,in_dec_x,in_succ_x,in_pred_x:
+                { in-place ordinal step: a memory write only if the mutated
+                  target is externally observable }
+                begin
+                  para:=tcallparanode(tinlinenode(n).left);
+                  while assigned(para) do
+                    begin
+                      if assigned(para.left) and
+                         (([nf_write,nf_modify]*para.left.flags)<>[]) and
+                         licm_lvalue_writes_memory(para.left) then
+                        begin pboolean(arg)^:=true; result:=fen_norecurse_true; end;
+                      para:=tcallparanode(para.right);
+                    end;
+                end;
+              else
+                { any other intrinsic (setlength/new/dispose/I/O/...) -> assume
+                  it may write memory }
+                begin pboolean(arg)^:=true; result:=fen_norecurse_true; end;
+            end;
+          else
+            ;
+        end;
+      end;
+
+
+    { -OoMODREF per-location hoist/sink support -------------------------------
+
+      A resolved direct call proven by -OoMODREF to WRITE NO MEMORY, to be
+      NON-TRAPPING, and to READ only a KNOWN, EXACT set of static variables
+      (never through a by-ref parameter) is a candidate for relocation (LICM
+      speculatively into the preheader; SINK conditionally into an if-arm) even
+      when the surrounding region is NOT globally memory-write-free.  The one
+      remaining obligation -- that the call reads the SAME value at the relocated
+      position as it would in place -- reduces to: no store in the RELEVANT
+      REGION (the loop body for LICM, the intervening if-condition for SINK)
+      writes any static the call reads.  This is exactly the per-static (item
+      (d)) footprint precision: modref_call_may_access_static(cn,s,false) answers
+      "may this call read static s".  So we walk the region and, for every store
+      it performs, reject if the call may read that store's target.
+
+      Store classification per node (over-reporting only DISABLES the relocation,
+      never enables an unsound one, so anything unattributable counts as a
+      conflict):
+        * a store to a plain LOCAL/temp/by-value param  -> no conflict (the call,
+          reading no by-ref actual, cannot name a caller local);
+        * a store to a nameable STATIC S               -> conflict iff the call
+          may read S;
+        * a store to anything else (deref/heap/self/by-ref target, asm, an
+          opaque or non-write-free call, an unknown intrinsic) -> conflict. }
+    type
+      tmodrefregionconflict = record
+        cn : tcallnode;
+        conflict : boolean;
+      end;
+      pmodrefregionconflict = ^tmodrefregionconflict;
+
+    { classify a store l-value's base: 0=local/temp (unnameable by a callee),
+      1=a specific named static (returned in S), 2=other observable memory
+      (deref / self / by-ref param / anything unattributable). Mirrors
+      licm_lvalue_writes_memory but also yields the static base. }
+    function licm_lvalue_static_base(t : tnode; out s : tstaticvarsym) : byte;
+      var
+        sym : tsym;
+      begin
+        result:=2;
+        s:=nil;
+        while assigned(t) do
+          case t.nodetype of
+            typeconvn: t:=ttypeconvnode(t).left;
+            subscriptn: t:=tsubscriptnode(t).left;
+            vecn: t:=tvecnode(t).left;
+            temprefn: exit(0);
+            derefn: exit(2);
+            loadn:
+              begin
+                sym:=tloadnode(t).symtableentry;
+                if sym is tstaticvarsym then
+                  begin
+                    s:=tstaticvarsym(sym);
+                    exit(1);
+                  end
+                else if sym is tparavarsym then
+                  begin
+                    if (vo_is_self in tparavarsym(sym).varoptions) then
+                      exit(2);
+                    if (tparavarsym(sym).varspez in [vs_var,vs_out,vs_constref]) and
+                       not(vo_is_funcret in tparavarsym(sym).varoptions) then
+                      exit(2)
+                    else
+                      exit(0);
+                  end
+                else if sym is tlocalvarsym then
+                  exit(0)
+                else
+                  exit(2);
+              end;
+            else
+              exit(2);
+          end;
+      end;
+
+    { one store target: no conflict for a local/temp, per-static query for a
+      named static, conflict for anything else }
+    procedure modref_region_note_store(pc : pmodrefregionconflict; lval : tnode);
+      var
+        s : tstaticvarsym;
+      begin
+        case licm_lvalue_static_base(lval,s) of
+          0: ; { local/temp/by-value param: unnameable, no conflict }
+          1: if modref_call_may_access_static(pc^.cn,s,false) then
+               pc^.conflict:=true;
+          else
+            pc^.conflict:=true;
+        end;
+      end;
+
+    { region walk: flags conflict:=true iff the region may write a location the
+      call pc^.cn may read (see the block comment above) }
+    function modref_region_conflict_cb(var n : tnode; arg : pointer) : foreachnoderesult;
+      var
+        pc : pmodrefregionconflict;
+        pd : tprocdef;
+        para : tcallparanode;
+      begin
+        result:=fen_false;
+        pc:=pmodrefregionconflict(arg);
+        case n.nodetype of
+          asmn:
+            begin pc^.conflict:=true; result:=fen_norecurse_true; end;
+          calln:
+            begin
+              { a region call writes no memory the outer call could read only if
+                -OoMODREF proved it writes NO memory at all; anything else may
+                store a static cn reads }
+              pd:=loop_call_target(n);
+              if not(assigned(pd) and modref_summary_available(pd) and
+                     (pd.modref_writes=mr_none)) then
+                begin pc^.conflict:=true; result:=fen_norecurse_true; end;
+            end;
+          assignn:
+            modref_region_note_store(pc,tassignmentnode(n).left);
+          derefn:
+            if ([nf_write,nf_modify]*n.flags)<>[] then
+              begin pc^.conflict:=true; result:=fen_norecurse_true; end;
+          inlinen:
+            case tinlinenode(n).inlinenumber of
+              in_inc_x,in_dec_x,in_succ_x,in_pred_x:
+                begin
+                  para:=tcallparanode(tinlinenode(n).left);
+                  while assigned(para) do
+                    begin
+                      if assigned(para.left) and
+                         (([nf_write,nf_modify]*para.left.flags)<>[]) then
+                        modref_region_note_store(pc,para.left);
+                      para:=tcallparanode(para.right);
+                    end;
+                end;
+              else
+                { any other intrinsic (setlength/new/dispose/I/O/...) may write }
+                begin pc^.conflict:=true; result:=fen_norecurse_true; end;
+            end;
+          else
+            ;
+        end;
+        if pc^.conflict then
+          result:=fen_norecurse_true;
+      end;
+
+    { true iff no store in REGION may write any location CN may read }
+    function modref_region_stable_for_call(region : tnode; cn : tcallnode) : boolean;
+      var
+        ctx : tmodrefregionconflict;
+      begin
+        ctx.cn:=cn;
+        ctx.conflict:=false;
+        if assigned(region) then
+          foreachnodestatic(pm_postprocess,region,@modref_region_conflict_cb,@ctx);
+        result:=not ctx.conflict;
+      end;
+
+    { -OoPURE nothrow consumer: a resolved DIRECT call to a routine proved
+      MEM-PURE (writes no memory; may read globals) AND NOTHROW (cannot raise or
+      trap), whose every argument is loop-invariant, is hoistable into the
+      preheader when the loop body writes no memory (so the globals it reads are
+      loop-invariant). It is NOT admitted by licm_is_pure_invariant, which
+      requires the stronger CONST verdict; here the NOTHROW bit -- tracked
+      independently of purity -- supplies exactly the "safe to speculate into a
+      possibly zero-trip preheader" guarantee that CONST otherwise stood in for.
+      A MEM-PURE call that may still TRAP (e.g. `100 div g`) is correctly
+      rejected here by the nothrow check. }
+    function tlicmcontext.nothrow_call_hoistable(expr : tnode) : boolean;
+      var
+        pd : tprocdef;
+        para : tcallparanode;
+      begin
+        result:=false;
+        if (expr.nodetype<>calln) or loopmaywrite then
+          exit;
+        if not licm_simple_type(expr.resultdef) then
+          exit;
+        if ([nf_write,nf_modify]*expr.flags)<>[] then
+          exit;
+        pd:=loop_call_target(expr);
+        if not assigned(pd) then
+          exit;
+        { const calls are already handled (and hoisted) by is_pure_invariant;
+          this path is for the strictly weaker mem-pure+nothrow case }
+        if not(proc_is_mempure(pd) and proc_is_nothrow(pd)) then
+          exit;
+        para:=tcallparanode(tcallnode(expr).left);
+        while assigned(para) do
+          begin
+            if not licm_is_pure_invariant(loopdefsum,para.paravalue) then
+              exit;
+            para:=tcallparanode(para.nextpara);
+          end;
+        result:=true;
+      end;
+
+
+    { -OoMODREF per-location consumer: a resolved DIRECT call proved by -OoMODREF
+      to WRITE NO memory, to be NON-TRAPPING and to READ only an EXACT set of
+      static variables (never through a by-ref parameter), whose every argument
+      is loop-invariant, is hoistable into the preheader when the LOOP BODY does
+      not write any static the call reads.  Unlike nothrow_call_hoistable this
+      does NOT require the whole loop to be memory-write-free: the loop may store
+      freely to locals and to statics DISJOINT from the call's read set (item (d)
+      per-static footprint).  It also reaches routines -OoPURE cannot prove
+      mem-pure (e.g. one that takes the address of a local, or calls an impure
+      but write-free helper) but that -OoMODREF summarises as writes=none.  The
+      writes=none + non-trapping combination makes the speculative preheader
+      evaluation -- even for a zero-trip loop -- unobservable. }
+    function tlicmcontext.modref_call_hoistable(expr : tnode) : boolean;
+      var
+        pd : tprocdef;
+        para : tcallparanode;
+      begin
+        result:=false;
+        if not(cs_opt_modref in current_settings.optimizerswitches) then
+          exit;
+        if expr.nodetype<>calln then
+          exit;
+        if not licm_simple_type(expr.resultdef) then
+          exit;
+        if ([nf_write,nf_modify]*expr.flags)<>[] then
+          exit;
+        pd:=loop_call_target(expr);
+        if not assigned(pd) or not modref_summary_available(pd) then
+          exit;
+        { writes nothing, cannot trap, exact per-formal and per-static masks }
+        if (pd.modref_writes<>mr_none) or modref_pd_can_trap(pd) then
+          exit;
+        if not(pd.modref_pmask_exact and pd.modref_smask_exact) then
+          exit;
+        { reads no memory through any by-ref parameter (so its reads are exactly
+          the static set, which the region scan reasons about per location); a
+          by-ref read of a caller local could not be proven stable against the
+          loop's local stores }
+        if pd.modref_reads_pmask<>0 then
+          exit;
+        { every actual is a pure loop-invariant by-value value (a by-ref actual
+          is address-taken and so is rejected here, keeping reads_pmask=0 honest) }
+        para:=tcallparanode(tcallnode(expr).left);
+        while assigned(para) do
+          begin
+            if not licm_is_pure_invariant(loopdefsum,para.paravalue) then
+              exit;
+            para:=tcallparanode(para.nextpara);
+          end;
+        { the loop body must not write any static the call reads }
+        result:=modref_region_stable_for_call(loopbody,tcallnode(expr));
+      end;
+
+
     function tlicmcontext.find_existing_hoist(n : tnode) : ttempcreatenode;
       var
         i : sizeint;
@@ -1410,8 +1937,15 @@ unit optloop;
           exit;
         if ([nf_write,nf_modify]*n.flags)<>[] then
           exit;
+        { is_pure_invariant covers const calls; a strictly weaker MEM-PURE +
+          NOTHROW loop-invariant call is also hoistable when the loop writes no
+          memory (nothrow_call_hoistable); and -OoMODREF hoists a write-free +
+          non-trapping call whose static reads the loop body does not write, even
+          when the loop DOES write other memory (modref_call_hoistable) }
         if not is_pure_invariant(n) then
-          exit;
+          if not nothrow_call_hoistable(n) then
+            if not modref_call_hoistable(n) then
+              exit;
 
         { a purely constant arithmetic expression is already folded; require at
           least one variable read so we actually save work. A call is always
@@ -1433,6 +1967,21 @@ unit optloop;
             do_firstpass(n);
             result:=fen_norecurse_false;
             exit;
+          end;
+
+        { -OoREPORT: a call hoisted via one of the two relaxations
+          (is_pure_invariant said no, i.e. it is not CONST) -- name which
+          consumer admitted it. nothrow_call_hoistable is tried first, so a call
+          it rejects was admitted by the -OoMODREF per-location path. }
+        if (cs_opt_report in current_settings.optimizerswitches) and
+           (n.nodetype=calln) and not is_pure_invariant(n) then
+          begin
+            if nothrow_call_hoistable(n) then
+              OptRemark(n.fileinfo,'licm',
+                'hoisted a proven mem-pure + NOTHROW loop-invariant call into the preheader (-OoPURE nothrow attribute)')
+            else
+              OptRemark(n.fileinfo,'licm',
+                'hoisted a proven -OoMODREF write-free + non-trapping loop-invariant call into the preheader (its static reads are not written in the loop)');
           end;
 
         if not assigned(inittemps) then
@@ -1481,17 +2030,33 @@ unit optloop;
           exit;
         loopdefsum:=n.optinfo^.defsum;
 
+        { -OoPURE nothrow consumer: does the loop body write any memory? (only
+          relevant with -OoPURE; the scan is cheap and gates nothrow_call_hoistable) }
+        loopmaywrite:=false;
+        if cs_opt_pure in current_settings.optimizerswitches then
+          begin
+            if n.nodetype=forn then
+              foreachnodestatic(pm_postprocess,tfornode(n).t2,@licm_writes_memory_cb,@loopmaywrite)
+            else
+              foreachnodestatic(pm_postprocess,twhilerepeatnode(n).right,@licm_writes_memory_cb,@loopmaywrite);
+          end
+        else
+          loopmaywrite:=true;
+
         inittemps:=nil;
         deletetemps:=nil;
         initstatements:=nil;
         deletestatements:=nil;
         nhoists:=0;
 
-        { walk the loop body top-down so the largest invariant subtree wins }
+        { stash the loop body for the -OoMODREF per-location hoist scan }
         if n.nodetype=forn then
-          foreachnodestatic(pm_preprocess,tfornode(n).t2,@licm_hoistcandidate_callback,@self)
+          loopbody:=tfornode(n).t2
         else
-          foreachnodestatic(pm_preprocess,twhilerepeatnode(n).right,@licm_hoistcandidate_callback,@self);
+          loopbody:=twhilerepeatnode(n).right;
+
+        { walk the loop body top-down so the largest invariant subtree wins }
+        foreachnodestatic(pm_preprocess,loopbody,@licm_hoistcandidate_callback,@self);
 
         if not assigned(inittemps) then
           exit;
@@ -1506,6 +2071,7 @@ unit optloop;
         addstatement(newstatements,oldn);
         addstatement(newstatements,deletetemps);
         n:=newn;
+        OptRemark(oldn.fileinfo,'licm','hoisted '+tostr(nhoists)+' loop-invariant expression(s) into the preheader');
       end;
 
 
@@ -2510,22 +3076,26 @@ unit optloop;
           whilerepeatn:
             if bitidiom_try(n) then
               begin
+                OptRemark(n.fileinfo,'bitidiom','clear-lowest-set-bit loop rewritten to the PopCnt intrinsic');
                 pboolean(arg)^:=true;
                 result:=fen_norecurse_false;
               end
             else if bitidiom_bsr_try(n) then
               begin
+                OptRemark(n.fileinfo,'bitidiom','highest-set-bit loop rewritten to the Bsr intrinsic');
                 pboolean(arg)^:=true;
                 result:=fen_norecurse_false;
               end;
           ifn:
             if bitidiom_tzcnt_try(n) then
               begin
+                OptRemark(n.fileinfo,'bitidiom','lowest-set-bit index rewritten to the Bsf/tzcnt intrinsic');
                 pboolean(arg)^:=true;
                 result:=fen_norecurse_false;
               end
             else if bitidiom_bsr_try(n) then
               begin
+                OptRemark(n.fileinfo,'bitidiom','highest-set-bit loop rewritten to the Bsr intrinsic');
                 pboolean(arg)^:=true;
                 result:=fen_norecurse_false;
               end;
@@ -2942,6 +3512,252 @@ unit optloop;
     const
       vect_vecwidth = 4;   { single lanes per 128-bit SSE packed op }
 
+    var
+      { fresh-name counter for the field-base snapshot temps created by the
+        element-wise vectorizer (see vect_field_base / the builder hoist) }
+      vect_fieldbase_seq : longint;
+
+    function vect_want_ymm : boolean;
+      { true when the AVX-256 (ymm) autovectorization width is requested
+        (-OoVECT256) AND the target fputype actually has an AVX unit, so the
+        128-bit windows can be safely widened to 256-bit. Only x86 has the
+        ymm-capable backend node; every other target keeps 128-bit. }
+      begin
+{$if defined(i386) or defined(x86_64)}
+        vect_want_ymm:=(cs_opt_vect256 in current_settings.optimizerswitches) and
+          (FPUX86_HAS_AVXUNIT in fpu_capabilities[current_settings.fputype]);
+{$else}
+        vect_want_ymm:=false;
+{$endif}
+      end;
+
+    function vect_transc_want_ymm : boolean;
+      { -OoAPPROXTRANS at 256-bit (ymm) width. The inline packed expf builds 2^n
+        by inserting the biased exponent into the IEEE field with packed 32-bit
+        integer add/shift (paddd + pslld); at 256-bit those are VPADDD/VPSLLD ymm,
+        which are AVX2 instructions -- an AVX-only unit can widen the float ops
+        (VMULPS/VADDPS/... ymm are AVX1) but NOT the integer exponent build. So the
+        transcendental body only widens to ymm when -OoVECT256 is requested AND the
+        fputype has an AVX2 unit; otherwise it stays at the SSE2-safe 128-bit (VL=4)
+        width regardless of VECT256. }
+      begin
+{$if defined(i386) or defined(x86_64)}
+        vect_transc_want_ymm:=vect_want_ymm and
+          (FPUX86_HAS_AVX2 in fpu_capabilities[current_settings.fputype]);
+{$else}
+        vect_transc_want_ymm:=false;
+{$endif}
+      end;
+
+    function vect_int8dot_want_ymm : boolean;
+      { -OoINT8DOT at 256-bit (ymm) width.  The widening MAC uses vpmovsxbw,
+        vpmaddwd and vpaddd at ymm width -- all AVX2 instructions -- so the int8
+        dot product only widens to 16 elements/iteration when -OoVECT256 is
+        requested AND the fputype has an AVX2 unit; otherwise it stays at the
+        128-bit (8 elements/iteration) width, which runs on the SSE2 baseline. }
+      begin
+{$if defined(i386) or defined(x86_64)}
+        vect_int8dot_want_ymm:=(cs_opt_vect256 in current_settings.optimizerswitches) and
+          (FPUX86_HAS_AVX2 in fpu_capabilities[current_settings.fputype]);
+{$else}
+        vect_int8dot_want_ymm:=false;
+{$endif}
+      end;
+
+    function vect_int8_elem_reason(n : tnode; counter : tabstractvarsym; out vec : tvecnode) : string;
+      { -OoINT8DOT: returns '' and sets vec if n (after peeling typeconv wrappers)
+        is  A[i]  where A is a simple non-aliased dynamic array of shortint (signed
+        8-bit) and the index is exactly a plain read of the loop counter; otherwise
+        a human-readable reason. }
+      var
+        vn, idx : tnode;
+        eledef : tdef;
+      begin
+        result:='';
+        vec:=nil;
+        vn:=rangeelim_skip_typeconv(n);
+        if not assigned(vn) or (vn.nodetype<>vecn) then
+          exit('operand is not an array-element access');
+        if not assigned(tvecnode(vn).left) or not assigned(tvecnode(vn).left.resultdef) then
+          exit('array base has no known type');
+        if not assigned(rangeelim_simple_var(tvecnode(vn).left)) then
+          exit('array base is not a simple non-aliased variable (possible aliasing)');
+        if not is_dynamic_array(tvecnode(vn).left.resultdef) then
+          exit('array is not a dynamic array');
+        eledef:=tarraydef(tvecnode(vn).left.resultdef).elementdef;
+        if not assigned(eledef) or (eledef.typ<>orddef) or (torddef(eledef).ordtype<>s8bit) then
+          exit('array element type is not shortint (signed 8-bit)');
+        idx:=rangeelim_skip_typeconv(tvecnode(vn).right);
+        if not assigned(idx) or (idx.nodetype<>loadn) then
+          exit('array index is not a plain variable read');
+        if ([nf_write,nf_modify]*idx.flags)<>[] then
+          exit('array index expression has side effects');
+        if tloadnode(idx).symtableentry<>tsym(counter) then
+          exit('array index is not the loop counter (non-unit stride or offset)');
+        vec:=tvecnode(vn);
+      end;
+
+    function vect_stable_ref_sym(n : tnode) : tabstractvarsym;
+      { the sym referenced if n is a plain load of a provably-stable object/class
+        reference through which an INVARIANT field may be hoisted: the implicit
+        Self parameter, or a simple non-aliased (non-address-taken, non-different-
+        scope, non-volatile) local variable / value-parameter.  nil otherwise.
+        The reference is the *handle* (Self, or a local class/object reference);
+        the caller additionally proves the loop reassigns neither the handle nor
+        (via the no-call gate) the field it names, so the field load is loop-
+        invariant and may be snapshotted once into the preheader. }
+      var
+        sym : tsym;
+        avs : tabstractvarsym;
+      begin
+        result:=nil;
+        if not assigned(n) or (n.nodetype<>loadn) then
+          exit;
+        sym:=tloadnode(n).symtableentry;
+        if not(sym is tabstractvarsym) then
+          exit;
+        avs:=tabstractvarsym(sym);
+        if avs.addr_taken or avs.different_scope then
+          exit;
+        if (vo_volatile in avs.varoptions) or (vo_is_thread_var in avs.varoptions) then
+          exit;
+        { the implicit Self parameter (a class pointer / object reference) }
+        if is_self_node(n) then
+          begin
+            result:=avs;
+            exit;
+          end;
+        { or a simple non-aliased local / value-parameter object|class reference }
+        if not(avs.typ in [localvarsym,paravarsym]) then
+          exit;
+        if (avs.typ=paravarsym) and (tparavarsym(avs).varspez<>vs_value) then
+          exit;
+        result:=avs;
+      end;
+
+
+    function vect_field_base(base : tnode; out refsym : tabstractvarsym) : tfieldvarsym;
+      { if base is  <stable-ref>.<field>  -- a subscript of a dynamic-array field
+        through a provably-stable reference (Self or a simple local/value-param,
+        per vect_stable_ref_sym) -- return that field sym and set refsym to the
+        reference's sym; otherwise nil.  This is the  Self.FData -style object-
+        field dynamic-array base the plain rangeelim_simple_var rule rejects. }
+      begin
+        result:=nil;
+        refsym:=nil;
+        if not assigned(base) or (base.nodetype<>subscriptn) then
+          exit;
+        if not assigned(base.resultdef) or not is_dynamic_array(base.resultdef) then
+          exit;
+        refsym:=vect_stable_ref_sym(tsubscriptnode(base).left);
+        if not assigned(refsym) then
+          exit;
+        result:=tsubscriptnode(base).vs;
+      end;
+
+
+    function vect_array_base_ok(base : tnode) : boolean;
+      { the array base is acceptable to the element-wise vectorizer / gather if it
+        is a simple non-aliased local/param variable (rangeelim_simple_var) OR a
+        provably-invariant object-field access (vect_field_base) which the builder
+        pre-hoists into a preheader temp so the recognizer's simple-var machinery
+        applies unchanged.  The field case is only sound under the extra whole-loop
+        gates (no call, reference not reassigned) checked once in vectorize_reason. }
+      var
+        rsym : tabstractvarsym;
+      begin
+        vect_array_base_ok:=assigned(rangeelim_simple_var(base)) or
+                            assigned(vect_field_base(base,rsym));
+      end;
+
+
+    function vect_gather_avx2 : boolean;
+      { -OoGATHER requires an AVX2 fputype: there is no SSE gather, so an indexed
+        load stays scalar unless the target has the vgatherdps/vpgatherdd unit.
+        This gates the whole shape (unlike VECT256, which only picks 128 vs 256). }
+      begin
+{$if defined(i386) or defined(x86_64)}
+        vect_gather_avx2:=(FPUX86_HAS_AVX2 in fpu_capabilities[current_settings.fputype]);
+{$else}
+        vect_gather_avx2:=false;
+{$endif}
+      end;
+
+    function vect_gather_elem_reason(n : tnode; counter : tabstractvarsym; out gvec : tvecnode; out ivec : tvecnode) : string;
+      { -OoGATHER: returns '' and sets gvec if n (after peeling typeconv wrappers)
+        is  a[idx[i]]  where a is a simple non-aliased dynamic array of single, idx
+        is a simple non-aliased dynamic array of signed 32-bit int, and the INNER
+        subscript idx[..] is exactly a plain read of the loop counter (unit stride).
+        The outer subscript idx[i] is a computed value, so this is the non-unit-
+        stride indexed load a plain vmovups cannot widen -- exactly what needs the
+        gather.  A contiguous a[i] (index = the plain counter) is deliberately NOT
+        matched here (it is the ordinary vok_reduce_sum shape). }
+      var
+        vn, idxaccess, inneridx : tnode;
+        aele, iele : tdef;
+      begin
+        result:='';
+        gvec:=nil;
+        ivec:=nil;
+        vn:=rangeelim_skip_typeconv(n);
+        if not assigned(vn) or (vn.nodetype<>vecn) then
+          exit('is not an array-element access');
+        if not assigned(tvecnode(vn).left) or not assigned(tvecnode(vn).left.resultdef) then
+          exit('gathered array base has no known type');
+        { gathered array a: simple non-aliased dynamic array of single, OR a
+          provably-invariant object-field dynamic array (Self.FData-style), which
+          the builder snapshots into a preheader temp under the whole-loop gates }
+        if not vect_array_base_ok(tvecnode(vn).left) then
+          exit('gathered array base is not a simple non-aliased variable or invariant object field (possible aliasing)');
+        if not is_dynamic_array(tvecnode(vn).left.resultdef) then
+          exit('gathered array is not a dynamic array');
+        aele:=tarraydef(tvecnode(vn).left.resultdef).elementdef;
+        if not is_single(aele) then
+          exit('gathered array element type is not single-precision float');
+        { the subscript must itself be an indexed load idx[i], NOT the plain counter }
+        idxaccess:=rangeelim_skip_typeconv(tvecnode(vn).right);
+        if not assigned(idxaccess) or (idxaccess.nodetype<>vecn) then
+          exit('subscript is not an indexed array read (a unit-stride load needs no gather)');
+        if not assigned(tvecnode(idxaccess).left) or not assigned(tvecnode(idxaccess).left.resultdef) then
+          exit('gather index array has no known type');
+        { index array idx: simple non-aliased dynamic array of signed 32-bit int,
+          OR a provably-invariant object-field dynamic array (Self.FData-style),
+          snapshotted into a preheader temp under the whole-loop gates }
+        if not vect_array_base_ok(tvecnode(idxaccess).left) then
+          exit('gather index array is not a simple non-aliased variable or invariant object field (possible aliasing)');
+        if not is_dynamic_array(tvecnode(idxaccess).left.resultdef) then
+          exit('gather index array is not a dynamic array');
+        iele:=tarraydef(tvecnode(idxaccess).left.resultdef).elementdef;
+        if not assigned(iele) or (iele.typ<>orddef) or (torddef(iele).ordtype<>s32bit) then
+          exit('gather index array element type is not longint (signed 32-bit)');
+        { the inner subscript must be exactly a plain read of the loop counter }
+        inneridx:=rangeelim_skip_typeconv(tvecnode(idxaccess).right);
+        if not assigned(inneridx) or (inneridx.nodetype<>loadn) then
+          exit('gather index subscript is not a plain variable read');
+        if ([nf_write,nf_modify]*inneridx.flags)<>[] then
+          exit('gather index subscript has side effects');
+        if tloadnode(inneridx).symtableentry<>tsym(counter) then
+          exit('gather index subscript is not the loop counter (non-unit stride or offset)');
+        gvec:=tvecnode(vn);
+        { the bare (typeconv-stripped) idx[i] vecn: the build needs its plain
+          reference &idx[i] to load the VF contiguous int32 index window, so it must
+          NOT be the typeconv-wrapped subscript of the outer a[...] node (that would
+          secondpass to a register value, not a memory reference) }
+        ivec:=tvecnode(idxaccess);
+      end;
+
+    function vect_widthtag : string;
+      { -OoREPORT width suffix: appended to the vectorize remark ONLY when the
+        256-bit ymm width was chosen (-OoVECT256 on an AVX fputype). The default
+        128-bit path appends nothing, so its remark stays byte-identical to the
+        pre-AVX-256 wording other tooling greps. }
+      begin
+        if vect_want_ymm then
+          vect_widthtag:=' width=ymm256'
+        else
+          vect_widthtag:='';
+      end;
+
     function vect_elem_reason(n : tnode; counter : tabstractvarsym; out vec : tvecnode) : string;
       { returns '' and sets vec to the vecn if n (after peeling typeconv wrappers)
         is  A[i]  where A is a simple non-aliased dynamic array of single and the
@@ -2958,9 +3774,11 @@ unit optloop;
           exit('operand is not an array-element access');
         if not assigned(tvecnode(vn).left) or not assigned(tvecnode(vn).left.resultdef) then
           exit('array base has no known type');
-        { the array must be a simple non-aliased dynamic array of single }
-        if not assigned(rangeelim_simple_var(tvecnode(vn).left)) then
-          exit('array base is not a simple non-aliased variable (possible aliasing)');
+        { the array must be a simple non-aliased dynamic array of single, OR a
+          provably-invariant object-field dynamic array (Self.FData-style), which
+          the builder snapshots into a preheader temp under the whole-loop gates }
+        if not vect_array_base_ok(tvecnode(vn).left) then
+          exit('array base is not a simple non-aliased variable or invariant object field (possible aliasing)');
         if not is_dynamic_array(tvecnode(vn).left.resultdef) then
           exit('array is not a dynamic array');
         if not is_single(tarraydef(tvecnode(vn).left.resultdef).elementdef) and
@@ -3091,6 +3909,22 @@ unit optloop;
       end;
 
 
+    function vect_call_cb(var n : tnode; arg : pointer) : foreachnoderesult;
+      { flags a real call node anywhere in the body: a method call could reassign
+        an object field, so an invariant-field array base cannot be hoisted past
+        one.  Only calln matters -- the field-base shapes never legitimately
+        contain a call, whereas inline nodes (min/max, fma) do not reassign
+        fields and are handled by the other shapes. }
+      begin
+        result:=fen_false;
+        if n.nodetype=calln then
+          begin
+            pboolean(arg)^:=true;
+            result:=fen_norecurse_true;
+          end;
+      end;
+
+
     type
       tvectorizecontext = object
         changed : boolean;
@@ -3106,6 +3940,8 @@ unit optloop;
         stmt, rhs : tnode;
         assign : tassignmentnode;
         avec, bvec, cvec : tvecnode;
+        gvec : tvecnode;       { -OoGATHER: the recognized a[idx[i]] indexed load }
+        ivec : tvecnode;       { -OoGATHER: the bare idx[i] index-array element access }
         vecop : TOpCG;
         vshape : tvectoropkind;
         vecdouble : boolean;   { false: single (VL=4); true: double (VL=2) }
@@ -3116,7 +3952,11 @@ unit optloop;
         hascheck : boolean;
         block, vecbody, scalbody : tnode;
         stat, vstat, sstat : tstatementnode;
-        lotemp, hitemp, splattemp, acctemp, seedtemp : ttempcreatenode;
+        lotemp, hitemp, splattemp, seedtemp : ttempcreatenode;
+        { register-resident reduction accumulator: the init node allocates the
+          shared context, the body/finish nodes attach to it }
+        redinit, redbody, redfin : tvectoropnode;
+        redctx : pvecreducectx;
         { reduction (single-precision sum / dot product) recognizer outputs }
         accsym : tabstractvarsym;
         redlhs, redla, redra, redexpr, redprod : tnode;
@@ -3129,6 +3969,14 @@ unit optloop;
         mmA_vec, mmB_vec : tvecnode;
         mmA_scalar, mmB_scalar : tnode;
         ismaxop : boolean;
+        { -OoAPPROXTRANS: which approximate transcendental the vok_transc body computes }
+        transfn : ttranscfunc;
+        { -OoAPPROXTRANS softmax shape: for  exp(b[i]-m)  this holds the
+          loop-invariant single scalar m (subtracted per lane before the packed
+          expf via a hoisted broadcast); nil for the bare  exp(b[i])  / sigmoid /
+          tanh shapes. }
+        transbias : tnode;
+        transbiassplat : ttempcreatenode;
         mminl : tinlinenode;
         splata, splatb : ttempcreatenode;
         windowa, windowb : tnode;
@@ -3142,6 +3990,251 @@ unit optloop;
           s:=rangeelim_skip_typeconv(x);
           red_is_acc:=assigned(s) and (s.nodetype=loadn) and
                       (tloadnode(s).symtableentry=tsym(accsym));
+        end;
+
+      { true if x, after peeling typeconv wrappers, is the floating-point
+        constant v (used to spot the 1.0 numerator/addend of a sigmoid shape) }
+      function fpconst_is(x : tnode; v : double) : boolean;
+        var s : tnode;
+        begin
+          s:=rangeelim_skip_typeconv(x);
+          fpconst_is:=assigned(s) and (s.nodetype=realconstn) and
+                      (trealconstnode(s).value_real=v);
+        end;
+
+      { -OoAPPROXTRANS: if n (a peeled RHS or sub-expression) is a call to the RTL
+        single-precision helper fpc_exp_real -- which the exp() inline node lowers
+        to in pass_1, BEFORE this loop pass runs -- return its argument value node
+        (peeled of typeconvs); otherwise nil.  This is how an exp() body is spotted
+        at the tree level the vectorizer sees. }
+      function exp_call_arg(n : tnode) : tnode;
+        var pn : tnode;
+        begin
+          exp_call_arg:=nil;
+          if not assigned(n) or (n.nodetype<>calln) then
+            exit;
+          if not assigned(tcallnode(n).procdefinition) or
+             not assigned(tprocdef(tcallnode(n).procdefinition).procsym) then
+            exit;
+          if upper(tprocdef(tcallnode(n).procdefinition).procsym.name)<>'FPC_EXP_REAL' then
+            exit;
+          pn:=tcallnode(n).left;
+          if not assigned(pn) or (pn.nodetype<>callparan) or
+             assigned(tcallparanode(pn).nextpara) then
+            exit;
+          exp_call_arg:=rangeelim_skip_typeconv(tcallparanode(pn).paravalue);
+        end;
+
+      { -OoAPPROXTRANS: if n is a one-argument call to the RTL math-unit routine
+        named rname (single->single overload), return its argument value node
+        (peeled of typeconvs); otherwise nil.  The owner-unit guard ('MATH')
+        avoids matching a user routine of the same name with other semantics.
+        Used for tanh(), which -- unlike exp() -- is an ordinary RTL function
+        call (no inline node) already present in the tree the vectorizer sees. }
+      function math_call_arg(n : tnode; const rname : string) : tnode;
+        var
+          pd : tprocdef;
+          pn : tnode;
+        begin
+          math_call_arg:=nil;
+          if not assigned(n) or (n.nodetype<>calln) then
+            exit;
+          pd:=tprocdef(tcallnode(n).procdefinition);
+          if not assigned(pd) or not assigned(pd.procsym) then
+            exit;
+          if upper(pd.procsym.name)<>rname then
+            exit;
+          if not assigned(pd.procsym.owner) or not assigned(pd.procsym.owner.name) or
+             (upper(pd.procsym.owner.name^)<>'MATH') then
+            exit;
+          if not assigned(pd.returndef) or not is_single(pd.returndef) then
+            exit;
+          pn:=tcallnode(n).left;
+          if not assigned(pn) or (pn.nodetype<>callparan) or
+             assigned(tcallparanode(pn).nextpara) then
+            exit;
+          math_call_arg:=rangeelim_skip_typeconv(tcallparanode(pn).paravalue);
+        end;
+
+      { -OoAPPROXTRANS: true if argn peels to  b[i]  (negate=false) or  -b[i]
+        (negate=true, accepting both a unary-minus and a 0-b[i] subtraction) where
+        b is a simple single-precision dynamic-array element of the loop counter;
+        on success bvec holds that element access. }
+      function elem_arg(argn : tnode; negate : boolean) : boolean;
+        var a : tnode;
+        begin
+          elem_arg:=false;
+          a:=rangeelim_skip_typeconv(argn);
+          if not assigned(a) then
+            exit;
+          if negate then
+            begin
+              if a.nodetype=unaryminusn then
+                a:=rangeelim_skip_typeconv(tunarynode(a).left)
+              else if (a.nodetype=subn) and fpconst_is(taddnode(a).left,0.0) then
+                a:=rangeelim_skip_typeconv(taddnode(a).right)
+              else
+                exit;
+            end;
+          if not assigned(a) or (vect_elem_reason(a,counter,bvec)<>'') then
+            exit;
+          if vect_elem_isdouble(bvec) then
+            exit;
+          elem_arg:=true;
+        end;
+
+      { -OoAPPROXTRANS softmax shape: true if argn peels to  b[i] - m  where b is a
+        simple single-precision dynamic-array element of the loop counter and m is a
+        provably loop-invariant single scalar (the row/vector max the caller
+        subtracts for numerical stability before exp).  On success bvec holds the
+        element access and transbias holds the scalar m (broadcast once and
+        subtracted per lane before the packed expf). The exp argument is thus not a
+        bare element, which the plain elem_arg path (correctly) declines. }
+      function elem_minus_scalar(argn : tnode) : boolean;
+        var a : tnode;
+        begin
+          elem_minus_scalar:=false;
+          a:=rangeelim_skip_typeconv(argn);
+          if not assigned(a) or (a.nodetype<>subn) then
+            exit;
+          { left must be b[i], a single-precision element of the loop counter }
+          if vect_elem_reason(taddnode(a).left,counter,bvec)<>'' then
+            exit;
+          if vect_elem_isdouble(bvec) then
+            exit;
+          { right must be a provably loop-invariant single scalar }
+          if vect_invariant_scalar_reason(taddnode(a).right,counter,false)<>'' then
+            exit;
+          transbias:=taddnode(a).right;
+          elem_minus_scalar:=true;
+        end;
+
+      { -OoAPPROXTRANS: recognize an approximate single-precision transcendental
+        activation body and, on a full match, set vshape:=vok_transc, transfn and
+        bvec (the source array element) and return true.  Returns false (fall
+        through to the other RHS shapes) when the body is not one of these forms.
+        Recognized (exp() has already been lowered to an fpc_exp_real call):
+          exp:      a[i] := exp(b[i])
+          softmax:  a[i] := exp(b[i]-m)  (m loop-invariant single scalar, set
+                    into transbias and subtracted per lane before the packed expf)
+          tanh:     a[i] := tanh(b[i])
+          sigmoid:  a[i] := 1/(1+exp(-b[i])) }
+      function try_transc : boolean;
+        var
+          den, e1, e2, arg : tnode;
+        begin
+          try_transc:=false;
+          { approximate transcendentals are single-precision only }
+          if vecdouble or not assigned(rhs) then
+            exit;
+          { exp:  a[i] := exp(b[i])  or the softmax shape  a[i] := exp(b[i]-m) }
+          arg:=exp_call_arg(rhs);
+          if assigned(arg) then
+            begin
+              if elem_arg(arg,false) or elem_minus_scalar(arg) then
+                begin
+                  transfn:=tf_exp;
+                  vshape:=vok_transc;
+                  try_transc:=true;
+                end;
+              exit;
+            end;
+          { tanh:  a[i] := tanh(b[i])  (RTL math-unit single overload) }
+          arg:=math_call_arg(rhs,'TANH');
+          if assigned(arg) then
+            begin
+              if elem_arg(arg,false) then
+                begin
+                  transfn:=tf_tanh;
+                  vshape:=vok_transc;
+                  try_transc:=true;
+                end;
+              exit;
+            end;
+          { sigmoid:  a[i] := 1/(1+exp(-b[i]))  ( slashn: 1.0 / (1.0 + exp(-b[i])) ) }
+          if rhs.nodetype=slashn then
+            begin
+              if not fpconst_is(taddnode(rhs).left,1.0) then
+                exit;
+              den:=rangeelim_skip_typeconv(taddnode(rhs).right);
+              if not assigned(den) or (den.nodetype<>addn) then
+                exit;
+              e1:=rangeelim_skip_typeconv(taddnode(den).left);
+              e2:=rangeelim_skip_typeconv(taddnode(den).right);
+              if fpconst_is(taddnode(den).left,1.0) then
+                arg:=exp_call_arg(e2)
+              else if fpconst_is(taddnode(den).right,1.0) then
+                arg:=exp_call_arg(e1)
+              else
+                exit;
+              if assigned(arg) and elem_arg(arg,true) then
+                begin
+                  transfn:=tf_sigmoid;
+                  vshape:=vok_transc;
+                  try_transc:=true;
+                end;
+              exit;
+            end;
+        end;
+
+      { Whole-loop gate for an object-field array base (Self.FData-style, accepted
+        by vect_array_base_ok / hoisted by the builder).  Returns '' when either no
+        recognized base is a field access, or every field base is provably loop-
+        invariant: the body makes NO call (a method could reassign the field) and
+        the base reference itself is never reassigned in the body (DFA).  Since the
+        body is exactly one assignment whose only write is the recognized target
+        (an array element or the scalar accumulator, never the field handle), the
+        reference-reassignment check is belt-and-suspenders; the no-call gate is
+        the load-bearing one.  Runs on the ORIGINAL (un-hoisted) tree. }
+      function field_base_gate : string;
+        var
+          hascall : boolean;
+          defsum : tdfaset;
+
+        function base_ref_stable(vec : tvecnode) : boolean;
+          { true unless vec's base is a field access whose handle is reassigned in
+            the loop body }
+          var
+            rsym : tabstractvarsym;
+            refload : tnode;
+          begin
+            base_ref_stable:=true;
+            if not assigned(vec) then
+              exit;
+            if not assigned(vect_field_base(vec.left,rsym)) then
+              exit;
+            refload:=tsubscriptnode(vec.left).left;
+            if assigned(refload.optinfo) and DynSetIn(defsum,refload.optinfo^.index) then
+              base_ref_stable:=false;
+          end;
+
+        function is_field(vec : tvecnode) : boolean;
+          var rsym : tabstractvarsym;
+          begin
+            is_field:=assigned(vec) and assigned(vect_field_base(vec.left,rsym));
+          end;
+
+        begin
+          field_base_gate:='';
+          { nothing to gate unless some recognized base is an object field }
+          if not(is_field(avec) or is_field(bvec) or is_field(cvec) or
+                 is_field(mmA_vec) or is_field(mmB_vec) or
+                 is_field(gvec) or is_field(ivec)) then
+            exit;
+          { a call could reassign the field between iterations }
+          hascall:=false;
+          foreachnodestatic(pm_postprocess,forn.t2,@vect_call_cb,@hascall);
+          if hascall then
+            exit('array base is an object field but the loop body makes a call that could reassign it');
+          { the field handle (Self / the object reference) must not be reassigned }
+          CalcDefSum(forn.t2);
+          if not assigned(forn.t2.optinfo) then
+            exit('data-flow information is unavailable for the loop body');
+          defsum:=forn.t2.optinfo^.defsum;
+          if not(base_ref_stable(avec) and base_ref_stable(bvec) and base_ref_stable(cvec) and
+                 base_ref_stable(mmA_vec) and base_ref_stable(mmB_vec) and
+                 base_ref_stable(gvec) and base_ref_stable(ivec)) then
+            exit('object-field array base reference is reassigned in the loop');
         end;
 
       { Runs the full OptimizeVectorize recognizer over the current for-loop and
@@ -3203,6 +4296,8 @@ unit optloop;
           vecop:=OP_NONE;
           mmA_vec:=nil; mmB_vec:=nil; mmA_scalar:=nil; mmB_scalar:=nil;
           ismaxop:=false;
+          transfn:=tf_exp;
+          transbias:=nil;
 
           { REDUCTION shape:  s := s + b[i]  (sum)  or  s := s + b[i]*c[i]  (dot
             product), recognized before the element-wise store shapes because its
@@ -3215,6 +4310,62 @@ unit optloop;
             reduction the vectorizer took: the vectorizer wins with no ordering
             change (and the scalar tail is a while-loop, which REASSOC ignores). }
           redlhs:=rangeelim_skip_typeconv(assign.left);
+
+          { -OoINT8DOT: integer quantized dot product  acc := acc + a[i]*b[i]  where
+            a,b are shortint dynamic arrays and acc is an EXACTLY-32-bit integer
+            local.  Lowered to a widening vpmaddwd MAC.  Unlike the float reduction
+            it needs NO fast-math: integer addition is associative/commutative
+            modulo 2^32, so the packed partial-sum order is bit-identical to the
+            wrapping scalar reduction, and each shortint*shortint product is exact
+            in the 16->32 widening.  A 64-bit accumulator is NOT accepted (its scalar
+            reduction does not wrap at 32 bits, so per-lane int32 wrapping would
+            diverge); -Co/-Cr is already excluded by the range/overflow-check bail
+            above (a checked reduction stays scalar). }
+          if (cs_opt_int8dot in current_settings.optimizerswitches) and
+             assigned(redlhs) and (redlhs.nodetype=loadn) and
+             assigned(redlhs.resultdef) and is_32bitint(redlhs.resultdef) then
+            begin
+              accsym:=rangeelim_simple_var(redlhs);
+              if not assigned(accsym) then
+                exit('INT8DOT accumulator is not a simple non-aliased local integer scalar');
+              if tloadnode(redlhs).symtableentry=tsym(counter) then
+                exit('INT8DOT accumulator is the loop counter');
+              rhs:=rangeelim_skip_typeconv(assign.right);
+              if not assigned(rhs) then
+                exit('INT8DOT reduction right-hand side is missing');
+              if rhs.nodetype<>addn then
+                exit('INT8DOT reduction right-hand side is not an addition into the accumulator');
+              redla:=rangeelim_skip_typeconv(taddnode(rhs).left);
+              redra:=rangeelim_skip_typeconv(taddnode(rhs).right);
+              if assigned(redla) and (redla.nodetype=loadn) and (tloadnode(redla).symtableentry=tsym(accsym)) then
+                redexpr:=taddnode(rhs).right
+              else if assigned(redra) and (redra.nodetype=loadn) and (tloadnode(redra).symtableentry=tsym(accsym)) then
+                redexpr:=taddnode(rhs).left
+              else
+                exit('INT8DOT addition does not have the accumulator as one operand');
+              { the addend must be a product a[i]*b[i] whose value is computed at the
+                accumulator's (32-bit) width -- FPC widens shortint*shortint to a
+                32-bit product, matching the packed 16->32 madd exactly }
+              if not assigned(redexpr.resultdef) or not is_32bitint(redexpr.resultdef) then
+                exit('INT8DOT addend is not a 32-bit integer product');
+              redprod:=rangeelim_skip_typeconv(redexpr);
+              if not (assigned(redprod) and (redprod.nodetype=muln)) then
+                exit('INT8DOT addend is not a product of two array elements');
+              leftreason:=vect_int8_elem_reason(taddnode(redprod).left,counter,bvec);
+              rightreason:=vect_int8_elem_reason(taddnode(redprod).right,counter,cvec);
+              if leftreason<>'' then
+                exit('INT8DOT first factor '+leftreason);
+              if rightreason<>'' then
+                exit('INT8DOT second factor '+rightreason);
+              vshape:=vok_int8dot;
+              CalcDefSum(forn.t2);
+              if not assigned(forn.t2.optinfo) or not assigned(forn.left.optinfo) then
+                exit('data-flow information is unavailable for the loop body');
+              if DynSetIn(forn.t2.optinfo^.defsum,forn.left.optinfo^.index) then
+                exit('loop counter is modified inside the loop body');
+              exit(field_base_gate);
+            end;
+
           if assigned(redlhs) and (redlhs.nodetype=loadn) and
              assigned(redlhs.resultdef) and
              (is_single(redlhs.resultdef) or is_double(redlhs.resultdef)) then
@@ -3322,8 +4473,21 @@ unit optloop;
                         exit('dot-product mixes single- and double-precision arrays');
                       vshape:=vok_reduce_dot;
                     end
+                  else if (cs_opt_gather in current_settings.optimizerswitches) and
+                          (not vecdouble) and vect_gather_avx2 and
+                          (vect_gather_elem_reason(redexpr,counter,gvec,ivec)='') then
+                    { -OoGATHER:  s := s + a[idx[i]]  -- a single-precision sum
+                      reduction whose element comes through a computed int32 index.
+                      Same register-resident partial-sum accumulator as vok_reduce_sum
+                      (and the same fast-math reorder license granted above), but the
+                      body widens the indexed load with an AVX2 vgatherdps instead of
+                      a contiguous vmovups.  Only on an AVX2 fputype (there is no SSE
+                      gather); the shape is skipped otherwise so the loop stays
+                      scalar.  -Co/-Cr already bailed above (a checked indexed load
+                      must stay scalar). }
+                    vshape:=vok_gather
                   else
-                    exit('reduction addend is neither an array element nor a product of two array elements of the loop counter');
+                    exit('reduction addend is neither an array element, a product of two array elements, nor an indexed (gather) load of the loop counter');
                 end;
               { leave provably tiny constant-trip loops to the scalar path }
               { (matches REASSOC: below 2*VL there is no packed win) }
@@ -3333,7 +4497,7 @@ unit optloop;
                 exit('data-flow information is unavailable for the loop body');
               if DynSetIn(forn.t2.optinfo^.defsum,forn.left.optinfo^.index) then
                 exit('loop counter is modified inside the loop body');
-              exit('');
+              exit(field_base_gate);
             end;
 
           { LHS: a single- or double-precision dynamic-array element  a[i] ; its
@@ -3346,6 +4510,14 @@ unit optloop;
           { RHS: one of the recognized element-wise shapes. }
           rhs:=rangeelim_skip_typeconv(assign.right);
 
+          { -OoAPPROXTRANS:  a[i] := exp(b[i])  /  1/(1+exp(-b[i]))  over single
+            arrays, lowered to an inline vector polynomial. Tried first so an
+            exp/sigmoid body is taken before the generic arithmetic shapes see it. }
+          if (cs_opt_approxtrans in current_settings.optimizerswitches) and
+             try_transc then
+            begin
+              { vshape/transfn/bvec set by try_transc }
+            end
           { if-conversion shape (-OoIFCONVERT):  a[i] := max/min(u,v)  where FPC's
             -O2 if-conversion has already lowered a branch-predicated ReLU / one-
             sided clamp / element-wise max-min into a single-precision min/max
@@ -3353,7 +4525,7 @@ unit optloop;
             register); v = opB is the second, NaN-preferred parameter (the min/max
             node's parameter-list head).  Each operand is either an array element
             of the loop counter or a provably loop-invariant single scalar. }
-          if assigned(rhs) and (rhs.nodetype=inlinen) and
+          else if assigned(rhs) and (rhs.nodetype=inlinen) and
              (tinlinenode(rhs).inlinenumber in [in_min_single,in_max_single]) then
             begin
               if not(cs_opt_ifconvert in current_settings.optimizerswitches) then
@@ -3479,6 +4651,98 @@ unit optloop;
             exit('data-flow information is unavailable for the loop body');
           if DynSetIn(forn.t2.optinfo^.defsum,forn.left.optinfo^.index) then
             exit('loop counter is modified inside the loop body');
+
+          { object-field array bases (if any) must be provably loop-invariant }
+          result:=field_base_gate;
+        end;
+
+      { Pre-hoist every object-field array base (Self.FData-style) recognized on a
+        vector node into a fresh local, snapshotted once in the loop preheader, and
+        repoint the in-loop access at that local.  Runs on the SUCCESS path only,
+        after the lo/hi/i-preamble is emitted into `stat`; vectorize_reason has
+        already proved (field_base_gate) the field is loop-invariant, so reading it
+        once before the loop is bit-identical.  The vec nodes are the very nodes
+        inside forn.t2, so both the packed body (avec.getcopy ...) and the scalar
+        remainder (forn.t2.getcopy) pick up the repointed base automatically.  A
+        distinct temp per (reference,field) pair -- so  a[i]:=a[i]+b[i]  over the
+        same field shares one snapshot. }
+      procedure hoist_field_bases;
+        var
+          nsnap : longint;
+          snaprefs : array[0..15] of tabstractvarsym;
+          snapfields : array[0..15] of tfieldvarsym;
+          snaptemps : array[0..15] of tabstractvarsym;
+
+        procedure hoist_one(vec : tvecnode);
+          var
+            rsym : tabstractvarsym;
+            fsym : tfieldvarsym;
+            i, slot : longint;
+            tsymp : tlocalvarsym;
+            arrdef : tdef;
+            newbase : tnode;
+          begin
+            if not assigned(vec) then
+              exit;
+            fsym:=vect_field_base(vec.left,rsym);
+            if not assigned(fsym) then
+              exit;
+            arrdef:=vec.left.resultdef;   { the field's dynamic-array def }
+            slot:=-1;
+            for i:=0 to nsnap-1 do
+              if (snaprefs[i]=rsym) and (snapfields[i]=fsym) then
+                begin
+                  slot:=i;
+                  break;
+                end;
+            if (slot<0) and (nsnap<=high(snaprefs)) then
+              begin
+                { The snapshot local holds the raw dynamic-array data POINTER, not
+                  a managed dynamic-array value: a fresh managed local cannot be
+                  introduced this late (its implicit-finally frame was already
+                  decided), and the field is proven loop-invariant and outlives the
+                  loop, so a borrowed non-owning pointer copy needs no reference
+                  counting or finalization.  In-loop accesses reinterpret the
+                  pointer back to the array def; with range checks off (required to
+                  vectorize) indexing is just base+i*elesize. }
+                inc(vect_fieldbase_seq);
+                tsymp:=clocalvarsym.create('$vfld$'+tostr(vect_fieldbase_seq),
+                  vs_value,voidpointertype,[]);
+                tsymp.register_sym;
+                current_procinfo.procdef.localst.insertsym(tsymp);
+                slot:=nsnap;
+                snaprefs[slot]:=rsym;
+                snapfields[slot]:=fsym;
+                snaptemps[slot]:=tsymp;
+                inc(nsnap);
+                { preheader:  temp := pointer(<ref>.<field>)   (evaluated once) }
+                addstatement(stat,cassignmentnode.create(
+                  cloadnode.create(tsym(tsymp),tsymp.owner),
+                  ctypeconvnode.create_internal(vec.left.getcopy,voidpointertype)));
+              end;
+            if slot<0 then
+              exit;
+            { repoint this access's base at the reinterpreted snapshot pointer.
+              The parent vecn is already typed (from the initial firstpass), so the
+              builder's do_firstpass(block) will not re-descend into this fresh
+              child -- type it explicitly here so its resultdef/convtype are set for
+              codegen. }
+            newbase:=ctypeconvnode.create_internal(
+              cloadnode.create(tsym(snaptemps[slot]),snaptemps[slot].owner),arrdef);
+            firstpass(newbase);
+            vec.left.free;
+            vec.left:=newbase;
+          end;
+
+        begin
+          nsnap:=0;
+          hoist_one(avec);
+          hoist_one(bvec);
+          hoist_one(cvec);
+          hoist_one(mmA_vec);
+          hoist_one(mmB_vec);
+          hoist_one(gvec);
+          hoist_one(ivec);
         end;
 
       begin
@@ -3496,6 +4760,8 @@ unit optloop;
         avec:=nil;
         bvec:=nil;
         cvec:=nil;
+        gvec:=nil;
+        ivec:=nil;
         scalarnode:=nil;
         scalarleft:=false;
         vecop:=OP_NONE;
@@ -3508,6 +4774,9 @@ unit optloop;
         mmA_scalar:=nil;
         mmB_scalar:=nil;
         ismaxop:=false;
+        transfn:=tf_exp;
+        transbias:=nil;
+        transbiassplat:=nil;
         mminl:=nil;
         accsym:=nil;
         redlhs:=nil;
@@ -3521,9 +4790,24 @@ unit optloop;
         if reason<>'' then
           begin
             MessagePos1(forn.fileinfo,cg_n_loop_not_vectorized,reason);
+            OptRemark(forn.fileinfo,'vectorize','not vectorized: '+reason);
             exit;
           end;
 
+        { -OoINT8DOT: the reduction runs over shortint elements with a 32-bit
+          integer accumulator.  eletype is the 32-bit int type used for the
+          register-resident accumulator seed/finish scalar temps; elewidth is the
+          number of int8 ELEMENTS consumed per iteration -- 8 on the 128-bit xmm
+          baseline (4 int32 lanes), 16 on the AVX2 ymm width (8 int32 lanes). }
+        if vshape=vok_int8dot then
+          begin
+            eletype:=s32inttype;
+            if vect_int8dot_want_ymm then
+              elewidth:=16
+            else
+              elewidth:=8;
+          end
+        else
         { pick the packed element type and lane count for this loop's precision:
           single -> [s32floattype x4], double -> [s64floattype x2]. All slot
           sizes, window advances and node widths below use these. }
@@ -3537,6 +4821,23 @@ unit optloop;
             eletype:=s32floattype;
             elewidth:=4;
           end;
+        { -OoVECT256: on an AVX-capable fputype double the lane count so each
+          packed window is a 256-bit ymm op (single: 8 lanes, double: 4). The
+          window advance (i:=i+VL), the vector-loop guard (i<=hi-(VL-1)) and the
+          splat/temp slot sizes below are all expressed in terms of elewidth, so
+          the wider window and its scalar remainder (now up to VL-1 = 7/3
+          iterations) follow automatically; the backend node derives the ymm
+          register width from vecwidth*element-size. }
+        if vect_want_ymm and (vshape<>vok_int8dot) then
+          elewidth:=elewidth*2;
+        { -OoAPPROXTRANS width: the 2^n exponent build uses packed 32-bit integer
+          add/shift (paddd/pslld), which at 256-bit are VPADDD/VPSLLD ymm -- AVX2
+          instructions. So the transcendental body widens to 256-bit (VL=8) only
+          under -OoVECT256 on an AVX2 fputype (vect_transc_want_ymm); on an AVX-only
+          or SSE fputype it stays at the SSE2-safe 128-bit (VL=4) width even when
+          VECT256 doubled elewidth above. }
+        if (vshape=vok_transc) and not vect_transc_want_ymm then
+          elewidth:=4;
 
         { ---- build the replacement statement block ---- }
         block:=internalstatements(stat);
@@ -3556,16 +4857,93 @@ unit optloop;
           cloadnode.create(tsym(counter),counter.owner),
           ctemprefnode.create(lotemp)));
 
+        { snapshot any invariant object-field array base into a preheader local }
+        hoist_field_bases;
+
+        { ---- INT8DOT build (integer widening MAC dot product) ----
+          Structurally identical to the float reduction below (register-resident
+          init / body / finish trio + vector while-loop + scalar remainder), but
+          with a 32-bit integer accumulator and no fast-math gate. }
+        if vshape=vok_int8dot then
+          begin
+            { seed lane 0 of the packed int accumulator with the incoming s, read
+              through a plain assignment so the incoming def of s stays live (a
+              backend node's operand reads are not modelled by DFA) }
+            seedtemp:=ctempcreatenode.create(eletype,eletype.size,tt_persistent,false);
+            addstatement(stat,seedtemp);
+            addstatement(stat,cassignmentnode.create(
+              ctemprefnode.create(seedtemp),
+              cloadnode.create(tsym(accsym),accsym.owner)));
+            redinit:=cvectoropnode.create_int8dot_init(
+              ctemprefnode.create(seedtemp),elewidth);
+            redctx:=redinit.new_redctx;
+            addstatement(stat,redinit);
+
+            { vector loop:  while i<=hi-(VL-1) do begin acc:=acc+a[i]*b[i]; i:=i+VL end }
+            vecbody:=internalstatements(vstat);
+            redbody:=cvectoropnode.create_int8dot(bvec.getcopy,cvec.getcopy,elewidth);
+            redbody.attach_redctx(redctx);
+            addstatement(vstat,redbody);
+            addstatement(vstat,cassignmentnode.create(
+              cloadnode.create(tsym(counter),counter.owner),
+              caddnode.create(addn,cloadnode.create(tsym(counter),counter.owner),
+                cordconstnode.create(elewidth,ctype,false))));
+            addstatement(stat,cwhilerepeatnode.create(
+              caddnode.create(lten,cloadnode.create(tsym(counter),counter.owner),
+                caddnode.create(subn,ctemprefnode.create(hitemp),
+                  cordconstnode.create(elewidth-1,ctype,false))),
+              vecbody,true,false));
+
+            { finish:  s := horizontal-sum(acc) via a memory-backed scalar temp }
+            splattemp:=ctempcreatenode.create(eletype,eletype.size,tt_persistent,false);
+            addstatement(stat,splattemp);
+            redfin:=cvectoropnode.create_int8dot_finish(
+              ctemprefnode.create(splattemp),elewidth);
+            redfin.attach_redctx(redctx);
+            addstatement(stat,redfin);
+            addstatement(stat,cassignmentnode.create(
+              cloadnode.create(tsym(accsym),accsym.owner),
+              ctemprefnode.create(splattemp)));
+
+            { scalar remainder:  while i<=hi do begin <original body>; i:=i+1 end }
+            scalbody:=internalstatements(sstat);
+            addstatement(sstat,forn.t2.getcopy);
+            addstatement(sstat,cassignmentnode.create(
+              cloadnode.create(tsym(counter),counter.owner),
+              caddnode.create(addn,cloadnode.create(tsym(counter),counter.owner),
+                cordconstnode.create(1,ctype,false))));
+            addstatement(stat,cwhilerepeatnode.create(
+              caddnode.create(lten,cloadnode.create(tsym(counter),counter.owner),
+                ctemprefnode.create(hitemp)),
+              scalbody,true,false));
+
+            addstatement(stat,ctempdeletenode.create(lotemp));
+            addstatement(stat,ctempdeletenode.create(hitemp));
+            addstatement(stat,ctempdeletenode.create(seedtemp));
+            addstatement(stat,ctempdeletenode.create(splattemp));
+
+            do_firstpass(block);
+            MessagePos1(forn.fileinfo,cg_n_loop_reduction_vectorized,tostr(elewidth));
+            if elewidth=16 then
+              leftreason:=' width=ymm256'
+            else
+              leftreason:='';
+            OptRemark(forn.fileinfo,'int8dot','int8 dot-product loop vectorized to a widening vpmaddwd MAC, VF='+tostr(elewidth)+', tail=scalar'+leftreason);
+            forn.free;
+            n:=block;
+            changed:=true;
+            exit;
+          end;
+
         { ---- REDUCTION build (sum / dot product) ---- }
         if vshape in [vok_reduce_sum,vok_reduce_dot] then
           begin
-            { 16-byte packed accumulator slot; allowreg=false so the body can
-              movups-load/store it each iteration (a register cannot persist
-              across the node-per-iteration vector loop) }
-            acctemp:=ctempcreatenode.create(
-              tarraydef.getreusable_vector(eletype,elewidth),
-              elewidth*eletype.size,tt_persistent,false);
-            addstatement(stat,acctemp);
+            { The packed accumulator is register-resident: it lives in a shared
+              xmm register (allocated by the reduce_init backend node at codegen
+              time) that persists across the whole vector loop -- no per-iteration
+              store/reload through a stack slot, so the vector ILP is not offset by
+              memory traffic.  The three cooperating nodes (init before the loop,
+              body in it, finish after it) share one register context. }
 
             { acc := [s,0,..]   (lane 0 keeps the incoming scalar value of s).
               The incoming s is first copied into a memory-backed scalar temp
@@ -3583,18 +4961,21 @@ unit optloop;
             addstatement(stat,cassignmentnode.create(
               ctemprefnode.create(seedtemp),
               cloadnode.create(tsym(accsym),accsym.owner)));
-            addstatement(stat,cvectoropnode.create_reduce_init(
-              ctemprefnode.create(acctemp),
-              ctemprefnode.create(seedtemp),vecdouble));
+            redinit:=cvectoropnode.create_reduce_init(
+              ctemprefnode.create(seedtemp),elewidth,vecdouble);
+            redctx:=redinit.new_redctx;
+            addstatement(stat,redinit);
 
             { vector loop:  while i<=hi-(VL-1) do begin acc:=acc+window; i:=i+VL end }
             vecbody:=internalstatements(vstat);
             if vshape=vok_reduce_dot then
-              addstatement(vstat,cvectoropnode.create_reduce(
-                ctemprefnode.create(acctemp),bvec.getcopy,cvec.getcopy,true,elewidth,vecdouble))
+              redbody:=cvectoropnode.create_reduce(
+                bvec.getcopy,cvec.getcopy,true,elewidth,vecdouble)
             else
-              addstatement(vstat,cvectoropnode.create_reduce(
-                ctemprefnode.create(acctemp),bvec.getcopy,nil,false,elewidth,vecdouble));
+              redbody:=cvectoropnode.create_reduce(
+                bvec.getcopy,nil,false,elewidth,vecdouble);
+            redbody.attach_redctx(redctx);
+            addstatement(vstat,redbody);
             addstatement(vstat,cassignmentnode.create(
               cloadnode.create(tsym(counter),counter.owner),
               caddnode.create(addn,cloadnode.create(tsym(counter),counter.owner),
@@ -3613,9 +4994,10 @@ unit optloop;
               def of s stays a plain assignment the allocator understands. }
             splattemp:=ctempcreatenode.create(eletype,eletype.size,tt_persistent,false);
             addstatement(stat,splattemp);
-            addstatement(stat,cvectoropnode.create_reduce_finish(
-              ctemprefnode.create(splattemp),
-              ctemprefnode.create(acctemp),elewidth,vecdouble));
+            redfin:=cvectoropnode.create_reduce_finish(
+              ctemprefnode.create(splattemp),elewidth,vecdouble);
+            redfin.attach_redctx(redctx);
+            addstatement(stat,redfin);
             addstatement(stat,cassignmentnode.create(
               cloadnode.create(tsym(accsym),accsym.owner),
               ctemprefnode.create(splattemp)));
@@ -3636,12 +5018,91 @@ unit optloop;
 
             addstatement(stat,ctempdeletenode.create(lotemp));
             addstatement(stat,ctempdeletenode.create(hitemp));
-            addstatement(stat,ctempdeletenode.create(acctemp));
             addstatement(stat,ctempdeletenode.create(seedtemp));
             addstatement(stat,ctempdeletenode.create(splattemp));
 
             do_firstpass(block);
             MessagePos1(forn.fileinfo,cg_n_loop_reduction_vectorized,tostr(elewidth));
+            OptRemark(forn.fileinfo,'vectorize','reduction loop vectorized, VF='+tostr(elewidth)+', tail=scalar'+vect_widthtag);
+            forn.free;
+            n:=block;
+            changed:=true;
+            exit;
+          end;
+
+        { ---- GATHER build (-OoGATHER): single-precision indexed sum reduction
+          s := s + a[idx[i]].  Structurally identical to the float sum reduction
+          above -- the SAME register-resident float accumulator seeded by
+          vok_reduce_init and horizontally summed by vok_reduce_finish -- but the
+          body is a vok_gather_body node that widens the indexed load with an AVX2
+          vgatherdps over the VF contiguous int32 indices idx[i..i+VF-1]. }
+        if vshape=vok_gather then
+          begin
+            { acc := [s,0,..]  (lane 0 keeps the incoming s), seeded from a memory
+              temp via a plain assignment so the incoming def of s stays live -- the
+              exact discipline the float sum reduction uses above. }
+            seedtemp:=ctempcreatenode.create(eletype,eletype.size,tt_persistent,false);
+            addstatement(stat,seedtemp);
+            addstatement(stat,cassignmentnode.create(
+              ctemprefnode.create(seedtemp),
+              cloadnode.create(tsym(accsym),accsym.owner)));
+            redinit:=cvectoropnode.create_reduce_init(
+              ctemprefnode.create(seedtemp),elewidth,false);
+            redctx:=redinit.new_redctx;
+            addstatement(stat,redinit);
+
+            { vector loop:  while i<=hi-(VL-1) do begin acc:=acc+a[idx[i..]]; i:=i+VL end
+                left  = idx[i]  (source of the VF contiguous int32 index window)
+                right = a[0]    (VSIB base of the gathered single array) }
+            vecbody:=internalstatements(vstat);
+            redbody:=cvectoropnode.create_gather(
+              ivec.getcopy,
+              cvecnode.create(tvecnode(gvec).left.getcopy,
+                cordconstnode.create(0,sizesinttype,false)),
+              elewidth);
+            redbody.attach_redctx(redctx);
+            addstatement(vstat,redbody);
+            addstatement(vstat,cassignmentnode.create(
+              cloadnode.create(tsym(counter),counter.owner),
+              caddnode.create(addn,cloadnode.create(tsym(counter),counter.owner),
+                cordconstnode.create(elewidth,ctype,false))));
+            addstatement(stat,cwhilerepeatnode.create(
+              caddnode.create(lten,cloadnode.create(tsym(counter),counter.owner),
+                caddnode.create(subn,ctemprefnode.create(hitemp),
+                  cordconstnode.create(elewidth-1,ctype,false))),
+              vecbody,true,false));
+
+            { finish:  s := horizontal-sum(acc) via a memory-backed scalar temp }
+            splattemp:=ctempcreatenode.create(eletype,eletype.size,tt_persistent,false);
+            addstatement(stat,splattemp);
+            redfin:=cvectoropnode.create_reduce_finish(
+              ctemprefnode.create(splattemp),elewidth,false);
+            redfin.attach_redctx(redctx);
+            addstatement(stat,redfin);
+            addstatement(stat,cassignmentnode.create(
+              cloadnode.create(tsym(accsym),accsym.owner),
+              ctemprefnode.create(splattemp)));
+
+            { scalar remainder:  while i<=hi do begin <original body>; i:=i+1 end }
+            scalbody:=internalstatements(sstat);
+            addstatement(sstat,forn.t2.getcopy);
+            addstatement(sstat,cassignmentnode.create(
+              cloadnode.create(tsym(counter),counter.owner),
+              caddnode.create(addn,cloadnode.create(tsym(counter),counter.owner),
+                cordconstnode.create(1,ctype,false))));
+            addstatement(stat,cwhilerepeatnode.create(
+              caddnode.create(lten,cloadnode.create(tsym(counter),counter.owner),
+                ctemprefnode.create(hitemp)),
+              scalbody,true,false));
+
+            addstatement(stat,ctempdeletenode.create(lotemp));
+            addstatement(stat,ctempdeletenode.create(hitemp));
+            addstatement(stat,ctempdeletenode.create(seedtemp));
+            addstatement(stat,ctempdeletenode.create(splattemp));
+
+            do_firstpass(block);
+            MessagePos1(forn.fileinfo,cg_n_loop_reduction_vectorized,tostr(elewidth));
+            OptRemark(forn.fileinfo,'gather','indexed-load sum reduction vectorized to AVX2 vgatherdps, VF='+tostr(elewidth)+', tail=scalar'+vect_widthtag);
             forn.free;
             n:=block;
             changed:=true;
@@ -3661,7 +5122,22 @@ unit optloop;
               elewidth*eletype.size,tt_persistent,false);
             addstatement(stat,splattemp);
             addstatement(stat,cvectoropnode.create_broadcast(
-              ctemprefnode.create(splattemp),scalarnode.getcopy,vecdouble));
+              ctemprefnode.create(splattemp),scalarnode.getcopy,elewidth,vecdouble));
+          end;
+
+        { -OoAPPROXTRANS softmax  exp(b[i]-m): broadcast the loop-invariant scalar m
+          ONCE into a memory splat slot [m,m,..] before the vector loop, exactly like
+          the vok_arr_scalar path; the transc body subtracts it per lane before the
+          packed expf. }
+        transbiassplat:=nil;
+        if (vshape=vok_transc) and assigned(transbias) then
+          begin
+            transbiassplat:=ctempcreatenode.create(
+              tarraydef.getreusable_vector(eletype,elewidth),
+              elewidth*eletype.size,tt_persistent,false);
+            addstatement(stat,transbiassplat);
+            addstatement(stat,cvectoropnode.create_broadcast(
+              ctemprefnode.create(transbiassplat),transbias.getcopy,elewidth,vecdouble));
           end;
 
         { if-conversion (vok_minmax): each min/max operand is either an array
@@ -3679,7 +5155,7 @@ unit optloop;
                   elewidth*eletype.size,tt_persistent,false);
                 addstatement(stat,splata);
                 addstatement(stat,cvectoropnode.create_broadcast(
-                  ctemprefnode.create(splata),mmA_scalar.getcopy,vecdouble));
+                  ctemprefnode.create(splata),mmA_scalar.getcopy,elewidth,vecdouble));
                 windowa:=ctemprefnode.create(splata);
               end;
             if assigned(mmB_vec) then
@@ -3691,7 +5167,7 @@ unit optloop;
                   elewidth*eletype.size,tt_persistent,false);
                 addstatement(stat,splatb);
                 addstatement(stat,cvectoropnode.create_broadcast(
-                  ctemprefnode.create(splatb),mmB_scalar.getcopy,vecdouble));
+                  ctemprefnode.create(splatb),mmB_scalar.getcopy,elewidth,vecdouble));
                 windowb:=ctemprefnode.create(splatb);
               end;
           end;
@@ -3708,6 +5184,12 @@ unit optloop;
             addstatement(vstat,cvectoropnode.create_copy(avec.getcopy,bvec.getcopy,elewidth,vecdouble));
           vok_minmax:
             addstatement(vstat,cvectoropnode.create_minmax(avec.getcopy,windowa,windowb,ismaxop,elewidth));
+          vok_transc:
+            if assigned(transbiassplat) then
+              addstatement(vstat,cvectoropnode.create_transc_bias(avec.getcopy,bvec.getcopy,
+                ctemprefnode.create(transbiassplat),transfn,elewidth))
+            else
+              addstatement(vstat,cvectoropnode.create_transc(avec.getcopy,bvec.getcopy,transfn,elewidth));
           else
             internalerror(2026070706);
         end;
@@ -3744,10 +5226,28 @@ unit optloop;
           addstatement(stat,ctempdeletenode.create(splatb));
 
         do_firstpass(block);
-        if vshape=vok_minmax then
-          MessagePos1(forn.fileinfo,cg_n_loop_ifconverted,tostr(elewidth))
+        if vshape=vok_transc then
+          begin
+            MessagePos1(forn.fileinfo,cg_n_loop_vectorized,tostr(elewidth));
+            case transfn of
+              tf_exp:
+                OptRemark(forn.fileinfo,'approxtrans','exp() activation loop vectorized to an inline approximate packed expf, VF='+tostr(elewidth)+', tail=scalar(exact RTL)');
+              tf_sigmoid:
+                OptRemark(forn.fileinfo,'approxtrans','sigmoid 1/(1+exp(-x)) activation loop vectorized to an inline approximate packed expf, VF='+tostr(elewidth)+', tail=scalar(exact RTL)');
+              tf_tanh:
+                OptRemark(forn.fileinfo,'approxtrans','tanh() activation loop vectorized to an inline approximate packed expf, VF='+tostr(elewidth)+', tail=scalar(exact RTL)');
+            end;
+          end
+        else if vshape=vok_minmax then
+          begin
+            MessagePos1(forn.fileinfo,cg_n_loop_ifconverted,tostr(elewidth));
+            OptRemark(forn.fileinfo,'ifconvert','min/max loop if-converted to packed max/min, VF='+tostr(elewidth)+vect_widthtag);
+          end
         else
-          MessagePos1(forn.fileinfo,cg_n_loop_vectorized,tostr(elewidth));
+          begin
+            MessagePos1(forn.fileinfo,cg_n_loop_vectorized,tostr(elewidth));
+            OptRemark(forn.fileinfo,'vectorize','loop vectorized, VF='+tostr(elewidth)+', tail=scalar'+vect_widthtag);
+          end;
         forn.free;
         n:=block;
         changed:=true;
@@ -3760,8 +5260,14 @@ unit optloop;
         if n.nodetype=forn then
           begin
             tvectorizecontext(arg^).processloop(n);
-            { n may now be a block; do not recurse into the freed for-node }
-            result:=fen_norecurse_false;
+            { If processloop vectorized this loop, n is now a block: stop, so we
+              do not recurse into the freed for-node.  If it DECLINED (n is still
+              a forn -- e.g. this is an outer counted loop whose body holds a
+              nested reduction loop, the dense-layer `for row do (dot over cols)`
+              shape), fall through with fen_false so the walk descends into the
+              body and the inner reduction loop still gets its own processloop. }
+            if n.nodetype<>forn then
+              result:=fen_norecurse_false;
           end;
       end;
 
@@ -4137,6 +5643,12 @@ unit optloop;
         addstatement(stat,ctempdeletenode.create(hitemp));
 
         do_firstpass(block);
+        if dounroll and willprefetch then
+          OptRemark(forn.fileinfo,'unrolldyn','dynamic-trip loop unrolled by '+tostr(uf)+' with software prefetch of '+tostr(nreadbases)+' streamed base(s)')
+        else if dounroll then
+          OptRemark(forn.fileinfo,'unrolldyn','dynamic-trip loop unrolled by '+tostr(uf))
+        else
+          OptRemark(forn.fileinfo,'prefetch','software prefetch inserted for '+tostr(nreadbases)+' streamed base(s)');
         forn.free;
         n:=block;
         changed:=true;
@@ -4557,6 +6069,10 @@ unit optloop;
                 end;
             if packok then
               begin
+                if assigned(parses[i].avec) then
+                  OptRemark(parses[i].avec.fileinfo,'slp',
+                    'straight-line group of '+tostr(slp_vecwidth)+
+                    ' scalar single-precision statements packed into one 128-bit SSE op');
                 case parses[i].shape of
                   vok_arr_arr:
                     begin
@@ -4583,7 +6099,7 @@ unit optloop;
                       firstpass(tmpn);
                       addstatement(wrapstat,tmpn);
                       bcast:=cvectoropnode.create_broadcast(
-                        ctemprefnode.create(splattemp),parses[i].scalarnode.getcopy,false);
+                        ctemprefnode.create(splattemp),parses[i].scalarnode.getcopy,slp_vecwidth,false);
                       firstpass(bcast);
                       addstatement(wrapstat,bcast);
                       opnode:=cvectoropnode.create_scalar(parses[i].avec.getcopy,
@@ -5277,6 +6793,7 @@ unit optloop;
         if reason<>'' then
           begin
             MessagePos1(forn.fileinfo,cg_n_loop_not_peeled,reason);
+            OptRemark(forn.fileinfo,'looppeel','not peeled: '+reason);
             exit;
           end;
 
@@ -5309,6 +6826,7 @@ unit optloop;
 
         do_firstpass(block);
         MessagePos1(forn.fileinfo,cg_n_loop_peeled,tostr(trip.svalue));
+        OptRemark(forn.fileinfo,'looppeel','loop peeled, '+tostr(trip.svalue)+' iteration(s) unrolled off the head');
         forn.free;
         n:=block;
         changed:=true;
@@ -5573,6 +7091,7 @@ unit optloop;
         if reason<>'' then
           begin
             MessagePos1(forn.fileinfo,cg_n_loop_not_split,reason);
+            OptRemark(forn.fileinfo,'loopsplit','not split: '+reason);
             exit;
           end;
 
@@ -5643,6 +7162,7 @@ unit optloop;
 
         do_firstpass(block);
         MessagePos1(forn.fileinfo,cg_n_loop_split,'');
+        OptRemark(forn.fileinfo,'loopsplit','loop split into two branch-free loops at an induction-variable crossover');
         forn.free;
         n:=block;
         changed:=true;
@@ -6004,8 +7524,12 @@ unit optloop;
             begin
               { diagnose only the first, un-fused candidate, to avoid noise }
               if not fusedany and assigned(s2) then
-                MessagePos1(tfornode(s1.left).fileinfo,cg_n_loop_not_fused,
-                  'the following statement is not a counted for-loop');
+                begin
+                  MessagePos1(tfornode(s1.left).fileinfo,cg_n_loop_not_fused,
+                    'the following statement is not a counted for-loop');
+                  OptRemark(tfornode(s1.left).fileinfo,'loopfuse',
+                    'not fused: the following statement is not a counted for-loop');
+                end;
               break;
             end;
 
@@ -6017,7 +7541,10 @@ unit optloop;
           if reason<>'' then
             begin
               if not fusedany then
-                MessagePos1(forn1.fileinfo,cg_n_loop_not_fused,reason);
+                begin
+                  MessagePos1(forn1.fileinfo,cg_n_loop_not_fused,reason);
+                  OptRemark(forn1.fileinfo,'loopfuse','not fused: '+reason);
+                end;
               break;
             end;
 
@@ -6051,6 +7578,7 @@ unit optloop;
           do_firstpass(fusedfor);
 
           MessagePos(forn1.fileinfo,cg_n_loop_fused);
+          OptRemark(forn1.fileinfo,'loopfuse','two adjacent counted loops fused into one');
           s1.left:=fusedfor;
           s2.left:=cnothingnode.create;
           forn1.free;
@@ -6058,6 +7586,17 @@ unit optloop;
           changed:=true;
           fusedany:=true;
           firstpair:=false;
+          { do_firstpass is a var-param that may REPLACE the fused loop: for a
+            constant-trip fused loop, tfornode.pass_typecheck runs the stock loop
+            unroller, which can fully unroll it (getridoffor) into a plain block
+            with no for-node left.  The greedy fold below reinterprets s1.left as a
+            tfornode on the next iteration, so if the survivor is no longer a
+            counted for-loop we must stop folding onto it (it would walk a block as
+            if it were a for-node -- an internalerror/stack overflow).  Any
+            still-unfused following loops remain visited by the outer
+            foreachnodestatic walk and can still fuse among themselves. }
+          if fusedfor.nodetype<>forn then
+            break;
         until false;
       end;
 
@@ -6184,7 +7723,33 @@ unit optloop;
             exit(fen_norecurse_true);
           end;
         case n.nodetype of
-          calln,addrn,assignn,forn,whilerepeatn,
+          calln:
+            { a resolved direct call to a routine -OoPURE proved PURE or CONST is
+              side-effect free and non-trapping, so duplicating it with a
+              shifted counter (the reassociation) is sound.  PURE (not only
+              CONST) is admissible here because the reduction body's ONLY store
+              is to the non-address-taken local accumulator, which no callee can
+              name -- so nothing in the loop writes memory a pure callee could
+              read, and regrouping the additions re-reads identical values.
+              -OoMODREF widens this to any call whose summary proves it writes no
+              memory and cannot trap (loop_is_modref_writefree_call): same
+              argument, but it reaches routines -OoPURE could not prove pure
+              (e.g. an open-array/hidden-parameter signature that only reads).
+              -OoMODREF widens it FURTHER to an exact-summary non-trapping call
+              that WRITES memory (loop_is_modref_reorderable_call): the transform
+              copies the addend as an indivisible blob and evaluates the copies in
+              counter order, preserving the count and order of every side effect,
+              so a writing addend call is as reorderable as a pure one here (see
+              that function's soundness note).  Keep recursing into the argument
+              subtrees so an accumulator reference or other unsafe construct
+              inside an argument is still caught. }
+            if not loop_is_pure_call(n) and not loop_is_modref_writefree_call(n) and
+               not loop_is_modref_reorderable_call(n) then
+              begin
+                preassoc_safety(arg)^.bad:=true;
+                result:=fen_norecurse_true;
+              end;
+          addrn,assignn,forn,whilerepeatn,
           breakn,continuen,goton,labeln,exitn,raisen,tryexceptn,tryfinallyn,onn:
             begin
               preassoc_safety(arg)^.bad:=true;
@@ -6210,6 +7775,49 @@ unit optloop;
           else
             ;
         end;
+      end;
+
+
+    function reassoc_note_call_cb(var n : tnode; arg : pointer) : foreachnoderesult;
+      { detects a pure/const call admitted into the reduction addend by the
+        relaxed reassoc_safety_cb, for an accurate -OoREPORT remark }
+      begin
+        if (n.nodetype=calln) and loop_is_pure_call(n) then
+          begin
+            pboolean(arg)^:=true;
+            result:=fen_norecurse_true;
+          end
+        else
+          result:=fen_false;
+      end;
+
+    function reassoc_note_modref_cb(var n : tnode; arg : pointer) : foreachnoderesult;
+      { detects a call admitted into the reduction addend by the -OoMODREF
+        write-free relaxation but NOT provable pure by -OoPURE, for the remark }
+      begin
+        if (n.nodetype=calln) and loop_is_modref_writefree_call(n) and
+           not loop_is_pure_call(n) then
+          begin
+            pboolean(arg)^:=true;
+            result:=fen_norecurse_true;
+          end
+        else
+          result:=fen_false;
+      end;
+
+    function reassoc_note_reorder_cb(var n : tnode; arg : pointer) : foreachnoderesult;
+      { detects a WRITING call admitted into the reduction addend by the -OoMODREF
+        write-disjoint (exact-summary, non-trapping) relaxation -- i.e. one that is
+        neither pure nor write-free -- for an accurate -OoREPORT remark }
+      begin
+        if (n.nodetype=calln) and loop_is_modref_reorderable_call(n) and
+           not loop_is_modref_writefree_call(n) and not loop_is_pure_call(n) then
+          begin
+            pboolean(arg)^:=true;
+            result:=fen_norecurse_true;
+          end
+        else
+          result:=fen_false;
       end;
 
 
@@ -6258,9 +7866,42 @@ unit optloop;
         keyed to the OLD child -- dropping the +delta (i*2 stayed i*2) or, when the
         multiply is not a power of two, tripping an operand-size internalerror.
         Clearing resultdef + the pass1/error flags on the whole subtree makes the
-        enclosing block's do_firstpass rebuild it consistently. }
+        enclosing block's do_firstpass rebuild it consistently.
+
+        A CALL node (and its whole argument subtree) is the ONE exception: it is
+        left intact.  After a call has been firstpassed its parameter list is in
+        EXPANDED form -- hidden high/typinfo parameters materialised, and the
+        actual->formal conversions inserted (a fixed array bound to an open-array
+        parameter carries the dynarray-style boundary + a runtime high para; a
+        managed actual carries a copy temp).  Clearing its resultdef forces a
+        re-typecheck that re-runs parameter matching over that already-expanded
+        list, which mis-binds the array actual to the (scalar) element type
+        ("Incompatible types: got Array Of X expected X") and would double-insert
+        the hidden paras.  None of that needs redoing: the counter substitution
+        only ever rewrites a plain counter read  i  into  (i+delta)  -- an
+        expression of the IDENTICAL type -- so any call ARGUMENT containing the
+        counter keeps its type, the call's own resultdef stays valid, and the new
+        (i+delta) subtree was already firstpassed in place by reassoc_subst_cb.
+        Skip the call so its expansion is preserved verbatim on every copy. }
       begin
+        if n.nodetype=calln then
+          begin
+            result:=fen_norecurse_false;
+            exit;
+          end;
         result:=fen_false;
+        { a copied load of a variable from an enclosing frame still carries the
+          original's parentfp node in left; with resultdef cleared the load is
+          re-typechecked, and pass_typecheck insists on wiring the parentfp
+          itself - IE 200309289 if one is already there.  Drop the stale copy
+          and let the re-typecheck rebuild it (set_needs_parentfp and
+          add_captured_sym are idempotent). }
+        if (n.nodetype=loadn) and assigned(tloadnode(n).left) and
+           (tloadnode(n).left.nodetype=loadparentfpn) then
+          begin
+            tloadnode(n).left.free;
+            tloadnode(n).left:=nil;
+          end;
         n.resultdef:=nil;
         exclude(n.transientflags,tnf_pass1_done);
         exclude(n.transientflags,tnf_error);
@@ -6291,6 +7932,9 @@ unit optloop;
         exprk, accref : tnode;
         j : longint;
         lo, hi : tconstexprint;
+        hasrelaxedcall : boolean;
+        hasmodrefcall : boolean;
+        hasreordercall : boolean;
 
       function reassoc_reason : string;
         begin
@@ -6299,6 +7943,18 @@ unit optloop;
             exit('descending (downto) loop');
           if assigned(forn.loopstep) then
             exit('non-unit loop step');
+          { The reassociated form drives the counter with an explicit main+tail
+            while loop, which leaves it at hi+1 (or, for an empty range, at lo) --
+            not at the for-loop's exit value (hi when it ran, unchanged when it did
+            not).  That difference is only observable if the counter's exit value
+            is live after the loop, so reassociate only when it is known dead
+            (lnf_dont_mind_loopvar_on_exit -- objfpc/delphi's undefined-on-exit
+            rule at parse time, or DFA having proved the counter unused after the
+            loop).  Reduction-loop counters are almost always dead here, so this
+            keeps the transform firing on the intended kernels while staying sound
+            for an escaping counter (mode unleashed keeps the counter live). }
+          if not(lnf_dont_mind_loopvar_on_exit in forn.loopflags) then
+            exit('loop counter''s exit value is observed after the loop');
 
           { counter: simple non-aliased signed 32/64-bit local/value-param }
           counter:=rangeelim_simple_var(forn.left);
@@ -6386,6 +8042,7 @@ unit optloop;
         if reassoc_reason<>'' then
           begin
             MessagePos1(forn.fileinfo,cg_n_loop_not_reassociated,reassoc_reason);
+            OptRemark(forn.fileinfo,'reassoc','not reassociated: '+reassoc_reason);
             exit;
           end;
 
@@ -6480,6 +8137,23 @@ unit optloop;
 
         do_firstpass(block);
         MessagePos1(forn.fileinfo,cg_n_loop_reassociated,tostr(reassoc_k));
+        if cs_opt_report in current_settings.optimizerswitches then
+          begin
+            hasrelaxedcall:=false;
+            hasmodrefcall:=false;
+            hasreordercall:=false;
+            foreachnodestatic(pm_postprocess,exprnode,@reassoc_note_call_cb,@hasrelaxedcall);
+            foreachnodestatic(pm_postprocess,exprnode,@reassoc_note_modref_cb,@hasmodrefcall);
+            foreachnodestatic(pm_postprocess,exprnode,@reassoc_note_reorder_cb,@hasreordercall);
+            if hasreordercall then
+              OptRemark(forn.fileinfo,'reassoc','reduction loop split into '+tostr(reassoc_k)+' partial accumulators (addend contains a mod/ref EXACT-summary non-trapping WRITING call kept in the body via -OoMODREF)')
+            else if hasmodrefcall then
+              OptRemark(forn.fileinfo,'reassoc','reduction loop split into '+tostr(reassoc_k)+' partial accumulators (addend contains a mod/ref write-free non-trapping call kept in the body via -OoMODREF)')
+            else if hasrelaxedcall then
+              OptRemark(forn.fileinfo,'reassoc','reduction loop split into '+tostr(reassoc_k)+' partial accumulators (addend contains a proven pure/const call kept in the body via -OoPURE)')
+            else
+              OptRemark(forn.fileinfo,'reassoc','reduction loop split into '+tostr(reassoc_k)+' partial accumulators');
+          end;
         forn.free;
         n:=block;
         changed:=true;
@@ -6492,8 +8166,13 @@ unit optloop;
         if n.nodetype=forn then
           begin
             treassoccontext(arg^).processloop(n);
-            { n may now be a block; do not recurse into the freed for-node }
-            result:=fen_norecurse_false;
+            { If processloop split this loop, n is now a block: stop, so we do not
+              recurse into the freed for-node.  If it DECLINED (n is still a forn,
+              e.g. an outer counted loop enclosing a nested reduction loop), fall
+              through with fen_false so the walk descends into the body and the
+              inner reduction loop still gets its own processloop. }
+            if n.nodetype<>forn then
+              result:=fen_norecurse_false;
           end;
       end;
 
@@ -6630,6 +8309,47 @@ unit optloop;
         rc.count:=0;
         foreachnodestatic(subtree,@ujam_refcount_cb,@rc);
         result:=rc.count;
+      end;
+
+
+    function ujam_bound_variant_cb(var n : tnode; arg : pointer) : foreachnoderesult;
+      { Flags anything in an inner-loop bound expression that makes it NOT
+        provably invariant across the K consecutive outer iterations the jam
+        collapses into one inner loop.  Unroll-and-jam drives all K unrolled
+        inner-body copies with a SINGLE inner loop, so the shared bound must
+        have the same value for outer iterations i, i+1, ..., i+K-1.  Reject:
+          * a read of the outer counter i or the inner counter j (varies with
+            the outer iteration, resp. self-referential);
+          * a read of a renamed scalar accumulator (the body writes it);
+          * ANY memory indirection -- an array element (vecn, e.g.
+            msgidxmax[i]), a pointer target (derefn), a record/object field
+            (subscriptn) -- because the outer body may write it and/or it may
+            vary with the outer counter;
+          * a call or inline intrinsic (side effects / unknown value).
+        Only compile-time constants and reads of simple scalar variables the
+        body never writes survive, which is exactly the classic rectangular
+        nest (constant or outer-invariant inner bounds). }
+      var
+        ps : pujam_scan;
+        a : longint;
+      begin
+        result:=fen_false;
+        ps:=pujam_scan(arg);
+        case n.nodetype of
+          vecn,derefn,addrn,subscriptn,calln,inlinen:
+            exit(fen_norecurse_true);
+          loadn:
+            begin
+              if (tloadnode(n).symtableentry=ps^.counter_i) or
+                 (tloadnode(n).symtableentry=ps^.counter_j) then
+                exit(fen_norecurse_true);
+              for a:=0 to ps^.naccums-1 do
+                if tloadnode(n).symtableentry=ps^.accsyms[a] then
+                  exit(fen_norecurse_true);
+            end;
+          else
+            ;
+        end;
       end;
 
 
@@ -6994,6 +8714,24 @@ unit optloop;
           if idx<0 then
             exit('the nested loop is not a direct statement of the outer body');
           innerfor:=tfornode(tmparr[idx]);
+
+          { The jam collapses the K per-outer-iteration inner loops into ONE
+            loop, driven by a single copy of the inner bounds.  That is only
+            sound when the inner bounds have the same value for the K
+            consecutive outer iterations i..i+K-1, i.e. are invariant w.r.t.
+            the outer counter.  A bound that reads the outer counter, a renamed
+            accumulator, or memory the outer body may write (an array element
+            such as msgidxmax[i], a pointer target, a field, a call) can differ
+            per outer row -- jamming it would drive the K different-length inner
+            bodies with one wrong trip count and write out of each row's range.
+            Note the iload_total=iload_subscript rule above does NOT cover this:
+            msgidxmax[i] is a "bare array subscript" of i, so it passes there. }
+          if foreachnodestatic(innerfor.right,@ujam_bound_variant_cb,@scan) or
+             foreachnodestatic(innerfor.t1,@ujam_bound_variant_cb,@scan) or
+             (assigned(innerfor.loopstep) and
+              foreachnodestatic(innerfor.loopstep,@ujam_bound_variant_cb,@scan)) then
+            exit('inner loop bounds are not invariant across the unrolled outer iterations (depend on the outer counter or memory the body may write)');
+
           SetLength(prologue,idx);
           nprologue:=idx;
           for i2:=0 to idx-1 do
@@ -7045,6 +8783,7 @@ unit optloop;
         if ujam_reason<>'' then
           begin
             MessagePos1(outerfor.fileinfo,cg_n_loop_not_unrolljammed,ujam_reason);
+            OptRemark(outerfor.fileinfo,'unrolljam','not unroll-and-jammed: '+ujam_reason);
             exit;
           end;
 
@@ -7128,6 +8867,7 @@ unit optloop;
 
         do_firstpass(block);
         MessagePos1(outerfor.fileinfo,cg_n_loop_unrolljammed,tostr(ujam_k));
+        OptRemark(outerfor.fileinfo,'unrolljam','two-level loop nest unroll-and-jammed, outer factor '+tostr(ujam_k));
         outerfor.free;
         n:=block;
         changed:=true;
@@ -7161,6 +8901,1027 @@ unit optloop;
           declines for lack of its own nested loop, then the outer 2-level nest
           matches) }
         foreachnodestatic(pm_postprocess,node,@ujam_processloop_cb,@ctx);
+        Result:=ctx.changed;
+      end;
+
+
+{****************************************************************************
+                              Loop interchange
+ ****************************************************************************}
+
+    { -OoLOOPINTERCHANGE reorders a perfect two-deep counted for-nest so the
+      innermost loop strides the row-contiguous dimension.  See the switch
+      comment in globtype.pas for the soundness argument; in brief, two body
+      shapes are accepted:
+
+        (R) element-wise map   W[idx] := f(R0[idx], R1[idx], ...)
+            the write array W is distinct from every read array and the SAME
+            index tree indexes the write and every read, so if the (i,j)->idx
+            map is not injective the colliding writes are idempotent (they store
+            f of the same, never-written read cells) -- interchange is therefore
+            bit-exact regardless of injectivity; and
+
+        (S) scalar sum-reduction   s := s + T
+            T only READS arrays, so reordering the pure read-and-accumulate is a
+            legal reassociation of an associative+commutative reduction -- exact
+            for an integer accumulator, and for a float accumulator only under
+            -OoFASTMATH (which permits FP reassociation).
+
+      A cost model on the affine subscript coefficients fires the transform only
+      when the interchanged order is strictly more cache-contiguous. }
+
+    { ---- shared object-field array-base recognition for the loop-reordering
+      passes (interchange / tiling).  These passes copy the loop body VERBATIM and
+      only reorder the iteration space, so unlike the vectorizer they need not
+      hoist the field load -- the invariant  Self.FData[idx]  access stays exactly
+      where it was, executed in a different order.  Soundness therefore needs only
+      that the field is loop-invariant, which ic_fieldbase_gate proves (no call in
+      the nest that could reassign the field; the field-handle reference not
+      reassigned in the body).  Array IDENTITY of a field base is its FIELD sym
+      ALONE (never distinguished by which object reference names it), so two
+      accesses to the same field are conservatively treated as the same array --
+      keeping the write/read disjointness sound without assuming two object
+      references denote distinct objects. }
+
+    function ic_write_base_sym(base : tnode) : tsym;
+      { the identifying sym of an accepted WRITE array base (already typeconv-
+        stripped): a simple non-aliased local/value-param VAR sym, or (Self.FData-
+        style) a dynamic-array FIELD sym.  nil if neither. }
+      var
+        v : tabstractvarsym;
+        f : tfieldvarsym;
+        r : tabstractvarsym;
+      begin
+        ic_write_base_sym:=nil;
+        v:=rangeelim_simple_var(base);
+        if assigned(v) then
+          exit(tsym(v));
+        f:=vect_field_base(base,r);
+        if assigned(f) then
+          ic_write_base_sym:=tsym(f);
+      end;
+
+    type
+      tic_fieldscan = record
+        hascall : boolean;
+        reflds  : array of tnode;   { field-base handle loads (Self / obj ref) }
+        nrefs   : longint;
+      end;
+      pic_fieldscan = ^tic_fieldscan;
+
+    function ic_fieldscan_cb(var n : tnode; arg : pointer) : foreachnoderesult;
+      { collects, over a nest body, every object-field array-base handle load and
+        flags any real call (a method could reassign a field). }
+      var
+        fs : pic_fieldscan;
+        base : tnode;
+        r : tabstractvarsym;
+      begin
+        result:=fen_false;
+        fs:=pic_fieldscan(arg);
+        if n.nodetype=calln then
+          begin
+            fs^.hascall:=true;
+            exit;
+          end;
+        if n.nodetype=vecn then
+          begin
+            base:=rangeelim_skip_typeconv(tvecnode(n).left);
+            if assigned(base) and (base.nodetype=subscriptn) and
+               assigned(vect_field_base(base,r)) then
+              begin
+                if fs^.nrefs>=length(fs^.reflds) then
+                  setlength(fs^.reflds,2*fs^.nrefs+4);
+                fs^.reflds[fs^.nrefs]:=tsubscriptnode(base).left;
+                inc(fs^.nrefs);
+              end;
+          end;
+      end;
+
+    function ic_fieldbase_gate(nestbody : tnode) : string;
+      { '' when either no accepted array base in the nest is an object field, or
+        every field base is provably loop-invariant: the body makes NO call (a
+        method could reassign the field) and no field-handle reference is
+        reassigned in the body (DFA).  The single-assignment recognized shape
+        already guarantees the only in-loop write is the array element / scalar
+        accumulator, never a field handle, so the reference-reassignment check is
+        belt-and-suspenders; the no-call gate is the load-bearing one.  Runs on the
+        ORIGINAL nest before the reorder copy. }
+      var
+        fs : tic_fieldscan;
+        i : longint;
+        defsum : tdfaset;
+        refld : tnode;
+      begin
+        result:='';
+        fs.hascall:=false;
+        setlength(fs.reflds,0);
+        fs.nrefs:=0;
+        foreachnodestatic(pm_postprocess,nestbody,@ic_fieldscan_cb,@fs);
+        if fs.nrefs=0 then
+          exit;   { no object-field base -> nothing extra to gate }
+        if fs.hascall then
+          exit('array base is an object field but the nest body makes a call that could reassign it');
+        CalcDefSum(nestbody);
+        if not assigned(nestbody.optinfo) then
+          exit('data-flow information is unavailable for the loop body');
+        defsum:=nestbody.optinfo^.defsum;
+        for i:=0 to fs.nrefs-1 do
+          begin
+            refld:=fs.reflds[i];
+            if assigned(refld) and assigned(refld.optinfo) and
+               DynSetIn(defsum,refld.optinfo^.index) then
+              exit('object-field array base reference is reassigned in the loop');
+          end;
+      end;
+
+    type
+      tic_scan = record
+        iout, iin : tabstractvarsym;  { current outer / inner loop counters }
+        wsym      : tsym;             { subset R: the write-array sym; nil for S }
+        accum     : tsym;            { subset S: the reduction accumulator; nil for R }
+        idxproto  : tnode;           { subset R: the required index of every subscript }
+        subset_r  : boolean;
+        subset_m  : boolean;         { subset M (tiling): array-element reduction addend --
+                                       forbid reading the accumulator array wsym, but the read
+                                       indices may differ from the write (matmul a[]/b[]) }
+        bad       : boolean;
+        badreason : string;
+        idxs      : array of tnode;   { every array-subscript index, for the cost model }
+        nidx      : longint;
+      end;
+
+    function ic_elem_ok(d : tdef) : boolean;
+      { an unmanaged scalar we can element-wise map/reduce without reordering a
+        managed-type refcount side effect: an 8/16/32/64-bit ordinal or Single/
+        Double }
+      begin
+        result:=false;
+        if not assigned(d) then
+          exit;
+        if is_managed_type(d) then
+          exit;
+        if (d.typ=orddef) and (d.size in [1,2,4,8]) then
+          exit(true);
+        if is_single(d) or is_double(d) then
+          exit(true);
+      end;
+
+    function ic_appears_in_mul(n : tnode; c : tsym) : boolean;
+      { true if the counter c appears as a factor of a multiplication -- or of a
+        left-shift, which is how the front end lowers a multiply by a power-of-two
+        stride such as  i*2048 -> i shl 11 -- anywhere in the (affine) index n, i.e.
+        its memory stride over c is non-unit }
+      begin
+        result:=false;
+        n:=rangeelim_skip_typeconv(n);
+        if not assigned(n) then
+          exit;
+        if n.nodetype=muln then
+          if (ujam_count_refs(tbinarynode(n).left,c)>0) or
+             (ujam_count_refs(tbinarynode(n).right,c)>0) then
+            exit(true);
+        if n.nodetype=shln then
+          if (ujam_count_refs(tbinarynode(n).left,c)>0) or
+             (ujam_count_refs(tbinarynode(n).right,c)>0) then
+            exit(true);
+        case n.nodetype of
+          addn,subn,muln,divn,modn,slashn,andn,orn,xorn,shln,shrn:
+            result:=ic_appears_in_mul(tbinarynode(n).left,c) or
+                    ic_appears_in_mul(tbinarynode(n).right,c);
+          unaryminusn,notn:
+            result:=ic_appears_in_mul(tunarynode(n).left,c);
+          else
+            ; { any other node: the counter does not appear scaled here }
+        end;
+      end;
+
+    function ic_has_bare_term(n : tnode; c : tsym) : boolean;
+      { true if c appears as a bare additive term of the index n (stride +/-1),
+        not folded inside a multiplication }
+      begin
+        result:=false;
+        n:=rangeelim_skip_typeconv(n);
+        if not assigned(n) then
+          exit;
+        case n.nodetype of
+          addn,subn:
+            result:=ic_has_bare_term(tbinarynode(n).left,c) or
+                    ic_has_bare_term(tbinarynode(n).right,c);
+          loadn:
+            result:=(tloadnode(n).symtableentry=c);
+          else
+            ; { any other node: no bare (+/-1 stride) occurrence of the counter }
+        end;
+      end;
+
+    procedure ic_add_idx(var sc : tic_scan; idx : tnode);
+      begin
+        if sc.nidx>=length(sc.idxs) then
+          setlength(sc.idxs,2*sc.nidx+4);
+        sc.idxs[sc.nidx]:=idx;
+        inc(sc.nidx);
+      end;
+
+    procedure ic_check_expr(var sc : tic_scan; n : tnode);
+      { recursive whitelist of the body RHS / reduction addend: only literals,
+        loop-invariant scalar reads, single-dimension array subscripts (validated
+        against the subset rules) and pure arithmetic are allowed.  Collects every
+        subscript index for the cost model.  Any call/deref/unknown node, a bare
+        counter use, or (subset R) a read of the written array / a mismatched read
+        index sets sc.bad. }
+      var
+        s, bsym : tsym;
+        base : tnode;
+        fldref : tabstractvarsym;
+      begin
+        if sc.bad then
+          exit;
+        n:=rangeelim_skip_typeconv(n);
+        if not assigned(n) then
+          exit;
+        case n.nodetype of
+          ordconstn,realconstn,pointerconstn,niln:
+            ; { a literal }
+          loadn:
+            begin
+              s:=tloadnode(n).symtableentry;
+              if (s=tsym(sc.iout)) or (s=tsym(sc.iin)) then
+                begin
+                  sc.bad:=true;
+                  sc.badreason:='a loop counter is used outside an array subscript';
+                end
+              else if assigned(sc.accum) and (s=sc.accum) then
+                begin
+                  sc.bad:=true;
+                  sc.badreason:='the reduction accumulator is re-read in the addend';
+                end;
+              { otherwise a loop-invariant scalar read -- fine }
+            end;
+          vecn:
+            begin
+              base:=rangeelim_skip_typeconv(tvecnode(n).left);
+              if assigned(base) and (base.nodetype=loadn) then
+                bsym:=tloadnode(base).symtableentry
+              else if assigned(base) and (base.nodetype=subscriptn) and
+                      assigned(vect_field_base(base,fldref)) then
+                { a  Self.FData -style object-field dynamic-array base, identified
+                  by its field sym (the reorder passes leave the access in place; a
+                  field is loop-invariant per ic_fieldbase_gate) }
+                bsym:=tsym(vect_field_base(base,fldref))
+              else
+                begin
+                  sc.bad:=true;
+                  sc.badreason:='a multi-dimensional or computed array base is not supported';
+                  exit;
+                end;
+              if sc.subset_r then
+                begin
+                  if bsym=sc.wsym then
+                    begin
+                      sc.bad:=true;
+                      sc.badreason:='the written array is also read in the body (possible loop-carried dependence)';
+                      exit;
+                    end;
+                  if not assigned(sc.idxproto) or not tvecnode(n).right.isequal(sc.idxproto) then
+                    begin
+                      sc.bad:=true;
+                      sc.badreason:='a read subscript uses a different index than the write (unproven dependence)';
+                      exit;
+                    end;
+                end;
+              if sc.subset_m then
+                begin
+                  { the reduction addend must not read the accumulator array
+                    (that would be a real loop-carried dependence beyond the
+                    single-cell reduction); the read index is free to differ from
+                    the write index -- the matmul a[i*K+k]/b[k*N+j] shape }
+                  if bsym=sc.wsym then
+                    begin
+                      sc.bad:=true;
+                      sc.badreason:='the accumulator array is read in the reduction addend (loop-carried dependence)';
+                      exit;
+                    end;
+                end;
+              ic_add_idx(sc,tvecnode(n).right);
+              { deliberately do NOT recurse into the subscript index (it holds the
+                counters) nor into the plain array-base load }
+            end;
+          addn,subn,muln,divn,modn,slashn,andn,orn,xorn,shln,shrn:
+            begin
+              ic_check_expr(sc,tbinarynode(n).left);
+              ic_check_expr(sc,tbinarynode(n).right);
+            end;
+          unaryminusn,notn:
+            ic_check_expr(sc,tunarynode(n).left);
+          else
+            begin
+              sc.bad:=true;
+              sc.badreason:='body contains an unsupported operation (call, pointer deref, ...)';
+            end;
+        end;
+      end;
+
+    function ic_single_stmt(body : tnode) : tnode;
+      { the sole meaningful (non-nothingn) statement of body, descending through
+        block wrappers; nil if there is not exactly one }
+      var
+        s, found : tnode;
+        cnt : longint;
+      begin
+        result:=nil;
+        while assigned(body) and (body.nodetype=blockn) do
+          body:=tblocknode(body).left;
+        if not assigned(body) then
+          exit;
+        if body.nodetype<>statementn then
+          exit(body);
+        found:=nil;
+        cnt:=0;
+        s:=body;
+        while assigned(s) and (s.nodetype=statementn) do
+          begin
+            if assigned(tstatementnode(s).left) and (tstatementnode(s).left.nodetype<>nothingn) then
+              begin
+                found:=tstatementnode(s).left;
+                inc(cnt);
+              end;
+            s:=tstatementnode(s).right;
+          end;
+        if cnt<>1 then
+          exit;
+        if found.nodetype=blockn then
+          result:=ic_single_stmt(found)
+        else
+          result:=found;
+      end;
+
+    type
+      tinterchangecontext = object
+        root : tnode;
+        changed : boolean;
+        procedure processloop(var n : tnode);
+      end;
+
+    procedure tinterchangecontext.processloop(var n : tnode);
+      var
+        outerfor, innerfor : tfornode;
+        iout, iin, accsym : tabstractvarsym;
+        sc : tic_scan;
+        body, lhs, rhs, taddend, base : tnode;
+        la, ra : tnode;
+        accdef : tdef;
+        recognized_nest : boolean;
+        cont_in, cont_out : longint;
+        any_in_scaled : boolean;
+        hascheck : boolean;
+        newinner, newouter, oldouter : tnode;
+        reason : string;
+
+      function ic_reason : string;
+        var
+          a : longint;
+        begin
+          result:='';
+          { --- outer loop shape --- }
+          if lnf_backward in outerfor.loopflags then
+            exit('outer loop is descending (downto)');
+          if assigned(outerfor.loopstep) then
+            exit('outer loop has a non-unit step');
+          iout:=rangeelim_simple_var(outerfor.left);
+          if not assigned(iout) then
+            exit('outer counter is not a simple non-aliased variable');
+          if not assigned(outerfor.left.resultdef) or (outerfor.left.resultdef.typ<>orddef) or
+             not is_signed(outerfor.left.resultdef) or not(outerfor.left.resultdef.size in [4,8]) then
+            exit('outer counter is not a signed 32/64-bit integer');
+          if ([cs_check_range,cs_check_overflow]*current_settings.localswitches)<>[] then
+            exit('range/overflow checking is enabled (-Cr/-Co)');
+          if not fuse_bound_pure(outerfor.right) or not fuse_bound_pure(outerfor.t1) then
+            exit('outer loop bounds are not side-effect free');
+
+          { --- the outer body must be exactly one nested counted loop --- }
+          body:=ic_single_stmt(outerfor.t2);
+          if not assigned(body) or (body.nodetype<>forn) then
+            exit('outer body is not a single perfectly-nested counted loop');
+          innerfor:=tfornode(body);
+          if lnf_backward in innerfor.loopflags then
+            exit('inner loop is descending (downto)');
+          if assigned(innerfor.loopstep) then
+            exit('inner loop has a non-unit step');
+          iin:=rangeelim_simple_var(innerfor.left);
+          if not assigned(iin) then
+            exit('inner counter is not a simple non-aliased variable');
+          if iin=iout then
+            exit('inner and outer loops share one counter');
+          if not assigned(innerfor.left.resultdef) or (innerfor.left.resultdef.typ<>orddef) or
+             not is_signed(innerfor.left.resultdef) or not(innerfor.left.resultdef.size in [4,8]) then
+            exit('inner counter is not a signed 32/64-bit integer');
+          if not fuse_bound_pure(innerfor.right) or not fuse_bound_pure(innerfor.t1) then
+            exit('inner loop bounds are not side-effect free');
+          { rectangular nest: inner bounds must not depend on the outer counter }
+          if (ujam_count_refs(innerfor.right,tsym(iout))<>0) or
+             (ujam_count_refs(innerfor.t1,tsym(iout))<>0) then
+            exit('inner loop bounds depend on the outer counter (non-rectangular nest)');
+          { and the outer bounds must not reference the inner counter }
+          if (ujam_count_refs(outerfor.right,tsym(iin))<>0) or
+             (ujam_count_refs(outerfor.t1,tsym(iin))<>0) then
+            exit('outer loop bounds reference the inner counter');
+          { decline any per-region R+/Q+ inside the nest }
+          hascheck:=false;
+          if foreachnodestatic(outerfor.t2,@vect_check_cb,@hascheck) then
+            exit('nest body has per-region range/overflow checking');
+
+          { Both counters must be dead on exit from their loop: interchange only
+            changes a counter's post-loop value in the zero-trip-count corner
+            cases (when both trip counts are non-zero the terminal values are
+            identical), so requiring the DFA-computed lnf_dont_mind_loopvar_on_exit
+            makes that difference unobservable while still permitting the usual
+            reuse of i/j by later loops (each re-initialises the counter before any
+            read).  The inner flag reflects i being dead after the inner loop,
+            which -- the nest being perfect -- is also the nest exit. }
+          if not(lnf_dont_mind_loopvar_on_exit in outerfor.loopflags) then
+            exit('outer counter may be read after the nest (live on loop exit)');
+          if not(lnf_dont_mind_loopvar_on_exit in innerfor.loopflags) then
+            exit('inner counter may be read after the nest (live on loop exit)');
+
+          recognized_nest:=true;
+
+          { --- inner body must be a single assignment --- }
+          body:=ic_single_stmt(innerfor.t2);
+          if not assigned(body) or (body.nodetype<>assignn) then
+            exit('inner loop body is not a single assignment');
+          lhs:=tassignmentnode(body).left;
+          rhs:=tassignmentnode(body).right;
+
+          sc.iout:=iout;
+          sc.iin:=iin;
+          sc.wsym:=nil;
+          sc.accum:=nil;
+          sc.idxproto:=nil;
+          sc.subset_r:=false;
+          sc.bad:=false;
+          sc.badreason:='';
+          setlength(sc.idxs,0);
+          sc.nidx:=0;
+
+          if lhs.nodetype=vecn then
+            begin
+              { subset R: W[idx] := f(...) }
+              base:=rangeelim_skip_typeconv(tvecnode(lhs).left);
+              if not assigned(base) or not assigned(ic_write_base_sym(base)) then
+                exit('the written array is not a simple single-dimension array variable or invariant object field');
+              if not ic_elem_ok(lhs.resultdef) then
+                exit('the written element is not an unmanaged scalar');
+              sc.subset_r:=true;
+              sc.wsym:=ic_write_base_sym(base);
+              if (sc.wsym=tsym(iout)) or (sc.wsym=tsym(iin)) then
+                exit('the write target is a loop counter');
+              sc.idxproto:=tvecnode(lhs).right;
+              ic_add_idx(sc,sc.idxproto);
+              ic_check_expr(sc,rhs);
+              if sc.bad then
+                exit(sc.badreason);
+            end
+          else if lhs.nodetype=loadn then
+            begin
+              { subset S: s := s + T }
+              accsym:=rangeelim_simple_var(lhs);
+              if not assigned(accsym) then
+                exit('the assignment target is not a simple non-aliased scalar');
+              accdef:=accsym.vardef;
+              if not ic_elem_ok(accdef) then
+                exit('the reduction accumulator is not an unmanaged scalar');
+              if (tsym(accsym)=tsym(iout)) or (tsym(accsym)=tsym(iin)) then
+                exit('the assignment target is a loop counter');
+              if rhs.nodetype<>addn then
+                exit('body is not a recognized  s := s + <addend>  reduction');
+              la:=taddnode(rhs).left;
+              ra:=taddnode(rhs).right;
+              taddend:=nil;
+              if (rangeelim_skip_typeconv(la).nodetype=loadn) and
+                 (tloadnode(rangeelim_skip_typeconv(la)).symtableentry=tsym(accsym)) then
+                taddend:=ra
+              else if (rangeelim_skip_typeconv(ra).nodetype=loadn) and
+                 (tloadnode(rangeelim_skip_typeconv(ra)).symtableentry=tsym(accsym)) then
+                taddend:=la;
+              if not assigned(taddend) then
+                exit('body is not a recognized  s := s + <addend>  reduction');
+              if (is_single(accdef) or is_double(accdef)) and
+                 not(cs_opt_fastmath in current_settings.optimizerswitches) then
+                exit('floating-point reduction interchange needs fast-math (-OoFASTMATH)');
+              sc.accum:=tsym(accsym);
+              ic_check_expr(sc,taddend);
+              if sc.bad then
+                exit(sc.badreason);
+            end
+          else
+            exit('inner body is neither an element-wise array write nor a scalar reduction');
+
+          { --- cost model: interchange only when the swapped inner counter (iout)
+            is contiguous on strictly more accesses than the current inner (iin),
+            and at least one current-inner access is non-contiguous (scaled) --- }
+          cont_in:=0;
+          cont_out:=0;
+          any_in_scaled:=false;
+          for a:=0 to sc.nidx-1 do
+            begin
+              if ic_appears_in_mul(sc.idxs[a],tsym(iin)) then
+                any_in_scaled:=true
+              else if ic_has_bare_term(sc.idxs[a],tsym(iin)) then
+                inc(cont_in);
+              if (not ic_appears_in_mul(sc.idxs[a],tsym(iout))) and
+                 ic_has_bare_term(sc.idxs[a],tsym(iout)) then
+                inc(cont_out);
+            end;
+          if not(any_in_scaled and (cont_out>cont_in)) then
+            exit('interchange is not more cache-contiguous than the current order');
+
+          { any object-field array base (Self.FData-style) must be loop-invariant }
+          result:=ic_fieldbase_gate(outerfor.t2);
+        end;
+
+      begin
+        if n.nodetype<>forn then
+          exit;
+        outerfor:=tfornode(n);
+        recognized_nest:=false;
+        reason:=ic_reason;
+        if reason<>'' then
+          begin
+            { only diagnose genuine 2-deep nests, to avoid noise on every loop }
+            if recognized_nest and (cs_opt_report in current_settings.optimizerswitches) then
+              OptRemark(outerfor.fileinfo,'loopinterchange','not interchanged: '+reason);
+            exit;
+          end;
+
+        { --- rebuild the nest with the loops swapped.  The outer counter/bounds
+          become the new INNER loop and the inner counter/bounds the new OUTER
+          loop, wrapping an unchanged copy of the body. --- }
+        newinner:=cfornode.create(
+          outerfor.left.getcopy,outerfor.right.getcopy,outerfor.t1.getcopy,
+          innerfor.t2.getcopy,false);
+        newouter:=cfornode.create(
+          innerfor.left.getcopy,innerfor.right.getcopy,innerfor.t1.getcopy,
+          newinner,false);
+
+        if cs_opt_report in current_settings.optimizerswitches then
+          OptRemark(outerfor.fileinfo,'loopinterchange',
+            'perfect 2-deep counted nest interchanged so the inner loop strides the contiguous dimension');
+
+        oldouter:=n;
+        n:=newouter;
+        do_firstpass(n);
+        oldouter.free;
+        changed:=true;
+      end;
+
+    function interchange_processloop_cb(var n : tnode; arg : pointer) : foreachnoderesult;
+      var
+        before : boolean;
+      begin
+        result:=fen_false;
+        if n.nodetype=forn then
+          begin
+            before:=tinterchangecontext(arg^).changed;
+            tinterchangecontext(arg^).processloop(n);
+            { pm_postprocess invokes this callback BEFORE descending into the
+              node's children, so a for-node we DECLINE must still let the walk
+              recurse -- otherwise a nest wrapped in an outer loop (e.g. a
+              repeat-count  for r  around the 2-deep nest) would never be reached.
+              Only when we actually transformed this node do we stop, because n is
+              now a freshly built replacement whose inner loop must not be
+              re-walked. }
+            if tinterchangecontext(arg^).changed<>before then
+              result:=fen_norecurse_false;
+          end;
+      end;
+
+    function OptimizeLoopInterchange(node : tnode) : boolean;
+      var
+        ctx : tinterchangecontext;
+      begin
+        Result:=false;
+        if (cs_opt_size in current_settings.optimizerswitches) then
+          exit;
+        if not(pi_dfaavailable in current_procinfo.flags) then
+          exit;
+        ctx.root:=node;
+        ctx.changed:=false;
+        { postorder so a nested inner loop is visited (and declines) before the
+          2-level nest that encloses it }
+        foreachnodestatic(pm_postprocess,node,@interchange_processloop_cb,@ctx);
+        Result:=ctx.changed;
+      end;
+
+
+{****************************************************************************
+                        Loop tiling / cache blocking
+ ****************************************************************************}
+
+    { -OoLOOPTILE blocks a perfect three-deep counted for-nest of the classic
+      matmul/conv reduction shape
+
+        for i:=0 to M-1 do
+          for j:=0 to N-1 do
+            for k:=0 to K-1 do
+              C[wi] := C[wi] + T;        (* wi affine in i,j only; T only READS
+                                          arrays other than C, e.g. a[i*K+k]*b[k*N+j] *)
+
+      into cache-sized tiles over the OUTPUT loops i and j, with the point loops
+      emitted in i / k / j order (the original j and k interchanged) so the
+      innermost loop strides the CONTIGUOUS dimension:
+
+        for it:=0 to M-1 step B do
+          for jt:=0 to N-1 step B do
+            for i:=it to min(it+B-1,M-1) do
+              for k:=0 to K-1 do
+                for j:=jt to min(jt+B-1,N-1) do
+                  C[i*N+j] := C[i*N+j] + a[i*K+k]*b[k*N+j];
+
+      so a reused operand panel -- a K*B slice of B (invariant of i), plus the
+      B-block of C -- stays cache-resident across the inner iterations of a tile
+      instead of being re-streamed from memory on every pass, AND every inner-loop
+      access is unit-stride (b[k*N+j] and C[i*N+j] over j).  The named gcc
+      -floop-block / polyhedral tiling transform, ported to FPC's tree optimizer;
+      it COMPOSES tiling with loop interchange (moving the contiguous j loop
+      innermost) -- without that the inner loop would stride b by N and blocking
+      could not help.
+
+      SOUNDNESS.  The write index C[i*N+j] is invariant of the reduction counter k
+      (required), and interchanging the j and k loops leaves each output cell
+      C[i*N+j] touched exactly once per k in increasing-k order (k is now the
+      middle loop, j the inner), so the per-cell reduction order is UNCHANGED --
+      bit-identical per cell.  The only reordering across cells is the blocked
+      visit order of the (i,j) cells.  When wi is injective over the (i,j)
+      rectangle -- the matmul norm, since i's coefficient is the row stride >= the
+      j trip count -- distinct (i,j) never share a cell, so the transform is
+      bit-exact for ANY element type.  The only way two (i,j) can collide is a
+      non-injective index, whose two complete per-cell sums are then reordered:
+      exact for an integer accumulator (integer + is associative), and for a FLOAT
+      accumulator permitted only under -OoFASTMATH (which allows FP reassociation)
+      -- we require that conservatively rather than proving injectivity here.
+      Reuse cost model: fire only when at least one read operand is invariant of i
+      AND at least one is invariant of j (genuine reuse across both tiled loops --
+      the matmul a[]/b[] signature), which declines a no-reuse element-wise nest
+      where tiling would only add loop overhead.
+
+      Legality reuses the interchange machinery: perfect counted nest, rectangular
+      (each loop's bounds independent of the inner counters), unit ascending step,
+      no -Cr/-Co, all three counters dead on exit, body free of calls / pointer
+      derefs / a read of the accumulator array.  The psub call site additionally
+      skips procedures with labels. }
+
+    const
+      tile_block = 64;   { iterations per tile edge; measured sweet spot on the
+                           bandwidth-bound matmul kernel (see the tasklist note) }
+
+    var
+      looptile_seq : longint;
+
+    function tile_make_min(a, b : tnode; d : tdef) : tnode;
+      { min(a,b) as an inline node of the counter's integer type d.  Both operands
+        are forced to exactly d: an add such as  it+63  promotes to int64 under
+        FPC's longint+longint rule, which would otherwise mismatch the chosen
+        in_min_longint inline (operand int64 vs a 32-bit min) and crash codegen.
+        The operands are provably within d's range (it,hi are d-typed loop values
+        and it+B-1 is capped by the min against hi), so the narrowing is exact. }
+      var
+        innr : tinlinenumber;
+      begin
+        if d.size>=8 then
+          innr:=in_min_int64
+        else
+          innr:=in_min_longint;
+        result:=cinlinenode.create(innr,false,
+          ccallparanode.create(ctypeconvnode.create_internal(a,d),
+            ccallparanode.create(ctypeconvnode.create_internal(b,d),nil)));
+      end;
+
+    type
+      ttilecontext = object
+        root : tnode;
+        changed : boolean;
+        procedure processloop(var n : tnode);
+      end;
+
+    procedure ttilecontext.processloop(var n : tnode);
+      var
+        outerfor, midfor, innerfor : tfornode;
+        iout, jmid, kin : tabstractvarsym;
+        sc : tic_scan;
+        body, lhs, rhs, taddend, base, wi, la, ra : tnode;
+        accdef : tdef;
+        recognized_nest : boolean;
+        reuse_i, reuse_j : boolean;
+        hascheck : boolean;
+        itsym, jtsym, ihsym, jhsym : tlocalvarsym;
+        newk, pointj, pointi, tilej, tilei, tilejbody, tileibody : tnode;
+        stmt : tstatementnode;
+        oldnest : tnode;
+        reason : string;
+
+      function tile_reason : string;
+        var
+          a : longint;
+        begin
+          result:='';
+          { --- outer loop i --- }
+          if lnf_backward in outerfor.loopflags then
+            exit('outer loop is descending (downto)');
+          if assigned(outerfor.loopstep) then
+            exit('outer loop has a non-unit step');
+          iout:=rangeelim_simple_var(outerfor.left);
+          if not assigned(iout) then
+            exit('outer counter is not a simple non-aliased variable');
+          if not assigned(outerfor.left.resultdef) or (outerfor.left.resultdef.typ<>orddef) or
+             not is_signed(outerfor.left.resultdef) or not(outerfor.left.resultdef.size in [4,8]) then
+            exit('outer counter is not a signed 32/64-bit integer');
+          if ([cs_check_range,cs_check_overflow]*current_settings.localswitches)<>[] then
+            exit('range/overflow checking is enabled (-Cr/-Co)');
+          if not fuse_bound_pure(outerfor.right) or not fuse_bound_pure(outerfor.t1) then
+            exit('outer loop bounds are not side-effect free');
+
+          { --- middle loop j (perfect nest) --- }
+          body:=ic_single_stmt(outerfor.t2);
+          if not assigned(body) or (body.nodetype<>forn) then
+            exit('outer body is not a single perfectly-nested counted loop');
+          midfor:=tfornode(body);
+          if lnf_backward in midfor.loopflags then
+            exit('middle loop is descending (downto)');
+          if assigned(midfor.loopstep) then
+            exit('middle loop has a non-unit step');
+          jmid:=rangeelim_simple_var(midfor.left);
+          if not assigned(jmid) then
+            exit('middle counter is not a simple non-aliased variable');
+          if jmid=iout then
+            exit('outer and middle loops share one counter');
+          if not assigned(midfor.left.resultdef) or (midfor.left.resultdef.typ<>orddef) or
+             not is_signed(midfor.left.resultdef) or not(midfor.left.resultdef.size in [4,8]) then
+            exit('middle counter is not a signed 32/64-bit integer');
+          if not fuse_bound_pure(midfor.right) or not fuse_bound_pure(midfor.t1) then
+            exit('middle loop bounds are not side-effect free');
+          { rectangular: middle bounds independent of the outer counter }
+          if (ujam_count_refs(midfor.right,tsym(iout))<>0) or
+             (ujam_count_refs(midfor.t1,tsym(iout))<>0) then
+            exit('middle loop bounds depend on the outer counter (non-rectangular nest)');
+          if (ujam_count_refs(outerfor.right,tsym(jmid))<>0) or
+             (ujam_count_refs(outerfor.t1,tsym(jmid))<>0) then
+            exit('outer loop bounds reference the middle counter');
+
+          { --- inner loop k (perfect nest, the reduction loop) --- }
+          body:=ic_single_stmt(midfor.t2);
+          if not assigned(body) or (body.nodetype<>forn) then
+            exit('middle body is not a single perfectly-nested counted loop');
+          innerfor:=tfornode(body);
+          if lnf_backward in innerfor.loopflags then
+            exit('inner loop is descending (downto)');
+          if assigned(innerfor.loopstep) then
+            exit('inner loop has a non-unit step');
+          kin:=rangeelim_simple_var(innerfor.left);
+          if not assigned(kin) then
+            exit('inner counter is not a simple non-aliased variable');
+          if (kin=iout) or (kin=jmid) then
+            exit('two loops share one counter');
+          if not assigned(innerfor.left.resultdef) or (innerfor.left.resultdef.typ<>orddef) or
+             not is_signed(innerfor.left.resultdef) or not(innerfor.left.resultdef.size in [4,8]) then
+            exit('inner counter is not a signed 32/64-bit integer');
+          if not fuse_bound_pure(innerfor.right) or not fuse_bound_pure(innerfor.t1) then
+            exit('inner loop bounds are not side-effect free');
+          { rectangular: inner bounds independent of the two outer counters }
+          if (ujam_count_refs(innerfor.right,tsym(iout))<>0) or (ujam_count_refs(innerfor.t1,tsym(iout))<>0) or
+             (ujam_count_refs(innerfor.right,tsym(jmid))<>0) or (ujam_count_refs(innerfor.t1,tsym(jmid))<>0) then
+            exit('inner loop bounds depend on an outer counter (non-rectangular nest)');
+          if (ujam_count_refs(outerfor.right,tsym(kin))<>0) or (ujam_count_refs(outerfor.t1,tsym(kin))<>0) or
+             (ujam_count_refs(midfor.right,tsym(kin))<>0) or (ujam_count_refs(midfor.t1,tsym(kin))<>0) then
+            exit('an outer loop bound references the inner counter');
+
+          { decline any per-region R+/Q+ inside the nest }
+          hascheck:=false;
+          if foreachnodestatic(outerfor.t2,@vect_check_cb,@hascheck) then
+            exit('nest body has per-region range/overflow checking');
+
+          { all three counters dead on exit: tiling only changes a counter's
+            post-loop value in the zero-trip corner cases; requiring the
+            DFA-computed lnf_dont_mind_loopvar_on_exit makes that unobservable }
+          if not(lnf_dont_mind_loopvar_on_exit in outerfor.loopflags) then
+            exit('outer counter may be read after the nest (live on loop exit)');
+          if not(lnf_dont_mind_loopvar_on_exit in midfor.loopflags) then
+            exit('middle counter may be read after the nest (live on loop exit)');
+          if not(lnf_dont_mind_loopvar_on_exit in innerfor.loopflags) then
+            exit('inner counter may be read after the nest (live on loop exit)');
+
+          { --- inner body: a single array-element reduction  C[wi]:=C[wi]+T --- }
+          body:=ic_single_stmt(innerfor.t2);
+          if not assigned(body) or (body.nodetype<>assignn) then
+            exit('inner loop body is not a single assignment');
+          lhs:=tassignmentnode(body).left;
+          rhs:=tassignmentnode(body).right;
+          if lhs.nodetype<>vecn then
+            exit('inner body does not write an array element (not a C[..]:=... reduction)');
+          base:=rangeelim_skip_typeconv(tvecnode(lhs).left);
+          if not assigned(base) or not assigned(ic_write_base_sym(base)) then
+            exit('the accumulator array is not a simple single-dimension array variable or invariant object field');
+          if not ic_elem_ok(lhs.resultdef) then
+            exit('the accumulated element is not an unmanaged scalar');
+          if rhs.nodetype<>addn then
+            exit('inner body is not a recognized  C[idx] := C[idx] + <addend>  reduction');
+          la:=taddnode(rhs).left;
+          ra:=taddnode(rhs).right;
+          taddend:=nil;
+          if la.isequal(lhs) then
+            taddend:=ra
+          else if ra.isequal(lhs) then
+            taddend:=la;
+          if not assigned(taddend) then
+            exit('inner body is not a recognized  C[idx] := C[idx] + <addend>  reduction');
+
+          wi:=tvecnode(lhs).right;
+          { the reduction cell must be invariant of the innermost (reduction)
+            counter, and vary with BOTH tiled counters (a genuine 2-D output) }
+          if ujam_count_refs(wi,tsym(kin))<>0 then
+            exit('the write index varies with the innermost loop (not a k-reduction)');
+          if (ujam_count_refs(wi,tsym(iout))=0) or (ujam_count_refs(wi,tsym(jmid))=0) then
+            exit('the write index does not depend on both tiled counters');
+
+          recognized_nest:=true;
+
+          { scan the addend (subset M): read-only, no accumulator-array read, no
+            call/deref, collect the read indices for the reuse cost model }
+          sc.iout:=iout;
+          sc.iin:=jmid;
+          sc.wsym:=ic_write_base_sym(base);
+          sc.accum:=nil;
+          sc.idxproto:=nil;
+          sc.subset_r:=false;
+          sc.subset_m:=true;
+          sc.bad:=false;
+          sc.badreason:='';
+          setlength(sc.idxs,0);
+          sc.nidx:=0;
+          ic_check_expr(sc,taddend);
+          if sc.bad then
+            exit(sc.badreason);
+
+          { float accumulator needs fast-math (cross-cell reassociation gate) }
+          accdef:=lhs.resultdef;
+          if (is_single(accdef) or is_double(accdef)) and
+             not(cs_opt_fastmath in current_settings.optimizerswitches) then
+            exit('floating-point reduction tiling needs fast-math (-OoFASTMATH)');
+
+          { reuse cost model: some operand invariant of i AND some invariant of j }
+          reuse_i:=false;
+          reuse_j:=false;
+          for a:=0 to sc.nidx-1 do
+            begin
+              if ujam_count_refs(sc.idxs[a],tsym(iout))=0 then
+                reuse_i:=true;
+              if ujam_count_refs(sc.idxs[a],tsym(jmid))=0 then
+                reuse_j:=true;
+            end;
+          if not(reuse_i and reuse_j) then
+            exit('no operand is reused across both tiled loops (tiling would not improve locality)');
+
+          { any object-field array base (Self.FData-style) must be loop-invariant }
+          result:=ic_fieldbase_gate(outerfor.t2);
+        end;
+
+      begin
+        if n.nodetype<>forn then
+          exit;
+        outerfor:=tfornode(n);
+        recognized_nest:=false;
+        reason:=tile_reason;
+        if reason<>'' then
+          begin
+            if recognized_nest and (cs_opt_report in current_settings.optimizerswitches) then
+              OptRemark(outerfor.fileinfo,'looptile','not tiled: '+reason);
+            exit;
+          end;
+
+        { --- build the tiled nest.  it/jt are fresh tile counters and ih/jh fresh
+          per-tile upper-bound temps (of the outer / middle counter type); the
+          original i,j,k counters are re-driven by the point loops and the
+          unchanged inner k-loop.  The tile-end bound  min(it+B-1, hi)  is
+          snapshotted into ih/jh once per tile (like a hand-written blocked loop)
+          rather than used inline as the point loop's `to` expression, which keeps
+          the point loop a clean constant-bounded counted loop for the downstream
+          induction/RMW passes. --- }
+        inc(looptile_seq);
+        itsym:=clocalvarsym.create('$tile_i$'+tostr(looptile_seq),vs_value,outerfor.left.resultdef,[]);
+        itsym.register_sym;
+        current_procinfo.procdef.localst.insertsym(itsym);
+        ihsym:=clocalvarsym.create('$tile_ih$'+tostr(looptile_seq),vs_value,outerfor.left.resultdef,[]);
+        ihsym.register_sym;
+        current_procinfo.procdef.localst.insertsym(ihsym);
+        jtsym:=clocalvarsym.create('$tile_j$'+tostr(looptile_seq),vs_value,midfor.left.resultdef,[]);
+        jtsym.register_sym;
+        current_procinfo.procdef.localst.insertsym(jtsym);
+        jhsym:=clocalvarsym.create('$tile_jh$'+tostr(looptile_seq),vs_value,midfor.left.resultdef,[]);
+        jhsym.register_sym;
+        current_procinfo.procdef.localst.insertsym(jhsym);
+
+        { The point loops are emitted in i / k / j order (the original j and k
+          interchanged), so the innermost loop is j -- the CONTIGUOUS dimension of
+          both the write c[i*N+j] and the read b[k*N+j].  Interchanging the j and k
+          loops is bit-exact: c[i*N+j] is still touched exactly once per k, in
+          increasing k order (k is now the middle loop, j the inner), so the
+          per-cell reduction order is unchanged.  This is the composition of loop
+          tiling with loop interchange the tasklist asks for; without it the inner
+          loop would stride b by N and blocking could not improve locality. }
+
+        { point-j (innermost, contiguous):  for j := jt to jh do <body> }
+        pointj:=cfornode.create(
+          midfor.left.getcopy,
+          cloadnode.create(jtsym,jtsym.owner),
+          cloadnode.create(jhsym,jhsym.owner),
+          innerfor.t2.getcopy,false);
+
+        { point-k (middle, the full-range reduction):  for k := k0 to k1 do <point-j> }
+        newk:=cfornode.create(
+          innerfor.left.getcopy,
+          innerfor.right.getcopy,innerfor.t1.getcopy,
+          pointj,false);
+
+        { point-i (outer):  for i := it to ih do <point-k> }
+        pointi:=cfornode.create(
+          outerfor.left.getcopy,
+          cloadnode.create(itsym,itsym.owner),
+          cloadnode.create(ihsym,ihsym.owner),
+          newk,false);
+
+        { tile-j body:  jh := min(jt+B-1, N-1);  <point-i> }
+        tilejbody:=internalstatements(stmt);
+        addstatement(stmt,cassignmentnode.create(
+          cloadnode.create(jhsym,jhsym.owner),
+          tile_make_min(
+            caddnode.create(addn,cloadnode.create(jtsym,jtsym.owner),
+              cordconstnode.create(tile_block-1,midfor.left.resultdef,false)),
+            midfor.t1.getcopy,midfor.left.resultdef)));
+        addstatement(stmt,pointi);
+
+        { tile-j:  for jt := <j-from> to <j-to> step B do <tile-j body> }
+        tilej:=cfornode.create(
+          cloadnode.create(jtsym,jtsym.owner),
+          midfor.right.getcopy,midfor.t1.getcopy,tilejbody,false);
+        tfornode(tilej).loopstep:=cordconstnode.create(tile_block,midfor.left.resultdef,false);
+
+        { tile-i body:  ih := min(it+B-1, M-1);  <tile-j> }
+        tileibody:=internalstatements(stmt);
+        addstatement(stmt,cassignmentnode.create(
+          cloadnode.create(ihsym,ihsym.owner),
+          tile_make_min(
+            caddnode.create(addn,cloadnode.create(itsym,itsym.owner),
+              cordconstnode.create(tile_block-1,outerfor.left.resultdef,false)),
+            outerfor.t1.getcopy,outerfor.left.resultdef)));
+        addstatement(stmt,tilej);
+
+        { tile-i:  for it := <i-from> to <i-to> step B do <tile-i body> }
+        tilei:=cfornode.create(
+          cloadnode.create(itsym,itsym.owner),
+          outerfor.right.getcopy,outerfor.t1.getcopy,tileibody,false);
+        tfornode(tilei).loopstep:=cordconstnode.create(tile_block,outerfor.left.resultdef,false);
+
+        if cs_opt_report in current_settings.optimizerswitches then
+          OptRemark(outerfor.fileinfo,'looptile',
+            'perfect 3-deep matmul-shaped nest cache-blocked into '+tostr(tile_block)+
+            'x'+tostr(tile_block)+' tiles (point loops reordered i/k/j so the inner loop strides the contiguous dimension)');
+
+        oldnest:=n;
+        n:=tilei;
+        do_firstpass(n);
+        oldnest.free;
+        changed:=true;
+      end;
+
+    function tile_processloop_cb(var n : tnode; arg : pointer) : foreachnoderesult;
+      var
+        before : boolean;
+      begin
+        result:=fen_false;
+        if n.nodetype=forn then
+          begin
+            before:=ttilecontext(arg^).changed;
+            ttilecontext(arg^).processloop(n);
+            { recurse into a DECLINED node's children (so a nest wrapped in an
+              outer repeat-count loop is still reached); stop only after an actual
+              transform, when n is a freshly built replacement }
+            if ttilecontext(arg^).changed<>before then
+              result:=fen_norecurse_false;
+          end;
+      end;
+
+    function OptimizeLoopTile(node : tnode) : boolean;
+      var
+        ctx : ttilecontext;
+      begin
+        Result:=false;
+        if (cs_opt_size in current_settings.optimizerswitches) then
+          exit;
+        if not(pi_dfaavailable in current_procinfo.flags) then
+          exit;
+        ctx.root:=node;
+        ctx.changed:=false;
+        foreachnodestatic(pm_postprocess,node,@tile_processloop_cb,@ctx);
         Result:=ctx.changed;
       end;
 
@@ -7666,6 +10427,7 @@ unit optloop;
         if reason<>'' then
           begin
             MessagePos1(forn.fileinfo,cg_n_loop_not_predcommoned,reason);
+            OptRemark(forn.fileinfo,'predcom','not predictively commoned: '+reason);
             exit;
           end;
 
@@ -7739,6 +10501,9 @@ unit optloop;
 
         do_firstpass(block);
         MessagePos2(forn.fileinfo,cg_n_loop_predcommoned,tostr(w),basesym.realname);
+        OptRemark(forn.fileinfo,'predcom','sliding window of '+tostr(w)+
+          ' offset(s) of '+basesym.realname+
+          ' carried in rotating temporaries (only the leading edge is reloaded)');
         forn.free;
         n:=block;
         changed:=true;
@@ -8321,7 +11086,14 @@ unit optloop;
           exit;
         env.facts:=facts;
         env.changed:=changed;
-        foreachnodestatic(pm_preprocess,n,@jt_walk_cb,@env);
+        { pm_postprocess runs the callback BEFORE descending, so the
+          fen_norecurse_false returned for ifn genuinely stops the generic walk
+          and jt_do_if alone recurses into the branches. pm_preprocess would
+          process the children first, so every nested if would be visited once
+          by the generic sweep and again by each ancestor's manual jt_walk --
+          exponential in if-nesting depth (hangs on large lowered string-case
+          dispatch chains). }
+        foreachnodestatic(pm_postprocess,n,@jt_walk_cb,@env);
       end;
 
 
@@ -8389,14 +11161,25 @@ unit optloop;
       begin
         result:=fen_false;
         if (n.nodetype=loadn) and
-           (tloadnode(n).symtableentry=psinkrefctx(arg)^.sym) then
+           (tloadnode(n).symtableentry=psinkrefctx(arg)^.sym) and
+           { A load node that is the destination of an assignment (nf_write set,
+             nf_modify clear) is a pure WRITE of V, not a read/use of it: the
+             old value is not consumed, it is overwritten.  Counting such a
+             write as a "use" of V is unsound for the arm-consumption test in
+             sink_try -- e.g. `code:=0; if cond then begin code:=sp; ... end`
+             (fpc_Val_UInt_Shortstr): the then-arm only WRITES code, yet was
+             seen as its sole consumer, so `code:=0` got sunk into that arm and
+             the fall-through path (cond false) returned code uninitialised.
+             Only genuine reads (plain loads, or read-modify-write loads that
+             carry nf_modify) consume V and must be tracked here. }
+           not((nf_write in n.flags) and not(nf_modify in n.flags)) then
           begin
             psinkrefctx(arg)^.found:=true;
             result:=fen_norecurse_true;
           end;
       end;
 
-    { true if subtree n contains any load of symbol sym }
+    { true if subtree n contains any read (use) of symbol sym }
     function sink_refs_sym(n : tnode; sym : tsym) : boolean;
       var
         ctx : tsinkrefctx;
@@ -8461,6 +11244,48 @@ unit optloop;
         end;
       end;
 
+    { -OoMODREF SINK consumer: a resolved DIRECT call proved to WRITE NO memory,
+      be NON-TRAPPING and READ only an EXACT set of statics (never through a
+      by-ref parameter), whose every argument is itself a movable (pure,
+      non-trapping, alias-free, non-address-taken) value, may be sunk into an
+      if-arm PAST the intervening condition COND provided COND does not write any
+      static the call reads.  Sinking makes the read-only non-trapping call
+      execute conditionally (fewer times) -- unobservable -- and the exact-static
+      footprint (item (d)) proves the same value is read at the later position.
+      The movable-argument requirement means the actuals are non-address-taken
+      locals/consts the condition cannot modify, so only the call's own static
+      reads need checking against COND. }
+    function sink_call_movable(cn : tcallnode; cond : tnode) : boolean;
+      var
+        pd : tprocdef;
+        para : tcallparanode;
+      begin
+        result:=false;
+        if not(cs_opt_modref in current_settings.optimizerswitches) then
+          exit;
+        if not licm_simple_type(cn.resultdef) then
+          exit;
+        if ([nf_write,nf_modify]*cn.flags)<>[] then
+          exit;
+        pd:=loop_call_target(cn);
+        if not assigned(pd) or not modref_summary_available(pd) then
+          exit;
+        if (pd.modref_writes<>mr_none) or modref_pd_can_trap(pd) then
+          exit;
+        if not(pd.modref_pmask_exact and pd.modref_smask_exact) then
+          exit;
+        if pd.modref_reads_pmask<>0 then
+          exit;
+        para:=tcallparanode(cn.left);
+        while assigned(para) do
+          begin
+            if not sink_movable_rhs(para.paravalue) then
+              exit;
+            para:=tcallparanode(para.nextpara);
+          end;
+        result:=modref_region_stable_for_call(cond,cn);
+      end;
+
     { attempt to sink the assignment held by statement node sn into the single
       arm of the following if that consumes it; returns true if it did }
     function sink_try(sn : tstatementnode) : boolean;
@@ -8494,9 +11319,13 @@ unit optloop;
           exit;
         idx:=assign.left.optinfo^.index;
 
-        { RHS must be pure, non-trapping and movable }
+        { RHS must be pure, non-trapping and movable: either a plain movable
+          expression, or (-OoMODREF) a write-free non-trapping call whose static
+          reads the intervening condition does not write }
         if not sink_movable_rhs(assign.right) then
-          exit;
+          if not((assign.right.nodetype=calln) and
+                 sink_call_movable(tcallnode(assign.right),ifstmt.left)) then
+            exit;
 
         { the condition must not read V }
         if sink_refs_sym(ifstmt.left,sym) then
@@ -8507,6 +11336,23 @@ unit optloop;
         if not assigned(succ) or not assigned(succ.optinfo) then
           exit;
         if DynSetIn(succ.optinfo^.life,idx) then
+          exit;
+
+        { SOUNDNESS: succ.optinfo^.life is the successor's live-IN, which we use
+          as a proxy for the if's live-OUT.  That proxy breaks when the if is the
+          last statement of a while/repeat body: tsetnodesuccessors makes such a
+          statement's successor the loop node ITSELF (control flows back through
+          the loop's controlling condition).  For a repeat..until loop the
+          condition is evaluated AFTER this if yet its uses are NOT folded into
+          the loop node's live-in -- they are killed there by the very
+          top-of-body re-definition we are about to sink (optdfa only re-adds the
+          condition use to the loop life for test-at-begin/while loops).  So a
+          `repeat V:=c; if..; until V` back-edge read of V is invisible to the
+          check above; moving the store into one arm would let the other path
+          reach `until V` with a stale value.  Treat any read of V by the loop's
+          controlling condition as a live use and decline the sink. }
+        if (succ.nodetype=whilerepeatn) and
+           sink_refs_sym(twhilerepeatnode(succ).left,sym) then
           exit;
 
         { exactly one arm consumes V }
@@ -8533,6 +11379,7 @@ unit optloop;
         sn.statement:=cnothingnode.create;
         do_firstpass(sn.left);
         do_firstpass(newblock);
+        OptRemark(assign.fileinfo,'sink','pure assignment sunk into the single if-arm that reads it');
         result:=true;
       end;
 
@@ -8621,6 +11468,15 @@ unit optloop;
         Vars: TLinkedList;
       end;
 
+    var
+      { during a store-motion body-safety scan, the set of globals THIS loop
+        would promote to registers (written qualifying statics). A body call is
+        transparent only if it provably neither reads nor writes ANY of them
+        (per-static -OoMODREF precision, item (d)); a call touching only OTHER
+        globals / heap is harmless because store motion caches nothing else.
+        nil outside the scan => the coarse "no global access at all" test. }
+      sm_promote_data : PStoreMotionData;
+
     { A global (tstaticvarsym) that may be promoted for the loop's duration. }
     function sm_qualifies_sym(sym: tsym): boolean;
       var
@@ -8666,6 +11522,65 @@ unit optloop;
           (tloadnode(n).symtableentry.typ in [localvarsym,paravarsym,staticvarsym]) and
           licm_simple_type(n.resultdef) and
           not is_managed_type(n.resultdef);
+      end;
+
+    { a call the store-motion pass may keep inside a promoted-global loop body.
+      Store motion holds each promoted global in a register across the whole
+      loop and writes it back once afterwards, so a call in the body is safe
+      only if it neither READS nor WRITES any globally-reachable memory (a
+      global read would see the stale in-memory copy; a global write would be
+      lost) and provably cannot TRAP/RAISE (an exception would skip the
+      post-loop write-back, leaving the global stale).
+
+      An -OoPURE CONST call qualifies (no memory access, non-trapping).
+      -OoMODREF additionally admits an IMPURE routine whose reads/writes at THIS
+      call site are confined to non-global actuals -- the motivating case being
+      a helper that writes only its own out parameter bound to a caller local --
+      provided its summary proves it cannot trap.
+
+      With the per-static summary (item (d)) and a known promotion set
+      (sm_promote_data), the requirement further relaxes from "touches NO global"
+      to "touches none of the PROMOTED globals": a helper that writes only an
+      unrelated static B may stay in a loop that promotes only global A, because
+      B is never register-cached (it keeps its normal in-memory semantics). }
+    function sm_call_transparent(n: tnode): boolean;
+      var
+        pd : tprocdef;
+        cn : tcallnode;
+        readsglobal,writesglobal : boolean;
+        v : TStoreMotionVar;
+      begin
+        result:=loop_is_const_call(n);
+        if result then
+          exit;
+        if not(cs_opt_modref in current_settings.optimizerswitches) then
+          exit;
+        pd:=loop_call_target(n);
+        if not assigned(pd) or modref_pd_can_trap(pd) then
+          exit;
+        cn:=tcallnode(n);
+        if assigned(sm_promote_data) then
+          begin
+            { per-static: the call may stay iff it provably neither reads nor
+              writes ANY global this loop promotes; touching other globals/heap is
+              harmless (store motion caches only the promoted set). An empty
+              promotion set (Vars.Count=0) makes every non-trapping resolved call
+              transparent, but such a loop promotes nothing and is dropped later. }
+            v:=TStoreMotionVar(sm_promote_data^.Vars.First);
+            while assigned(v) do
+              begin
+                if modref_call_may_access_static(cn,v.Sym,true) or
+                   modref_call_may_access_static(cn,v.Sym,false) then
+                  exit;
+                v:=TStoreMotionVar(v.Next);
+              end;
+            result:=true;
+          end
+        else
+          { no known promotion set (e.g. the -OoREPORT rescan): the coarse test --
+            the call must touch no globally-reachable memory at all }
+          result:=modref_call_effect(cn,readsglobal,writesglobal) and
+                  not readsglobal and not writesglobal;
       end;
 
     { Recursive whitelist over statements *and* expressions: true only if every
@@ -8721,11 +11636,42 @@ unit optloop;
           unaryminusn,notn:
             result:=(([cs_check_overflow,cs_check_range]*n.localswitches)=[]) and
                     sm_node_safe(tunarynode(n).left);
+          calln:
+            { a resolved direct call to a routine -OoPURE proved CONST reads and
+              writes NO memory, is side-effect free and non-trapping: it can
+              neither observe nor clobber the promoted global (nor any other
+              memory) and can never raise before the post-loop store, so it is
+              transparent to the promotion.  PURE is NOT sufficient here -- a
+              pure routine may READ global memory, and it would read the promoted
+              global's stale in-memory copy while the live value sits in the
+              register temp.  The argument subtrees must themselves be safe
+              (recursed below), which also keeps them non-trapping. }
+            begin
+              result:=sm_call_transparent(n);
+              if result then
+                result:=sm_node_safe(tcallnode(n).left);
+            end;
+          callparan:
+            result:=sm_node_safe(tcallparanode(n).paravalue) and
+                    sm_node_safe(tcallparanode(n).nextpara);
           else
-            { calln, inlinen, derefn, subscriptn, vecn, divn, modn, nested
+            { inlinen, derefn, subscriptn, vecn, divn, modn, nested
               forn/whilerepeatn, break/continue/goto/raise/try, ... -> decline }
             result:=false;
         end;
+      end;
+
+    { detects a proven-CONST / mod-ref-transparent call kept in the loop body by
+      the relaxed whitelist, for an accurate -OoREPORT remark }
+    function sm_has_constcall_cb(var n: tnode; arg: pointer): foreachnoderesult;
+      begin
+        if (n.nodetype=calln) and sm_call_transparent(n) then
+          begin
+            pboolean(arg)^:=true;
+            result:=fen_norecurse_true;
+          end
+        else
+          result:=fen_false;
       end;
 
     function sm_find_var(data: PStoreMotionData; sym: tsymentry): TStoreMotionVar;
@@ -8799,26 +11745,17 @@ unit optloop;
         NewWrapper: TStatementNode;
         NewNode, NewCopy: tnode;
         promoted: integer;
+        hasconstcall: boolean;
       begin
         result:=fen_false;
         if not (n.nodetype in [forn,whilerepeatn]) or (nf_internal in n.flags) then
           exit;
 
-        { the whole loop node (bounds/condition + body) must be provably
-          call-free, non-trapping and alias-safe }
-        if n.nodetype=forn then
-          bodysafe:=sm_node_safe(tfornode(n).right) and   { start bound }
-                    sm_node_safe(tfornode(n).t1) and       { end bound }
-                    sm_node_safe(tfornode(n).t2)           { body }
-        else
-          bodysafe:=sm_node_safe(twhilerepeatnode(n).left) and  { condition }
-                    sm_node_safe(twhilerepeatnode(n).right) and  { body }
-                    sm_node_safe(twhilerepeatnode(n).t1);
-        if not bodysafe then
-          exit;
-
         data.Vars:=TLinkedList.Create;
         try
+          { collect the promotion set FIRST -- the written qualifying globals --
+            so the body-safety scan can judge each in-body call against exactly
+            the globals this loop would register-cache (per-static -OoMODREF). }
           foreachnodestatic(pm_postprocess,n,@sm_collectrefs,@data);
 
           { keep only globals actually WRITTEN in the loop -- those are the ones
@@ -8852,6 +11789,33 @@ unit optloop;
 
           if data.Vars.Count=0 then
             exit;
+
+          { the whole loop node (bounds/condition + body) must be provably
+            non-trapping and alias-safe; an in-body call is admitted only if it
+            provably touches none of the promoted globals (sm_promote_data) }
+          sm_promote_data:=@data;
+          if n.nodetype=forn then
+            bodysafe:=sm_node_safe(tfornode(n).right) and   { start bound }
+                      sm_node_safe(tfornode(n).t1) and       { end bound }
+                      sm_node_safe(tfornode(n).t2)           { body }
+          else
+            bodysafe:=sm_node_safe(twhilerepeatnode(n).left) and  { condition }
+                      sm_node_safe(twhilerepeatnode(n).right) and  { body }
+                      sm_node_safe(twhilerepeatnode(n).t1);
+          sm_promote_data:=nil;
+          if not bodysafe then
+            begin
+              { the promotion-candidate temps were built before the safety scan
+                (so it could judge body calls against them); none were consumed,
+                so release them here (the finally only frees the list items) }
+              v:=TStoreMotionVar(data.Vars.First);
+              while assigned(v) do
+                begin
+                  v.TempCreate.Free;
+                  v:=TStoreMotionVar(v.Next);
+                end;
+              exit;
+            end;
 
           { rewrite every reference in the loop to the corresponding temp }
           if not foreachnodestatic(pm_postprocess,n,@sm_replacerefs,@data) then
@@ -8894,11 +11858,24 @@ unit optloop;
               v:=TStoreMotionVar(v.Previous);
             end;
 
+          if cs_opt_report in current_settings.optimizerswitches then
+            begin
+              hasconstcall:=false;
+              foreachnodestatic(pm_postprocess,NewCopy,@sm_has_constcall_cb,@hasconstcall);
+              if hasconstcall then
+                OptRemark(n.fileinfo,'storemotion',
+                  'promoted '+tostr(data.Vars.Count)+' invariant-address global(s) to register temps across a loop body containing a call proven not to touch global memory (-OoPURE/-OoMODREF)')
+              else
+                OptRemark(n.fileinfo,'storemotion',
+                  'promoted '+tostr(data.Vars.Count)+' invariant-address global(s) to register temps for the loop');
+            end;
+
           n.Free;
           n:=NewBlock;
           n.pass_typecheck;
           result:=fen_true;
         finally
+          sm_promote_data:=nil;
           data.Vars.Free;
         end;
       end;
@@ -9837,6 +12814,10 @@ unit optloop;
             current_procinfo.procdef.localst.insertsym(cands[i].recsym);
             cands[i].accept:=true;
             result:=true;
+            if assigned(cands[i].inl) then
+              OptRemark(cands[i].inl.fileinfo,'stackalloc',
+                'dynamic array '+cands[i].dsym.realname+' of '+tostr(cands[i].n)+
+                ' element(s) promoted from the heap to a stack frame slot');
           end;
         if result then
           foreachnodestatic(node,@stackalloc_apply,@cands);
@@ -10169,14 +13150,21 @@ unit optloop;
       end;
 
     function switchtable_walk(var n: tnode; arg: pointer): foreachnoderesult;
+      var
+        casepos : tfileposinfo;
       begin
         result:=fen_false;
         if n.nodetype=casen then
-          if switchtable_try(n) then
-            begin
-              pboolean(arg)^:=true;
-              result:=fen_norecurse_false;
-            end;
+          begin
+            casepos:=n.fileinfo;
+            if switchtable_try(n) then
+              begin
+                OptRemark(casepos,'switchtable',
+                  'fully-covered constant-assignment case converted to per-variable lookup tables (branchless)');
+                pboolean(arg)^:=true;
+                result:=fen_norecurse_false;
+              end;
+          end;
       end;
 
     function OptimizeSwitchTable(node : tnode) : boolean;
@@ -10265,6 +13253,12 @@ unit optloop;
         [addn,subn,muln,andn,orn,xorn,shln,shrn,notn,unaryminusn,
          derefn,vecn,subscriptn,typeconvn];
 
+    var
+      { set by gvn_call_no_memwrite when an impure but write-free call is admitted
+        as memory-transparent under -OoMODREF (for the -OoREPORT remark); reset at
+        the start of each OptimizeGVNPRE run }
+      gvnpre_modref_transp : boolean;
+
     { --- small helpers ------------------------------------------------------ }
 
     { true if N is a direct call to a routine proven PURE by -OoPURE (reads but
@@ -10329,14 +13323,58 @@ unit optloop;
       end;
 
 
+    { -OoMODREF lift: a resolved DIRECT call whose mod/ref summary proves it
+      writes NO memory whatsoever (modref_writes = mr_none: not through a global,
+      not through a by-reference parameter, not through a deref).  Such a call --
+      even though it is impure (it may READ global memory, do input, or trap, so
+      -OoPURE rightly refuses to prove it pure) -- cannot invalidate ANY
+      value-numbered memory reader (gvn_mem) nor local (gvn_pure) entry, because
+      GVN-PRE only re-uses a value across an unchanged memory/local state and this
+      call changes neither.  Trapping is irrelevant here: the reuse temp is
+      materialised at the FIRST (dominating) occurrence and merely READ later, so
+      if an intervening call traps the later read is simply never reached.
+      writes = mr_byref is NOT sufficient: it would write caller storage bound to
+      a by-ref actual (an address-taken local or a global), which a gvn_mem entry
+      could alias and read. }
+    function gvn_call_no_memwrite(n : tnode) : boolean;
+      var
+        cn : tcallnode;
+        pd : tprocdef;
+      begin
+        result:=false;
+        if not(cs_opt_modref in current_settings.optimizerswitches) then
+          exit;
+        if (n=nil) or (n.nodetype<>calln) then
+          exit;
+        cn:=tcallnode(n);
+        { resolved direct call only (excludes indirect / procvar targets) }
+        if not assigned(cn.procdefinition) or not(cn.procdefinition is tprocdef) then
+          exit;
+        pd:=tprocdef(cn.procdefinition);
+        { a method call must dispatch to a statically known body }
+        if assigned(cn.methodpointer) and
+           ((po_virtualmethod in pd.procoptions) or
+            (po_abstractmethod in pd.procoptions)) then
+          exit;
+        { aggregate-return machinery performs hidden stores -> stay a barrier }
+        if assigned(cn.funcretnode) or assigned(cn.callinitblock) or
+           assigned(cn.callcleanupblock) then
+          exit;
+        result:=modref_summary_available(pd) and (pd.modref_writes=mr_none);
+        if result then
+          gvnpre_modref_transp:=true;
+      end;
+
+
     function gvn_sideeffect_cb(var n : tnode; arg : pointer) : foreachnoderesult;
       begin
         result:=fen_false;
         case n.nodetype of
           calln:
-            { a proven-pure call is not a barrier -- recurse into its arguments so
-              a side effect hiding in an argument is still caught }
-            if not gvn_pure_call(n) then
+            { a proven-pure call, or (under -OoMODREF) an impure call proven to
+              write no memory, is not a barrier -- recurse into its arguments so a
+              side effect hiding in an argument is still caught }
+            if not gvn_pure_call(n) and not gvn_call_no_memwrite(n) then
               result:=fen_norecurse_true;
           assignn,asmn,finalizetempsn:
             result:=fen_norecurse_true;
@@ -10821,7 +13859,11 @@ unit optloop;
                 ki^.mem:=true;
             end;
           calln:
-            ki^.mem:=true;
+            { any call that may WRITE memory kills every memory-reader entry
+              carried into/around the loop; a call proven to write no memory
+              (-OoMODREF, gvn_call_no_memwrite) leaves them available }
+            if not gvn_call_no_memwrite(n) then
+              ki^.mem:=true;
           asmn:
             ki^.killall:=true;
           inlinen:
@@ -11082,12 +14124,23 @@ unit optloop;
       begin
         result:=false;
         ctx.init;
+        gvnpre_modref_transp:=false;
         avail:=nil;
         gvn_process(node,@ctx,avail);
         if ctx.eliminated>0 then
           begin
             MessagePos2(current_procinfo.entrypos,cg_n_gvnpre_eliminated,
               tostr(ctx.eliminated),ctx.firstexpr);
+            if gvnpre_modref_transp then
+              OptRemark(current_procinfo.entrypos,'gvnpre',
+                'eliminated '+tostr(ctx.eliminated)+
+                ' fully-redundant expression(s) (first: '+ctx.firstexpr+
+                '), reused from a dominating computation across a mod/ref write-free call (-OoMODREF)')
+            else
+              OptRemark(current_procinfo.entrypos,'gvnpre',
+                'eliminated '+tostr(ctx.eliminated)+
+                ' fully-redundant expression(s) (first: '+ctx.firstexpr+
+                '), reused from a dominating computation');
             if assigned(ctx.preambleblk) then
               begin
                 do_firstpass(ctx.preambleblk);

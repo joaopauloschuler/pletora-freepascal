@@ -1120,6 +1120,61 @@ implementation
       end;
 
 
+    { FPC Unleashed (cross-unit inline-asm splicing): the asm operands of an
+      inline body are serialized as a raw tai list in the ppu.  tasmsymbol
+      objects are module-local and are NOT written by putasmsymbol (it emits a
+      0 placeholder and getasmsymbol returns nil), so a spliced-cross-unit
+      top_ref lost its global symbol.  These helpers serialize the symbol by
+      NAME + bind + typ and re-resolve it against the LOADING module: a global/
+      external symbol becomes an external reference the linker resolves against
+      the defining unit; any module-local (AB_LOCAL/AB_NONE/AB_TEMP) symbol is
+      NOT reconstructed here -- such a body is marked cross-unit-unsafe (see
+      tasmnode.buildderefimpl) and kept out of line, so its operands are never
+      emitted from the loaded copy. }
+    const
+      asmsym_crossunit_global = [AB_EXTERNAL,AB_COMMON,AB_GLOBAL,
+        AB_WEAK_EXTERNAL,AB_PRIVATE_EXTERN,AB_IMPORT,AB_LAZY,
+        AB_INDIRECT,AB_EXTERNAL_INDIRECT,AB_WEAK];
+
+    procedure ppuwriteasmsymname(ppufile:tcompilerppufile;s:tasmsymbol);
+      begin
+        if assigned(s) then
+          begin
+            ppufile.putbyte(1);
+            ppufile.putansistring(s.name);
+            ppufile.putbyte(byte(s.bind));
+            ppufile.putbyte(byte(s.typ));
+          end
+        else
+          ppufile.putbyte(0);
+      end;
+
+    function ppuloadasmsymname(ppufile:tcompilerppufile):tasmsymbol;
+      var
+        nm   : ansistring;
+        bind : TAsmsymbind;
+        typ  : TAsmsymtype;
+      begin
+        result:=nil;
+        if ppufile.getbyte=0 then
+          exit;
+        nm:=ppufile.getansistring;
+        bind:=TAsmsymbind(ppufile.getbyte);
+        typ:=TAsmsymtype(ppufile.getbyte);
+        if nm='' then
+          exit;
+        if bind in asmsym_crossunit_global then
+          { global/external symbol: reference it by name against the loading
+            module so the linker resolves it to the defining unit's export }
+          result:=current_asmdata.RefAsmSymbol(nm,typ)
+        else
+          { module-local symbol: cannot be reconstructed cross-unit.  Leave it
+            nil -- the enclosing block is flagged cross-unit-unsafe and stays
+            out of line, so this operand is never emitted from the loaded copy. }
+          result:=nil;
+      end;
+
+
     function new_section(list:TAsmList;Asectype:TAsmSectiontype;const Aname:string;Aalign:byte;Asecorder:TasmSectionorder=secorder_default) : tai_section;
       begin
         Result:=tai_section.create(Asectype,Aname,Aalign,Asecorder);
@@ -2523,7 +2578,15 @@ implementation
     constructor tai_label.ppuload(t:taitype;ppufile:tcompilerppufile);
       begin
         inherited ppuload(t,ppufile);
+        { asm labels are module-local and are not serialized (getasmsymbol
+          returns nil).  A body containing an asm label is flagged cross-unit-
+          unsafe (tasmnode.buildderefimpl) and stays out of line, so this loaded
+          label is never emitted.  Materialise a fresh module-local label so the
+          loaded tai is well-formed (labsym<>nil): derefimpl and any later copy
+          must not dereference a nil labsym. }
         labsym:=tasmlabel(ppufile.getasmsymbol);
+        if not assigned(labsym) then
+          current_asmdata.getjumplabel(labsym);
         ppufile.getbyte; { was is_global flag, now unused }
       end;
 
@@ -2538,7 +2601,8 @@ implementation
 
     procedure tai_label.derefimpl;
       begin
-        labsym.is_set:=true;
+        if assigned(labsym) then
+          labsym.is_set:=true;
       end;
 
 {****************************************************************************
@@ -3335,8 +3399,8 @@ implementation
               ppufile.getdata(o.ref^.refaddr,sizeof(o.ref^.refaddr));
               o.ref^.scalefactor:=ppufile.getbyte;
               o.ref^.offset:=ppufile.getaint;
-              o.ref^.symbol:=ppufile.getasmsymbol;
-              o.ref^.relsymbol:=ppufile.getasmsymbol;
+              o.ref^.symbol:=ppuloadasmsymname(ppufile);
+              o.ref^.relsymbol:=ppuloadasmsymname(ppufile);
             end;
           top_const :
             o.val:=ppufile.getaint;
@@ -3378,8 +3442,8 @@ implementation
               ppufile.putdata(o.ref^.refaddr,sizeof(o.ref^.refaddr));
               ppufile.putbyte(o.ref^.scalefactor);
               ppufile.putaint(o.ref^.offset);
-              ppufile.putasmsymbol(o.ref^.symbol);
-              ppufile.putasmsymbol(o.ref^.relsymbol);
+              ppuwriteasmsymname(ppufile,o.ref^.symbol);
+              ppuwriteasmsymname(ppufile,o.ref^.relsymbol);
             end;
           top_const :
             ppufile.putaint(o.val);

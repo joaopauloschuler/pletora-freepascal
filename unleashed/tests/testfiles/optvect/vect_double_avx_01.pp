@@ -4,9 +4,9 @@
   128-bit (2-wide); results must be bit-identical to the scalar path. Exercises
   the element-wise store shapes and both reduction shapes (an FMA-capable target
   additionally contracts s+a[i]*b[i] into an fma() node, whose double form the
-  recognizer accepts and widens to vmulpd+vaddpd under fast-math). For
-  exactly-representable inputs there is no rounding, so the packed reduction
-  equals the strict sequential (downto) reference. }
+  recognizer accepts and widens to a packed vfmadd231pd multiply-add under
+  fast-math). For exactly-representable inputs there is no rounding, so even the
+  fused reduction equals the strict sequential (downto) reference bit-for-bit. }
 program vect_double_avx_01;
 {$mode objfpc}{$H+}
 function qb(x: double): qword; var q: qword absolute x; begin qb:=q; end;

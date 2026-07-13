@@ -1,6 +1,7 @@
-{ %OPT="-O4 -Cfsse64" }
-{ Disabled control: the autovectorizer is opt-in, so at -O4 WITHOUT -OoVECTORIZE
-  the reduction stays scalar (only -OoREASSOC may split it into partial scalar
+{ %OPT="-O4 -OoNOVECTORIZE -Cfsse64" }
+{ Disabled control: -OoVECTORIZE is now in the -O4 default set, so this test
+  disables it explicitly with -OoNOVECTORIZE.  With the vectorizer off the
+  reduction stays scalar (only -OoREASSOC may split it into partial scalar
   accumulators).  The sum and dot product must still be correct against a strict
   sequential (downto) reference.  Companion to vect_reduce_01. }
 program vect_reduce_disabled_01;

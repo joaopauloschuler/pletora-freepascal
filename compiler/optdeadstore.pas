@@ -41,7 +41,7 @@ unit optdeadstore;
       nutils,
       nbas,nld,nmem,ncal,
       defutil,
-      optbase,optpure,
+      optbase,optpure,optmodref,optutils,
       symtype,symdef,symsym,symconst;
 
 
@@ -234,54 +234,53 @@ unit optdeadstore;
           );
       end;
 
-    { --- pure/const call barrier relaxation (-OoPURE consumer) --------------
+    { --- pure/const/mod-ref call barrier relaxation (-OoPURE / -OoMODREF) ----
 
       The field-store scan above treats every call as a hard barrier: it may
       read the pending store's memory (keeping it live) or write memory (an
-      aliasing effect). A call whose target -OoPURE proved PURE or CONST is far
-      weaker and need not flush the whole pending set:
+      aliasing effect). A call whose memory effect at THIS call site is known is
+      far weaker and need not flush the whole pending set:
 
-        * a CONST routine reads and writes NO memory at all -- it can neither
-          observe nor clobber a pending store, so it is a complete non-barrier
-          (only its argument expressions, scanned normally, perform reads);
+        * a call that neither reads nor writes any globally-reachable memory
+          (an -OoPURE CONST routine, or -- via -OoMODREF -- an impure routine
+          whose reads/writes at this site are confined to non-global actuals,
+          e.g. a helper writing only its out parameter bound to a caller local)
+          is a complete non-barrier: only its argument expressions, scanned
+          normally, perform reads;
 
-        * a PURE routine writes no memory but MAY read global/heap state, so it
-          is a potential *reader*: a pending store to a globally reachable slot
-          (a static var, or a by-reference const parameter) could be observed
-          and must be kept live, but a store to a non-address-taken local or a
+        * a call that may read and/or write globally-reachable memory (an
+          -OoPURE PURE routine, or an -OoMODREF routine that reads/writes a
+          static or a by-reference-parameter actual at this site) is treated as
+          a potential observer/clobberer of every globally reachable pending
+          slot (a static var, or a by-reference const parameter), which is
+          therefore kept live -- but a store to a non-address-taken local or a
           by-value parameter is invisible to any callee (no pointer to it can
-          exist) and therefore survives the pure call.
+          exist) and survives the call.
 
-      Indirect / procvar / virtual / aggregate-returning calls stay full
-      barriers, as do deref and asm nodes. }
+      Indirect / procvar / virtual / external / aggregate-returning calls stay
+      full barriers (modref_call_effect returns no information), as do deref and
+      asm nodes.  modref_call_effect consults the -OoPURE verdict first, so this
+      subsumes and generalizes the former pure/const-only relaxation. }
 
     type
       tcallkind = (elc_barrier, elc_pure, elc_const);
 
     function el_classify_call(cn: tcallnode): tcallkind;
       var
-        pd : tprocdef;
+        readsglobal,writesglobal : boolean;
       begin
         result:=elc_barrier;
-        if not(cs_opt_pure in current_settings.optimizerswitches) then
+        if ([cs_opt_pure,cs_opt_modref]*current_settings.optimizerswitches)=[] then
           exit;
-        { resolved direct call only (excludes indirect / procvar targets) }
-        if not assigned(cn.procdefinition) or not(cn.procdefinition is tprocdef) then
-          exit;
-        pd:=tprocdef(cn.procdefinition);
-        { a method call must dispatch to a statically known body }
-        if assigned(cn.methodpointer) and
-           ((po_virtualmethod in pd.procoptions) or
-            (po_abstractmethod in pd.procoptions)) then
-          exit;
-        { aggregate return machinery performs hidden stores -> stay a barrier }
-        if assigned(cn.funcretnode) or assigned(cn.callinitblock) or
-           assigned(cn.callcleanupblock) then
-          exit;
-        if proc_is_const(pd) then
-          result:=elc_const
-        else if proc_is_pure(pd) then
-          result:=elc_pure;
+        if modref_call_effect(cn,readsglobal,writesglobal) then
+          begin
+            if not readsglobal and not writesglobal then
+              result:=elc_const
+            else
+              { reads and/or writes some globally reachable location: keep every
+                globally reachable pending store live (local ones still survive) }
+              result:=elc_pure;
+          end;
       end;
 
     { true if a pure callee could read this pending-store base's memory. The
@@ -306,13 +305,21 @@ unit optdeadstore;
       thazinfo = record
         barrier  : boolean; { deref / asm / impure call -> hard flush }
         purecall : boolean; { a proven-PURE (global-reading) call was seen }
+        { the elc_pure call nodes seen, so a per-static (-OoMODREF) check can ask
+          each of them whether it may read/write a SPECIFIC pending static base
+          instead of blanket-invalidating every globally-reachable pending store }
+        calls    : array of tcallnode;
+        ncalls   : longint;
       end;
       phazinfo = ^thazinfo;
 
     { scan a tree for memory hazards, treating a proven pure/const call as a
       non-barrier (recursing into its arguments so a nested hazard is still
-      caught) and recording whether any pure (global-reading) call occurred. }
+      caught) and recording whether any pure (global-reading) call occurred (and
+      collecting those call nodes for the per-static refinement). }
     function el_haz_scan(var n: tnode; arg: pointer): foreachnoderesult;
+      var
+        hz : phazinfo;
       begin
         result:=fen_true;
         case n.nodetype of
@@ -329,7 +336,14 @@ unit optdeadstore;
                   result:=fen_norecurse_true;
                 end;
               elc_pure:
-                phazinfo(arg)^.purecall:=true;
+                begin
+                  hz:=phazinfo(arg);
+                  hz^.purecall:=true;
+                  if hz^.ncalls>=length(hz^.calls) then
+                    setlength(hz^.calls,(hz^.ncalls+1)*2);
+                  hz^.calls[hz^.ncalls]:=tcallnode(n);
+                  inc(hz^.ncalls);
+                end;
               elc_const:
                 ;
             end;
@@ -391,14 +405,36 @@ unit optdeadstore;
             end;
         end;
 
-      { drop pending stores a pure call may observe (globally reachable bases) }
-      procedure invalidate_globals;
+      { true if any collected pure call in HZ may read or write the static base S
+        at its call site. A non-static globally-reachable base (a by-ref const
+        parameter) has no stable per-location identity here, so it stays
+        conservatively reachable. }
+      function static_base_call_hazard(hz: phazinfo; s: tsym): boolean;
+        var
+          k : longint;
+        begin
+          result:=true;
+          if s.typ<>staticvarsym then
+            exit;
+          for k:=0 to hz^.ncalls-1 do
+            if modref_call_may_access_static(hz^.calls[k],s,true) or
+               modref_call_may_access_static(hz^.calls[k],s,false) then
+              exit;
+          result:=false;
+        end;
+
+      { drop pending stores a pure call may observe (globally reachable bases).
+        With -OoMODREF a pending store to a STATIC survives a call set whose exact
+        read/write footprint provably excludes that static (per-location
+        precision); other globally-reachable bases stay conservative. }
+      procedure invalidate_globals(hz: phazinfo);
         var
           i : longint;
         begin
           i:=0;
           while i<npend do
-            if el_base_globally_reachable(pend[i].base) then
+            if el_base_globally_reachable(pend[i].base) and
+               static_base_call_hazard(hz,pend[i].base) then
               pend_remove(i)
             else
               inc(i);
@@ -415,6 +451,8 @@ unit optdeadstore;
         begin
           hz.barrier:=false;
           hz.purecall:=false;
+          hz.calls:=nil;
+          hz.ncalls:=0;
           tmp:=tree;
           foreachnodestatic(tmp,@el_haz_scan,@hz);
           if hz.barrier then
@@ -423,8 +461,9 @@ unit optdeadstore;
             begin
               invalidate_reads(tree);
               if hz.purecall then
-                invalidate_globals;
+                invalidate_globals(@hz);
             end;
+          setlength(hz.calls,0);
         end;
 
       procedure handle_stmt(sn: tstatementnode);
@@ -549,7 +588,15 @@ unit optdeadstore;
             { extended pass: record-field and static-array-element stores }
             if rootnode.nodetype=blockn then
               el_fieldstore_block(tblocknode(rootnode).left,changed);
-          end;
+            { -OoREPORT: report only when a store was actually removed }
+            if changed then
+              OptRemark(current_procinfo.procdef.fileinfo,'deadstore',
+                'removed one or more stores whose value is overwritten before any use');
+          end
+        else
+          { -OoREPORT: the dominant whole-routine bail-out }
+          OptRemark(current_procinfo.procdef.fileinfo,'deadstore',
+            'dead-store elimination skipped: routine has nested procedures');
 {$ifdef DEBUG_DEADSTORE}
         if changed then
           begin

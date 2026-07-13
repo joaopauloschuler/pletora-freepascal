@@ -2960,10 +2960,11 @@ cg_e_function_not_support_by_selected_instruction_set=06056_E_The function used,
 cg_f_max_units_reached=06057_F_Maximum number of units ($1) reached for the current target
 % Depending of target architecture, the number of units is limited. This limit
 % has been reached. A unit counts only if it contains initialization or finalization count.
-cg_n_no_inline=06058_N_Call to subroutine "$1" marked as inline is not inlined
+cg_n_no_inline=06058_N_Call to subroutine "$1" marked as inline is not inlined$2
 % The directive inline is only a hint to the compiler. Sometimes the compiler ignores this hint, a subroutine
-% marked as inline is not inlined. In this case, this hint is given. Compiling with \var{-vd} might result in more information why
-% the directive inline is ignored.
+% marked as inline is not inlined. In this case, this hint is given. When the routine is defined in the unit
+% currently being compiled, the reason why it could not be inlined is appended in parentheses; otherwise
+% compiling with \var{-vd} might result in more information why the directive inline is ignored.
 cg_e_case_missing_value=06059_E_Case statement does not handle ordinal value "$1", and no else/otherwise statement is present.
 # The case statement does not handle the specified value and does not have an else/otherwise statement, and the compiler determined
 # that this value can be passed to the case statement. This is a compile-time error in ISO and Extended Pascal.
@@ -2984,12 +2985,13 @@ cg_e_intrinsic_not_supported_by_instruction_set=06064_E_Intrinsic not supported 
 % The intrinsic translates into an assembler instruction which is not supported by the instruction set
 % selected by \var{-Cp}
 cg_n_loop_vectorized=06065_N_Loop autovectorized (SSE, $1-wide packed single)
-% The loop-level autovectorizer (\var{-O4 -OoVECTORIZE}) recognized this
-% for-loop and replaced its scalar body with packed SSE operations plus a
-% scalar remainder loop. This diagnostic is only emitted while the vectorize
-% pass is enabled and is shown at note verbosity (\var{-vn}).
+% The loop-level autovectorizer (\var{-OoVECTORIZE}, enabled by default at
+% \var{-O4}) recognized this for-loop and replaced its scalar body with packed
+% SSE operations plus a scalar remainder loop. This diagnostic is only emitted
+% while the vectorize pass is enabled and is shown at note verbosity (\var{-vn}).
 cg_n_loop_not_vectorized=06066_N_Loop not autovectorized: $1
-% The loop-level autovectorizer (\var{-O4 -OoVECTORIZE}) inspected this
+% The loop-level autovectorizer (\var{-OoVECTORIZE}, enabled by default at
+% \var{-O4}) inspected this
 % for-loop but fell back to scalar code. The reason it could not vectorize the
 % loop is given as \var{$1}. This diagnostic is only emitted while the
 % vectorize pass is enabled and is shown at note verbosity (\var{-vn}).
@@ -3136,6 +3138,27 @@ cg_h_proc_const=06088_H_Function "$1" proven const by -OoPURE (result depends on
 % reads no global/static/threadvar/referenced memory and has no side effect -- so
 % two calls with equal arguments always yield the same value. This hint is only
 % emitted while the pass is enabled and is shown at hint verbosity (\var{-vh}).
+cg_o_opt_remark=06089_O_$1: $2
+% Structured optimization remark emitted by the \var{-Ooreport} facility (the
+% gcc \var{-fopt-info} / clang \var{-Rpass} counterpart). Each of the fork's
+% \var{-Oo*} loop and vectorizer passes emits one line per applied transform and
+% -- more usefully -- one per missed transform naming the concrete blocking
+% reason, at the position of the affected loop, prefixed by the pass name
+% (\var{$1}). Unlike the per-pass \var{-vn}/\var{-vh} notes it is gated only by
+% \var{-Ooreport} (independent of message verbosity) and carries no
+% \i{Note:}/\i{Hint:} label, so it is machine-greppable. Measure-only: enabling
+% it never changes generated code.
+cg_h_proc_nothrow=06090_H_Function "$1" proven nothrow by -OoPURE (cannot raise an exception or trap)
+% The interprocedural pure/const discovery pass (\var{-OoPURE}) proved that this
+% routine -- and every routine it calls -- can never raise an exception or trap
+% (no division/checked arithmetic, no faulting dereference, no inline assembler,
+% no indirect/virtual/external call, no \var{raise}/\var{try}). This \i{nothrow}
+% attribute is tracked INDEPENDENTLY of purity, so it can hold for a routine that
+% is not pure (e.g. one that only writes a global). A consumer such as
+% \var{-OoLICM} may speculatively hoist a proven nothrow, side-effect-free,
+% loop-invariant call into a loop preheader even when the loop may run zero
+% times. This hint is only emitted while the pass is enabled and is shown at hint
+% verbosity (\var{-vh}).
 %
 % \end{description}
 # EndOfTeX
