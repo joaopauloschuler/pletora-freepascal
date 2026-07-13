@@ -305,13 +305,46 @@ begin
       end;
     until False;
     P.WaitOnExit;
-    Result.ExitCode := P.ExitStatus;
+    { ExitCode, not ExitStatus: on Unix the latter is the raw waitpid status
+      (exit 1 reads as 256). }
+    Result.ExitCode := P.ExitCode;
     Result.Stdout := OutS.DataString;
     Result.Stderr := ErrS.DataString;
   finally
     ErrS.Free;
     OutS.Free;
     P.Free;
+  end;
+end;
+
+{ The last ACount non-empty lines of AText, joined with ' | ' — compact enough
+  for a one-line error message. }
+function LastLines(const AText: string; ACount: Integer): string;
+var
+  Lines: TStringList;
+  i, Taken: Integer;
+  L: string;
+begin
+  Result := '';
+  Lines := TStringList.Create;
+  try
+    Lines.Text := AText;
+    Taken := 0;
+    for i := Lines.Count - 1 downto 0 do
+    begin
+      L := Trim(Lines[i]);
+      if L = '' then
+        Continue;
+      if Result = '' then
+        Result := L
+      else
+        Result := L + ' | ' + Result;
+      Inc(Taken);
+      if Taken >= ACount then
+        Break;
+    end;
+  finally
+    Lines.Free;
   end;
 end;
 
@@ -790,9 +823,13 @@ begin
   end;
   if PO.ExitCode <> 0 then
   begin
+    { FPC reports errors on STDOUT; fall back to it when stderr is empty. }
     if Trim(PO.Stderr) <> '' then
       raise EPfBench.CreateFmt('build failed (exit %d): %s',
         [PO.ExitCode, Trim(PO.Stderr)])
+    else if Trim(PO.Stdout) <> '' then
+      raise EPfBench.CreateFmt('build failed (exit %d): %s',
+        [PO.ExitCode, Trim(LastLines(PO.Stdout, 4))])
     else
       raise EPfBench.CreateFmt('build failed (exit %d)', [PO.ExitCode]);
   end;

@@ -46,6 +46,14 @@ CC="${2:-${FPCU:-$root/fpcu.sh}}"
 [ -x "$CC" ] || { echo "ERROR: compiler not found at $CC"; exit 1; }
 [ -x "$root/compiler/ppcx64" ] || { echo "ERROR: in-tree compiler not built (run ./rebuildu.sh)"; exit 1; }
 
+# fpcu.sh supplies the RTL + packages unit paths itself; a bare compiler
+# (e.g. compiler/ppcx64 passed as $2) needs them appended explicitly or every
+# fixture build fails with "Can't find unit".
+case "$CC" in
+  *fpcu.sh) UNITPATHS="" ;;
+  *) UNITPATHS=" -Fu$root/rtl/units/x86_64-linux -Fu$root/packages/*/units/x86_64-linux" ;;
+esac
+
 # The in-repo pf-bench harness; build it on first use.
 PB="${PF_BENCH_BIN:-$root/unleashed/tools/pf-bench/bin/pf-bench}"
 if [ ! -x "$PB" ]; then
@@ -76,7 +84,7 @@ for p in $PASSES; do
   echo "[$n/$total] $p  $(date +%H:%M:%S)" | tee -a "$OUT/progress.log"
   "$PB" ab --root "$PBROOT" \
       --compiler-a "$CC" --compiler-b "$CC" \
-      --flags=-O3 --flags-b="-Oo$p" \
+      --flags="-O3$UNITPATHS" --flags-b="-Oo$p" \
       --runs 4 --warmup 1 > "$OUT/$p.log" 2>&1
   # pf-bench table rows: "<proj>/<bench>  <A median>  <B median>  <spd>x  <status>"
   # where status is "ok", "run failure" or "CHECKSUM MISMATCH (...)".
